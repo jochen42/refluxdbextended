@@ -1,0 +1,106 @@
+{
+  "tag": "uncompacted",
+  "runs_per_query": 15,
+  "results": {
+    "full_scan": {
+      "sql": "-- Full-range aggregation across every host and every point. Forces a scan of\n-- every parquet file the querier knows about. Most-uncompacted-friendly:\n-- many small gen1 files = many small reads.\nSELECT region, AVG(temp) AS avg_temp, MAX(humidity) AS max_humid, COUNT(*) AS n\nFROM sensors\nGROUP BY region",
+      "times_s": [
+        2.0347639179999533,
+        1.9964679589993466,
+        1.9978896680004254,
+        1.976096292000875,
+        1.9921085010009847,
+        2.0401713760002167,
+        2.072131126000386,
+        2.0523205010013044,
+        1.9914211260002048,
+        2.0357568339986756,
+        2.0809459179999976,
+        2.0720302930003527,
+        2.0346917510014464,
+        2.037098042001162,
+        2.0462003350003215
+      ],
+      "min_s": 1.976096292000875,
+      "median_s": 2.0357568339986756,
+      "max_s": 2.0809459179999976,
+      "mean_s": 2.03067290933371,
+      "response_bytes": 185
+    },
+    "high_card_filter": {
+      "sql": "-- High-cardinality predicate: per-host extremes across a 4-week window.\n-- Benchmarks the per-file pruning path. Compaction should improve this\n-- materially when many gen1 files cover overlapping host sets.\nSELECT host, MAX(pressure) AS max_p, MIN(pressure) AS min_p\nFROM sensors\nWHERE time > now() - INTERVAL '4 weeks'\nGROUP BY host\nORDER BY max_p DESC\nLIMIT 50",
+      "times_s": [
+        0.39255933399908827,
+        0.42426795800020045,
+        0.40074250100042264,
+        0.4219933749991469,
+        0.4484004999994795,
+        0.3999114170001121,
+        0.4067903750001278,
+        0.42740725000112434,
+        0.3791732919999049,
+        0.42035833399859257,
+        0.3998867079990305,
+        0.4175686670005234,
+        0.4306210840004496,
+        0.42078020900044066,
+        0.4515837910003029
+      ],
+      "min_s": 0.3791732919999049,
+      "median_s": 0.42035833399859257,
+      "max_s": 0.4515837910003029,
+      "mean_s": 0.4161363196665964,
+      "response_bytes": 1435
+    },
+    "hour_buckets": {
+      "sql": "-- 6-hour downsampling over an 8-week window. Touches most parquet files\n-- since timestamps span the entire generated range; aggregation work is\n-- dominated by group-by and merge across many files. 6h bins keep result\n-- cardinality manageable while still exercising the full date range.\nSELECT\n    DATE_BIN(INTERVAL '6 hours', time) AS bucket,\n    region,\n    AVG(temp) AS avg_temp,\n    APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity\nFROM sensors\nWHERE time > now() - INTERVAL '8 weeks'\nGROUP BY bucket, region\nORDER BY bucket, region",
+      "times_s": [
+        0.8023107090011763,
+        0.7814789579988428,
+        0.7742040840003028,
+        0.7825583339999866,
+        0.8046077920007519,
+        0.8054183330004889,
+        0.8196427919992857,
+        0.7779287929988641,
+        0.8116417509991152,
+        0.7644177919992217,
+        0.7836020009999629,
+        0.8142254169997614,
+        0.7743407920006575,
+        0.7655674999987241,
+        0.7798632080011885
+      ],
+      "min_s": 0.7644177919992217,
+      "median_s": 0.7825583339999866,
+      "max_s": 0.8196427919992857,
+      "mean_s": 0.789453883733222,
+      "response_bytes": 57270
+    },
+    "narrow_window": {
+      "sql": "-- 1-week recent window \u2014 exercises the gen1-heavy tail. Most recent data\n-- still sits in many small gen1 files; compaction should already be\n-- promoting older portions of this window to gen2/3.\nSELECT region, AVG(temp), COUNT(*)\nFROM sensors\nWHERE time > now() - INTERVAL '1 week'\nGROUP BY region",
+      "times_s": [
+        0.07586704200002714,
+        0.06268254099995829,
+        0.06727520800086495,
+        0.062103250000291155,
+        0.06504916700032481,
+        0.08312587500040536,
+        0.06077495799945609,
+        0.07071350000114762,
+        0.05907345899868233,
+        0.0658085420000134,
+        0.05713775099866325,
+        0.05644262499845354,
+        0.05930450000050769,
+        0.05816575000062585,
+        0.08907870799885131
+      ],
+      "min_s": 0.05644262499845354,
+      "median_s": 0.06268254099995829,
+      "max_s": 0.08907870799885131,
+      "mean_s": 0.06617352506655153,
+      "response_bytes": 167
+    }
+  }
+}
