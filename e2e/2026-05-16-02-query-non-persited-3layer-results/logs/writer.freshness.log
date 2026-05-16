@@ -1,0 +1,43 @@
+writer-1  | 2026-05-16T15:52:15.090774677Z 2026-05-16T15:52:15.090688Z  INFO influxdb3_lib::commands::serve: InfluxDB 3 Core server starting node_id=writer-1 git_hash=c68a5712951128aa65e146169fe814ea69f22f63 version=3.3.0-nightly uuid=545bdf65-6434-408c-8c17-3cc0aae71480 num_cpus=8
+writer-1  | 2026-05-16T15:52:15.090824135Z 2026-05-16T15:52:15.090761Z  INFO influxdb3_clap_blocks::object_store: Object Store bucket=Some("influxdb3-bench") endpoint=Some(Endpoint("http://minio:9000")) object_store_type="S3"
+writer-1  | 2026-05-16T15:52:15.090892469Z 2026-05-16T15:52:15.090813Z  INFO object_store::aws::builder: Using Static credential provider
+writer-1  | 2026-05-16T15:52:15.093607635Z 2026-05-16T15:52:15.093560Z  INFO influxdb3_lib::commands::serve: Creating shared query executor num_threads=8
+writer-1  | 2026-05-16T15:52:15.095137302Z 2026-05-16T15:52:15.095051Z  INFO influxdb3_lib::commands::serve: opening shared catalog at _catalog/
+writer-1  | 2026-05-16T15:52:15.096474177Z 2026-05-16T15:52:15.096415Z  INFO influxdb3_catalog::object_store: catalog not found, creating a new one catalog_uuid=1674c544-aefa-4796-a9ce-5a2d59e50c82
+writer-1  | 2026-05-16T15:52:15.098476344Z 2026-05-16T15:52:15.097839Z  INFO influxdb3_catalog::object_store: persisted catalog checkpoint file sequence=0
+writer-1  | 2026-05-16T15:52:15.098498469Z 2026-05-16T15:52:15.097854Z  INFO influxdb3_catalog::catalog::update: create database name="_internal"
+writer-1  | 2026-05-16T15:52:15.098500010Z 2026-05-16T15:52:15.097858Z  INFO influxdb3_catalog::catalog: creating new database database_name="_internal"
+writer-1  | 2026-05-16T15:52:15.099459885Z 2026-05-16T15:52:15.099327Z  INFO influxdb3_catalog::object_store: persisted next catalog sequence put_result=PutResult { e_tag: Some("\"42cf897073e9aaf666f5c939803075b7\""), version: None } object_path=CatalogFilePath(Path { raw: "_catalog/catalogs/00000000000000000001.catalog" })
+writer-1  | 2026-05-16T15:52:15.099470469Z 2026-05-16T15:52:15.099369Z  INFO influxdb3_catalog::catalog: created internal database
+writer-1  | 2026-05-16T15:52:15.099471802Z 2026-05-16T15:52:15.099385Z  INFO influxdb3_lib::commands::serve: catalog initialized catalog_uuid=1674c544-aefa-4796-a9ce-5a2d59e50c82
+writer-1  | 2026-05-16T15:52:15.099472802Z 2026-05-16T15:52:15.099391Z  INFO influxdb3_catalog::catalog::update: register node node_id="writer-1" core_count=8 mode=[Core]
+writer-1  | 2026-05-16T15:52:15.099473802Z 2026-05-16T15:52:15.099396Z  INFO influxdb3_catalog::catalog::update: registering new node to the catalog node_id="writer-1" instance_id="6d6c99d4-9ec9-45d6-bb6f-a82cc959d7e3"
+writer-1  | 2026-05-16T15:52:15.100888719Z 2026-05-16T15:52:15.100811Z  INFO influxdb3_catalog::object_store: persisted next catalog sequence put_result=PutResult { e_tag: Some("\"feb25deeecd03eef4f316ea61003ad71\""), version: None } object_path=CatalogFilePath(Path { raw: "_catalog/catalogs/00000000000000000002.catalog" })
+writer-1  | 2026-05-16T15:52:15.100904177Z 2026-05-16T15:52:15.100871Z  INFO influxdb3_lib::commands::serve: catalog initialized instance_id="6d6c99d4-9ec9-45d6-bb6f-a82cc959d7e3"
+writer-1  | 2026-05-16T15:52:15.100945052Z 2026-05-16T15:52:15.100894Z  INFO influxdb3_catalog::catalog::update: set gen1 duration duration_ns=60000000000
+writer-1  | 2026-05-16T15:52:15.101604094Z 2026-05-16T15:52:15.101568Z  INFO influxdb3_catalog::object_store: persisted next catalog sequence put_result=PutResult { e_tag: Some("\"d4623151a448801a1f17e6fbc75a56c7\""), version: None } object_path=CatalogFilePath(Path { raw: "_catalog/catalogs/00000000000000000003.catalog" })
+writer-1  | 2026-05-16T15:52:15.101641302Z 2026-05-16T15:52:15.101609Z  INFO influxdb3_lib::commands::serve: acquiring writer lease (ttl=60s)
+writer-1  | 2026-05-16T15:52:15.102341427Z 2026-05-16T15:52:15.102297Z  INFO influxdb3_write::leases: lease _locks/writer.lease acquired by writer-1-545bdf65-6434-408c-8c17-3cc0aae71480 (no prior holder)
+writer-1  | 2026-05-16T15:52:15.103767802Z 2026-05-16T15:52:15.103721Z  INFO influxdb3_wal::object_store: replaying WAL files
+writer-1  | 2026-05-16T15:52:15.103771177Z 2026-05-16T15:52:15.103728Z  INFO influxdb3_wal::object_store: completed replaying wal files time_taken=7.75µs
+writer-1  | 2026-05-16T15:52:15.103772510Z 2026-05-16T15:52:15.103742Z  INFO influxdb3_lib::commands::serve: spawning shared-inventory poller interval=2s
+writer-1  | 2026-05-16T15:52:15.103773260Z 2026-05-16T15:52:15.103748Z  INFO influxdb3_lib::commands::serve: setting up background mem check for query buffer
+writer-1  | 2026-05-16T15:52:15.103773969Z 2026-05-16T15:52:15.103757Z  INFO influxdb3_lib::commands::serve: compaction service disabled (mode=Writer does not run compaction)
+writer-1  | 2026-05-16T15:52:15.103774677Z 2026-05-16T15:52:15.103758Z  INFO influxdb3_lib::commands::serve: setting up telemetry store
+writer-1  | 2026-05-16T15:52:15.103775385Z 2026-05-16T15:52:15.103764Z  WARN influxdb3_lib::commands::serve: server started without auth (`--without-auth` switch), all token creation and regeneration of admin token endpoints are disabled
+writer-1  | 2026-05-16T15:52:15.103890177Z 2026-05-16T15:52:15.103831Z  INFO influxdb3_write::deleter: Started catalog hard deleter task. delete_grace_period=86400s
+writer-1  | 2026-05-16T15:52:15.104207635Z 2026-05-16T15:52:15.104171Z  INFO influxdb3_lib::commands::serve: setting up server with authz disabled for paths paths_without_authz=[]
+writer-1  | 2026-05-16T15:52:15.104209677Z 2026-05-16T15:52:15.104190Z  INFO influxdb3_server: startup time: 13ms address=0.0.0.0:8181
+writer-1  | 2026-05-16T15:52:19.111504346Z 2026-05-16T15:52:19.111381Z  INFO influxdb3_write::inventory_poller: inventory poller advanced catalog before_seq=3 after_seq=4
+writer-1  | 2026-05-16T15:52:20.256316555Z 2026-05-16T15:52:20.256063Z  INFO influxdb3_catalog::object_store: persisted next catalog sequence put_result=PutResult { e_tag: Some("\"b530752dec6acb4585bc89d7489801f7\""), version: None } object_path=CatalogFilePath(Path { raw: "_catalog/catalogs/00000000000000000005.catalog" })
+writer-1  | 2026-05-16T15:52:21.106366097Z 2026-05-16T15:52:21.106087Z  INFO influxdb3_wal::snapshot_tracker: snapshotting all before last wal period (using last wal period time) force_snapshot=false wal_periods_3_times_snapshot_size=false
+writer-1  | 2026-05-16T15:52:21.106434097Z 2026-05-16T15:52:21.106173Z  INFO influxdb3_wal::object_store: flushing WAL buffer to object store host="writer-1" n_ops=1 min_timestamp_ns=1778946740243207000 max_timestamp_ns=1778946740243207000 wal_file_number=1
+writer-1  | 2026-05-16T15:52:21.247808763Z 2026-05-16T15:52:21.247718Z  INFO influxdb3_shutdown: Received SIGTERM
+writer-1  | 2026-05-16T15:52:21.247821805Z 2026-05-16T15:52:21.247740Z  INFO influxdb3_lib::commands::serve: shutdown requested
+writer-1  | 2026-05-16T15:52:21.247917347Z 2026-05-16T15:52:21.247777Z  INFO influxdb3_catalog::catalog: updating node state to stopped in shared catalog node_id="writer-1"
+writer-1  | 2026-05-16T15:52:21.247924555Z 2026-05-16T15:52:21.247807Z  INFO influxdb3_catalog::catalog::update: updating node state to Stopped in catalog node_id="writer-1" process_uuid=545bdf65-6434-408c-8c17-3cc0aae71480
+writer-1  | 2026-05-16T15:52:21.247930097Z 2026-05-16T15:52:21.247845Z  INFO influxdb3_write::deleter: Shutdown signal received, exiting object deleter loop.
+writer-1  | 2026-05-16T15:52:21.249288888Z 2026-05-16T15:52:21.249230Z  INFO influxdb3_write::leases: lease _locks/writer.lease released by writer-1-545bdf65-6434-408c-8c17-3cc0aae71480
+writer-1  | 2026-05-16T15:52:21.249343805Z 2026-05-16T15:52:21.249315Z  INFO influxdb3_catalog::object_store: persisted next catalog sequence put_result=PutResult { e_tag: Some("\"1c17e97b2ceed3335468ae2b67a2a52a\""), version: None } object_path=CatalogFilePath(Path { raw: "_catalog/catalogs/00000000000000000006.catalog" })
+writer-1  | 2026-05-16T15:52:21.249540263Z 2026-05-16T15:52:21.249471Z  INFO influxdb3_lib::commands::serve: frontend shutdown completed
+writer-1  | 2026-05-16T15:52:21.249546847Z 2026-05-16T15:52:21.249482Z  INFO influxdb3_lib::commands::serve: backend shutdown completed
