@@ -8,8 +8,10 @@ pub(crate) mod async_collections;
 pub mod chunk;
 pub mod compaction;
 pub mod deleter;
+pub mod leases;
 pub mod paths;
 pub mod persister;
+pub mod shared_inventory;
 pub mod write_buffer;
 
 use anyhow::Context;
@@ -59,8 +61,8 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub trait WriteBuffer: Bufferer + ChunkContainer + DistinctCacheManager + LastCacheManager {
-    /// Returns the persisted files manager
-    fn persisted_files(&self) -> Arc<dyn std::any::Any>;
+    /// Returns the persisted files manager. Downcast with `Arc::downcast::<PersistedFiles>()`.
+    fn persisted_files(&self) -> Arc<dyn std::any::Any + Send + Sync>;
 }
 
 /// The buffer is for buffering data in memory and in the wal before it is persisted as parquet files in storage.

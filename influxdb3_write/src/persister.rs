@@ -1,7 +1,9 @@
 //! This is the implementation of the `Persister` used to write data from the buffer to object
 //! storage.
 
+use crate::PersistedSnapshot;
 use crate::PersistedSnapshotVersion;
+use crate::paths::CompactionInfoFilePath;
 use crate::paths::ParquetFilePath;
 use crate::paths::SnapshotInfoFilePath;
 use arrow::datatypes::SchemaRef;
@@ -201,6 +203,46 @@ impl Persister {
     #[cfg(test)]
     pub async fn load_parquet_file(&self, path: ParquetFilePath) -> Result<Bytes> {
         Ok(self.object_store.get(&path).await?.bytes().await?)
+    }
+
+    /// Persist a compaction manifest under `{host}/compactions/{id}.compaction.json`.
+    /// The manifest is a regular `PersistedSnapshot` describing newly written compacted
+    /// files (`databases`) and the inputs they replace (`removed_files`). Stored under a
+    /// separate path from WAL-driven snapshots so its identifier does not need to be
+    /// coordinated with the WAL snapshot sequence.
+    pub async fn persist_compaction_snapshot(
+        &self,
+        compaction_id: &str,
+        persisted_snapshot: &PersistedSnapshot,
+    ) -> Result<()> {
+        let path = CompactionInfoFilePath::new(self.node_identifier_prefix.as_str(), compaction_id);
+        let json = serde_json::to_vec_pretty(persisted_snapshot)?;
+        self.object_store.put(path.as_ref(), json.into()).await?;
+        Ok(())
+    }
+
+    /// Load every compaction manifest under `{host}/compactions/`. Unlike WAL snapshots
+    /// there is no expectation of unbounded growth — compaction emits one manifest per
+    /// cycle and prior manifests' `removed_files` cancel earlier `databases` entries when
+    /// fed back through `PersistedFiles`.
+    pub async fn load_compaction_snapshots(&self) -> Result<Vec<PersistedSnapshot>> {
+        let dir = CompactionInfoFilePath::dir(&self.node_identifier_prefix);
+        let mut listing = self.object_store.list(Some(&dir));
+        let mut paths = Vec::new();
+        while let Some(item) = listing.next().await {
+            paths.push(item?.location);
+        }
+        // Stable order so removals consistently apply after their corresponding
+        // additions when older manifests are replayed.
+        paths.sort_unstable();
+
+        let mut snapshots = Vec::with_capacity(paths.len());
+        for location in paths {
+            let bytes = self.object_store.get(&location).await?.bytes().await?;
+            let snapshot: PersistedSnapshot = serde_json::from_slice(&bytes)?;
+            snapshots.push(snapshot);
+        }
+        Ok(snapshots)
     }
 
     /// Persists the snapshot file

@@ -137,6 +137,48 @@ const DEPRECATED_ENV_VARS: &[(&str, &str)] = &[(
     "use INFLUXDB3_PARQUET_MEM_CACHE_SIZE instead, it is in MB or %",
 )];
 
+/// Role this server process plays.
+///
+/// `All` is the legacy single-node mode and the default. The split modes let
+/// an operator scale ingest, compaction, and query independently against a
+/// shared object store bucket — provided a single writer and a single
+/// compactor are deployed (currently enforced by deployment, plus an optional
+/// advisory lease on the compactor side).
+///
+/// MVP enforcement is limited to gating the compaction service per mode. The
+/// HTTP listener is still bound in every mode; operators are expected to
+/// route write traffic only to `Writer`/`All` instances and read traffic to
+/// `Querier`/`Writer`/`All` instances at the load balancer. Hardening the
+/// listener to refuse the wrong endpoints per mode is a follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum NodeMode {
+    /// Ingest + query + compact, the way today's single binary runs.
+    All,
+    /// Accept writes, run the WAL, persist gen1 parquet. No compaction.
+    /// Query endpoints remain available so this process can also serve
+    /// reads of its own data; deploy a separate `--mode querier` if you
+    /// want to scale reads independently.
+    Writer,
+    /// Compact only. No HTTP write handlers, no WAL, no query bind. Pairs
+    /// with an advisory lease so two compactors against the same bucket
+    /// do not duplicate work.
+    Compactor,
+    /// Read-only. No ingest, no compaction. Scales horizontally.
+    Querier,
+}
+
+impl NodeMode {
+    pub fn runs_ingest(self) -> bool {
+        matches!(self, Self::All | Self::Writer)
+    }
+    pub fn runs_compaction(self) -> bool {
+        matches!(self, Self::All | Self::Compactor)
+    }
+    pub fn runs_query(self) -> bool {
+        matches!(self, Self::All | Self::Writer | Self::Querier)
+    }
+}
+
 /// Try to keep all the memory size in MB instead of raw bytes, also allow
 /// them to be configured as a percentage of total memory using MemorySizeMb
 #[derive(Debug, clap::Parser)]
@@ -256,6 +298,56 @@ pub struct Config {
     )]
     pub enable_compaction: bool,
 
+    /// Role this process plays in a deployment. `all` (default) runs ingest,
+    /// query, and compaction in one binary. `writer`, `compactor`, and `querier`
+    /// let an operator split the responsibilities across multiple processes
+    /// sharing the same object store bucket.
+    #[clap(
+        long = "mode",
+        env = "INFLUXDB3_MODE",
+        value_enum,
+        default_value_t = NodeMode::All,
+        action
+    )]
+    pub mode: NodeMode,
+
+    /// TTL of the advisory compactor lease. A holder that fails to refresh
+    /// within this window is considered crashed and a peer may take over.
+    /// Set to `0s` to disable the lease entirely (single-node use only).
+    #[clap(
+        long = "compactor-lease-ttl",
+        env = "INFLUXDB3_COMPACTOR_LEASE_TTL",
+        default_value = "60s",
+        action
+    )]
+    pub compactor_lease_ttl: humantime::Duration,
+
+    /// TTL of the advisory writer lease. Mirrors `--compactor-lease-ttl` but
+    /// for the singleton ingester. Acquired in `writer` mode only; ignored
+    /// otherwise. Set to `0s` to disable.
+    #[clap(
+        long = "writer-lease-ttl",
+        env = "INFLUXDB3_WRITER_LEASE_TTL",
+        default_value = "60s",
+        action
+    )]
+    pub writer_lease_ttl: humantime::Duration,
+
+    /// Open the catalog under the global `_catalog/` prefix so every node in
+    /// a multi-node deployment sees a single source of truth for schema,
+    /// retention, and tables. Requires an object store backend that supports
+    /// `If-None-Match: *` (S3, MinIO, Azure, GCS — InMemory and LocalFS for
+    /// dev). Defaults to `true` when `--mode` is anything other than `all`.
+    #[clap(
+        long = "shared-catalog",
+        env = "INFLUXDB3_SHARED_CATALOG",
+        action,
+        num_args = 0..=1,
+        require_equals = false,
+        default_missing_value = "true",
+    )]
+    pub shared_catalog: Option<bool>,
+
     /// Interval between compaction runs. The compactor will check for files to compact at this interval.
     #[clap(
         long = "compaction-interval",
@@ -284,6 +376,18 @@ pub struct Config {
         action
     )]
     pub min_files_for_compaction: usize,
+
+    /// Wait this long after a compaction manifest is published before deleting the
+    /// original gen{N-1} parquet files. Prevents 404 errors in queries that resolved
+    /// the old paths before the manifest landed. Set to `0s` to delete immediately
+    /// (only safe for single-node use where no remote querier exists).
+    #[clap(
+        long = "compaction-delete-grace",
+        env = "INFLUXDB3_COMPACTION_DELETE_GRACE",
+        default_value = "10m",
+        action
+    )]
+    pub compaction_delete_grace: humantime::Duration,
 
     /// The amount of time that the server looks back on startup when populating the in-memory
     /// index of gen1 files.
@@ -847,15 +951,33 @@ pub async fn command(config: Config) -> Result<()> {
     ));
 
     let process_uuid_getter: Arc<dyn ProcessUuidGetter> = Arc::new(ProcessUuidWrapper::new());
-    let catalog = Catalog::new_with_shutdown(
-        config.node_identifier_prefix.as_str(),
-        Arc::clone(&object_store),
-        Arc::clone(&time_provider),
-        Arc::clone(&metrics),
-        shutdown_manager.register(),
-        Arc::clone(&process_uuid_getter),
-    )
-    .await?;
+    // Pick shared vs per-node catalog: explicit flag wins; otherwise default
+    // to shared when the operator picked a split mode (writer/compactor/querier).
+    let shared_catalog = config
+        .shared_catalog
+        .unwrap_or(config.mode != NodeMode::All);
+    let catalog = if shared_catalog {
+        info!("opening shared catalog at _catalog/");
+        Catalog::open_shared_with_shutdown(
+            config.node_identifier_prefix.as_str(),
+            Arc::clone(&object_store),
+            Arc::clone(&time_provider),
+            Arc::clone(&metrics),
+            shutdown_manager.register(),
+            Arc::clone(&process_uuid_getter),
+        )
+        .await?
+    } else {
+        Catalog::new_with_shutdown(
+            config.node_identifier_prefix.as_str(),
+            Arc::clone(&object_store),
+            Arc::clone(&time_provider),
+            Arc::clone(&metrics),
+            shutdown_manager.register(),
+            Arc::clone(&process_uuid_getter),
+        )
+        .await?
+    };
     info!(catalog_uuid = ?catalog.catalog_uuid(), "catalog initialized");
 
     let _ = catalog
@@ -920,6 +1042,55 @@ pub async fn command(config: Config) -> Result<()> {
         wal_replay_fail_on_error: config.wal_replay_fail_on_error,
     };
 
+    // Multi-node modes (writer/compactor/querier) participate in the shared
+    // inventory: writers publish snapshots there, queriers load peers' files
+    // from it, the compactor reads from it. `All` keeps legacy single-node
+    // behavior unless the operator explicitly opts in.
+    let shared_inventory = if config.mode != NodeMode::All {
+        Some(influxdb3_write::shared_inventory::SharedInventory::new(
+            Arc::clone(&object_store),
+        ))
+    } else {
+        None
+    };
+
+    // Writer lease: ensure no other process is also accepting writes against
+    // this bucket. Acquired before WAL replay so a stale predecessor can't
+    // race the WAL writer.
+    let writer_lease_ttl: Duration = config.writer_lease_ttl.into();
+    if matches!(config.mode, NodeMode::Writer) && !writer_lease_ttl.is_zero() {
+        info!("acquiring writer lease (ttl={:?})", writer_lease_ttl);
+        let owner = format!(
+            "{}-{}",
+            config.node_identifier_prefix.as_str(),
+            *PROCESS_UUID_STR
+        );
+        let writer_lease = Arc::new(influxdb3_write::leases::Lease::new(
+            influxdb3_write::leases::LeaseConfig::new(
+                object_store::path::Path::from("_locks/writer.lease"),
+                owner,
+                writer_lease_ttl,
+            ),
+            Arc::clone(&object_store),
+        ));
+        let acquired = writer_lease
+            .try_acquire(time_provider.now().timestamp_millis())
+            .await
+            .map_err(|e| Error::WriteBufferInit(anyhow::anyhow!(
+                "failed to acquire writer lease: {e}"
+            )))?;
+        if !acquired {
+            return Err(Error::WriteBufferInit(anyhow::anyhow!(
+                "writer lease already held by another process; refusing to start"
+            )));
+        }
+        influxdb3_write::leases::run(
+            writer_lease,
+            Arc::clone(&time_provider) as _,
+            shutdown_manager.register(),
+        );
+    }
+
     let write_buffer_impl = WriteBufferImpl::new(WriteBufferImplArgs {
         persister: Arc::clone(&persister),
         catalog: Arc::clone(&catalog),
@@ -935,6 +1106,7 @@ pub async fn command(config: Config) -> Result<()> {
         n_snapshots_to_load_on_start: n_snapshots_to_load_on_start as usize,
         shutdown: shutdown_manager.register(),
         wal_replay_concurrency_limit: config.wal_replay_concurrency_limit,
+        shared_inventory: shared_inventory.clone(),
     })
     .await
     .map_err(|e| Error::WriteBufferInit(e.into()))?;
@@ -997,29 +1169,71 @@ pub async fn command(config: Config) -> Result<()> {
         ).await?;
     }
 
-    // Initialize and start compaction service
-    if config.enable_compaction {
-        info!("setting up compaction service");
+    // Compaction runs in `all` and `compactor` modes. `writer` and `querier`
+    // are explicitly not allowed to compact even if `--enable-compaction`
+    // is left at its default `true`.
+    let should_compact = config.mode.runs_compaction() && config.enable_compaction;
+    if should_compact {
+        info!("setting up compaction service ({:?} mode)", config.mode);
         let compaction_config = influxdb3_write::compaction::CompactionConfig {
-            enabled: config.enable_compaction,
+            enabled: true,
             interval: config.compaction_interval.into(),
             max_files_per_run: config.max_compaction_files,
             min_files_for_compaction: config.min_files_for_compaction,
             generation_durations,
+            delete_grace: config.compaction_delete_grace.into(),
+            checkpoint_every_n_cycles: 10,
+            claim_ttl: Duration::from_secs(30 * 60),
         };
 
-        let compaction_service = Arc::new(influxdb3_write::compaction::CompactionService::new(
+        let mut compaction_service = influxdb3_write::compaction::CompactionService::new(
             compaction_config,
             Arc::clone(&catalog),
             Arc::clone(&write_buffer_impl) as Arc<dyn WriteBuffer>,
+            Arc::clone(&persister),
             Arc::clone(&write_path_executor),
             Arc::clone(&object_store),
             Arc::clone(&time_provider),
             shutdown_manager.register(),
-        ));
+        );
+        if let Some(inv) = &shared_inventory {
+            compaction_service = compaction_service.with_shared_inventory(inv.clone());
+        }
 
+        // Advisory compactor lease. Skipped when TTL=0 (single-node operator
+        // opting out) or when running `all` mode (no peers expected).
+        let lease_ttl: Duration = config.compactor_lease_ttl.into();
+        if !lease_ttl.is_zero() && matches!(config.mode, NodeMode::Compactor) {
+            info!("acquiring compactor lease (ttl={:?})", lease_ttl);
+            let lease_owner = format!(
+                "{}-{}",
+                config.node_identifier_prefix.as_str(),
+                *PROCESS_UUID_STR
+            );
+            let lease = Arc::new(influxdb3_write::leases::Lease::new(
+                influxdb3_write::leases::LeaseConfig::new(
+                    object_store::path::Path::from("_locks/compactor.lease"),
+                    lease_owner,
+                    lease_ttl,
+                ),
+                Arc::clone(&object_store),
+            ));
+            influxdb3_write::leases::run(
+                Arc::clone(&lease),
+                Arc::clone(&time_provider) as _,
+                shutdown_manager.register(),
+            );
+            compaction_service = compaction_service.with_lease(lease);
+        }
+
+        let compaction_service = Arc::new(compaction_service);
         compaction_service.start();
         info!("compaction service started");
+    } else if !config.mode.runs_compaction() {
+        info!(
+            "compaction service disabled (mode={:?} does not run compaction)",
+            config.mode
+        );
     } else {
         info!("compaction service disabled");
     }
@@ -1103,15 +1317,22 @@ pub async fn command(config: Config) -> Result<()> {
         ))
     };
 
-    let http = Arc::new(HttpApi::new(
-        common_state.clone(),
-        Arc::clone(&time_provider) as _,
-        Arc::clone(&write_buffer),
-        Arc::clone(&query_executor) as _,
-        Arc::clone(&processing_engine),
-        config.max_http_request_size,
-        Arc::clone(&authorizer),
-    ));
+    let endpoint_policy = influxdb3_server::http::EndpointPolicy {
+        allow_write: config.mode.runs_ingest(),
+        allow_query: config.mode.runs_query(),
+    };
+    let http = Arc::new(
+        HttpApi::new(
+            common_state.clone(),
+            Arc::clone(&time_provider) as _,
+            Arc::clone(&write_buffer),
+            Arc::clone(&query_executor) as _,
+            Arc::clone(&processing_engine),
+            config.max_http_request_size,
+            Arc::clone(&authorizer),
+        )
+        .with_endpoint_policy(endpoint_policy),
+    );
 
     let server = Server::new(CreateServerArgs {
         common_state,

@@ -187,6 +187,10 @@ pub struct WriteBufferImplArgs {
     pub n_snapshots_to_load_on_start: usize,
     pub shutdown: ShutdownToken,
     pub wal_replay_concurrency_limit: Option<usize>,
+    /// Set in multi-node deployments so WAL-driven snapshots are also published
+    /// to a globally-readable namespace. `None` keeps legacy single-node
+    /// behavior (per-node snapshot prefix only).
+    pub shared_inventory: Option<crate::shared_inventory::SharedInventory>,
 }
 
 impl WriteBufferImpl {
@@ -206,6 +210,7 @@ impl WriteBufferImpl {
             n_snapshots_to_load_on_start,
             shutdown,
             wal_replay_concurrency_limit,
+            shared_inventory,
         }: WriteBufferImplArgs,
     ) -> Result<Arc<Self>> {
         // load snapshots and replay the wal into the in memory buffer
@@ -229,8 +234,34 @@ impl WriteBufferImpl {
             first_snapshot.next_file_id.set_next_id();
         }
 
+        // Load compaction manifests and replay them after WAL snapshots so their
+        // `removed_files` correctly cancel inputs that the WAL snapshots added.
+        // Compaction manifests don't drive WAL/snapshot sequence numbers.
+        let compaction_snapshots = persister.load_compaction_snapshots().await?;
+
+        let mut combined_snapshots = persisted_snapshots;
+        combined_snapshots.extend(compaction_snapshots);
+
+        // Multi-node: also fold every peer's published WAL snapshots plus
+        // checkpoint-pruned compaction manifests from the shared inventory.
+        // Order: per-node first, then global, so global `removed_files` reach
+        // entries the per-node load already added.
+        if let Some(inv) = &shared_inventory {
+            match inv.load_full_state().await {
+                Ok(loaded) => {
+                    combined_snapshots.extend(loaded.flatten());
+                }
+                Err(e) => {
+                    observability_deps::tracing::warn!(
+                        %e, "failed to load shared inventory at startup; \
+                             only local node's data will be visible"
+                    );
+                }
+            }
+        }
+
         let persisted_files = Arc::new(PersistedFiles::new_from_persisted_snapshots(
-            persisted_snapshots,
+            combined_snapshots,
         ));
         let queryable_buffer = Arc::new(QueryableBuffer::new(QueryableBufferArgs {
             executor,
@@ -240,6 +271,7 @@ impl WriteBufferImpl {
             distinct_cache_provider: Arc::clone(&distinct_cache),
             persisted_files: Arc::clone(&persisted_files),
             parquet_cache: parquet_cache.clone(),
+            shared_inventory: shared_inventory.clone(),
         }));
 
         // create the wal instance, which will replay into the queryable buffer and start
@@ -607,8 +639,8 @@ impl LastCacheManager for WriteBufferImpl {
 }
 
 impl WriteBuffer for WriteBufferImpl {
-    fn persisted_files(&self) -> Arc<dyn std::any::Any> {
-        Arc::clone(&self.persisted_files) as Arc<dyn std::any::Any>
+    fn persisted_files(&self) -> Arc<dyn std::any::Any + Send + Sync> {
+        Arc::clone(&self.persisted_files) as Arc<dyn std::any::Any + Send + Sync>
     }
 }
 
@@ -794,6 +826,7 @@ mod tests {
             n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
             shutdown: ShutdownManager::new_testing().register(),
             wal_replay_concurrency_limit: Some(1),
+            shared_inventory: None,
         })
         .await
         .unwrap();
@@ -905,6 +938,7 @@ mod tests {
             n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
             shutdown: ShutdownManager::new_testing().register(),
             wal_replay_concurrency_limit: Some(1),
+            shared_inventory: None,
         })
         .await
         .unwrap();
@@ -1001,6 +1035,7 @@ mod tests {
                 n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
                 shutdown: ShutdownManager::new_testing().register(),
                 wal_replay_concurrency_limit: Some(1),
+                shared_inventory: None,
             })
             .await
             .unwrap()
@@ -1264,6 +1299,7 @@ mod tests {
             n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
             shutdown: ShutdownManager::new_testing().register(),
             wal_replay_concurrency_limit: Some(1),
+            shared_inventory: None,
         })
         .await
         .unwrap();
@@ -3461,6 +3497,7 @@ mod tests {
             n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
             shutdown: ShutdownManager::new_testing().register(),
             wal_replay_concurrency_limit: None,
+            shared_inventory: None,
         })
         .await
         .unwrap();

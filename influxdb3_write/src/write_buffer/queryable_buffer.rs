@@ -26,7 +26,7 @@ use iox_query::exec::Executor;
 use iox_query::frontend::reorg::ReorgPlanner;
 use object_store::Error;
 use object_store::path::Path;
-use observability_deps::tracing::{error, info};
+use observability_deps::tracing::{error, info, warn};
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use parquet::format::FileMetaData;
@@ -48,6 +48,9 @@ pub struct QueryableBuffer {
     persisted_files: Arc<PersistedFiles>,
     buffer: Arc<RwLock<BufferState>>,
     parquet_cache: Option<Arc<dyn ParquetCacheOracle>>,
+    /// When set, every successful WAL-driven snapshot also gets dual-published
+    /// to the shared inventory so peer queriers and the compactor see it.
+    shared_inventory: Option<crate::shared_inventory::SharedInventory>,
     /// Sends a notification to this watch channel whenever a snapshot info is persisted
     persisted_snapshot_notify_rx: tokio::sync::watch::Receiver<Option<PersistedSnapshotVersion>>,
     persisted_snapshot_notify_tx: tokio::sync::watch::Sender<Option<PersistedSnapshotVersion>>,
@@ -62,6 +65,7 @@ pub struct QueryableBufferArgs {
     pub distinct_cache_provider: Arc<DistinctCacheProvider>,
     pub persisted_files: Arc<PersistedFiles>,
     pub parquet_cache: Option<Arc<dyn ParquetCacheOracle>>,
+    pub shared_inventory: Option<crate::shared_inventory::SharedInventory>,
 }
 
 impl QueryableBuffer {
@@ -74,6 +78,7 @@ impl QueryableBuffer {
             distinct_cache_provider,
             persisted_files,
             parquet_cache,
+            shared_inventory,
         }: QueryableBufferArgs,
     ) -> Self {
         let buffer = Arc::new(RwLock::new(BufferState::new(Arc::clone(&catalog))));
@@ -88,6 +93,7 @@ impl QueryableBuffer {
             persisted_files,
             buffer,
             parquet_cache,
+            shared_inventory,
             persisted_snapshot_notify_rx,
             persisted_snapshot_notify_tx,
         }
@@ -280,6 +286,7 @@ impl QueryableBuffer {
         let catalog = Arc::clone(&self.catalog);
         let notify_snapshot_tx = self.persisted_snapshot_notify_tx.clone();
         let parquet_cache = self.parquet_cache.clone();
+        let shared_inventory = self.shared_inventory.clone();
 
         tokio::spawn(async move {
             info!(
@@ -413,6 +420,20 @@ impl QueryableBuffer {
                 loop {
                     match persister.persist_snapshot(&persisted_snapshot).await {
                         Ok(_) => {
+                            // Dual-publish to shared inventory so peer queriers
+                            // and the dedicated compactor see this snapshot.
+                            // Best-effort: a failure here doesn't roll back the
+                            // primary persist — peers will pick it up on the
+                            // next checkpoint refresh.
+                            if let Some(inv) = &shared_inventory {
+                                let PersistedSnapshotVersion::V1(ps) = &persisted_snapshot;
+                                if let Err(e) = inv
+                                    .publish_wal_snapshot(persister.node_identifier_prefix(), ps)
+                                    .await
+                                {
+                                    warn!(%e, "failed to publish snapshot to shared inventory");
+                                }
+                            }
                             let persisted_snapshot = Some(persisted_snapshot.clone());
                             notify_snapshot_tx
                                 .send(persisted_snapshot)
@@ -728,6 +749,7 @@ mod tests {
             .unwrap(),
             persisted_files: Arc::new(PersistedFiles::new()),
             parquet_cache: None,
+            shared_inventory: None,
         };
         let queryable_buffer = QueryableBuffer::new(queryable_buffer_args);
 
@@ -932,6 +954,7 @@ mod tests {
             .unwrap(),
             persisted_files: Arc::new(PersistedFiles::new()),
             parquet_cache: None,
+            shared_inventory: None,
         };
         let queryable_buffer = QueryableBuffer::new(queryable_buffer_args);
 

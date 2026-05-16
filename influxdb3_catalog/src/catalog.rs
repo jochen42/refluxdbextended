@@ -166,6 +166,11 @@ impl CatalogState {
 
 const CATALOG_CHECKPOINT_INTERVAL: u64 = 100;
 
+/// Object-store prefix used when the catalog runs in shared multi-node mode.
+/// Every writer/compactor/querier opens the catalog under this same prefix
+/// so all schema changes are seen by every node.
+pub const SHARED_CATALOG_PREFIX: &str = "_catalog";
+
 #[derive(Clone, Copy, Debug)]
 pub struct CatalogArgs {
     pub default_hard_delete_duration: Duration,
@@ -264,6 +269,54 @@ impl Catalog {
                 .subscribe_to_updates("catalog_operation_metrics")
                 .await,
         );
+        Ok(catalog)
+    }
+
+    /// Open the catalog at the global `_catalog/` prefix. Every node in a
+    /// multi-node deployment opens this same catalog so schema, retention,
+    /// and table inventory are consistent across writer, compactor, and
+    /// queriers. The catalog log files already use `PutMode::Create` for
+    /// optimistic concurrency, so safe under concurrent writers as long as
+    /// the backing object store supports `If-None-Match: *`.
+    pub async fn open_shared(
+        store: Arc<dyn ObjectStore>,
+        time_provider: Arc<dyn TimeProvider>,
+        metric_registry: Arc<Registry>,
+    ) -> Result<Self> {
+        Self::new(SHARED_CATALOG_PREFIX, store, time_provider, metric_registry).await
+    }
+
+    /// Same as [`open_shared`] but also spawns the node-state shutdown hook
+    /// keyed on the supplied process-specific `node_id`.
+    pub async fn open_shared_with_shutdown(
+        node_id: impl Into<Arc<str>>,
+        store: Arc<dyn ObjectStore>,
+        time_provider: Arc<dyn TimeProvider>,
+        metric_registry: Arc<Registry>,
+        shutdown_token: ShutdownToken,
+        process_uuid_getter: Arc<dyn ProcessUuidGetter>,
+    ) -> Result<Arc<Self>> {
+        let node_id = node_id.into();
+        let catalog =
+            Arc::new(Self::open_shared(store, time_provider, metric_registry).await?);
+        let catalog_cloned = Arc::clone(&catalog);
+        tokio::spawn(async move {
+            shutdown_token.wait_for_shutdown().await;
+            info!(
+                node_id = node_id.as_ref(),
+                "updating node state to stopped in shared catalog"
+            );
+            if let Err(error) = catalog_cloned
+                .update_node_state_stopped(node_id.as_ref(), process_uuid_getter)
+                .await
+            {
+                error!(
+                    ?error,
+                    node_id = node_id.as_ref(),
+                    "encountered error while updating node to stopped state in shared catalog"
+                );
+            }
+        });
         Ok(catalog)
     }
 

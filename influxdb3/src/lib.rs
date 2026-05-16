@@ -31,6 +31,7 @@ pub mod commands {
     pub mod enable;
     pub mod helpers;
     pub mod install;
+    pub mod migrate;
     pub mod query;
     pub mod serve;
     pub mod show;
@@ -110,6 +111,8 @@ enum Command {
     Update(commands::update::Config),
     /// Perform a set of writes to a running InfluxDB 3 Core server
     Write(commands::write::Config),
+    /// Migrate on-disk state for multi-node deployments
+    Migrate(commands::migrate::Config),
 }
 
 pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
@@ -218,6 +221,12 @@ pub fn startup(args: Vec<String>) -> Result<(), std::io::Error> {
             Some(Command::Write(config)) => {
                 if let Err(e) = commands::write::command(config).await {
                     eprintln!("Write command failed: {e}");
+                    std::process::exit(ReturnCode::Failure as _)
+                }
+            }
+            Some(Command::Migrate(config)) => {
+                if let Err(e) = commands::migrate::command(config).await {
+                    eprintln!("Migrate command failed: {e}");
                     std::process::exit(ReturnCode::Failure as _)
                 }
             }

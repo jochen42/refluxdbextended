@@ -1,12 +1,18 @@
-use crate::{ParquetFile, ParquetFileId, WriteBuffer};
+use crate::leases::Lease;
+use crate::persister::Persister;
+use crate::shared_inventory::SharedInventory;
+use crate::write_buffer::persisted_files::PersistedFiles;
+use crate::{DatabaseTables, ParquetFile, ParquetFileId, PersistedSnapshot, WriteBuffer};
+use bytes::Bytes;
+use object_store::{PutMode, PutOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use datafusion_util::stream_from_batches;
 use influxdb3_catalog::catalog::Catalog;
-use influxdb3_id::{DbId, TableId};
+use influxdb3_id::{DbId, SerdeVecMap, TableId};
+use influxdb3_wal::{SnapshotSequenceNumber, WalFileSequenceNumber};
 use iox_query::exec::Executor;
 use iox_query::frontend::reorg::ReorgPlanner;
-use iox_time::TimeProvider;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjPath;
 use observability_deps::tracing::{debug, error, info, warn};
@@ -16,6 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
+use uuid::Uuid;
 
 /// Configuration for the compaction service
 #[derive(Debug, Clone)]
@@ -30,6 +37,19 @@ pub struct CompactionConfig {
     pub min_files_for_compaction: usize,
     /// Generation durations for each level
     pub generation_durations: HashMap<u8, Duration>,
+    /// Wait this long after publishing a compaction manifest before deleting the
+    /// original gen{n-1} parquet files. Prevents 404s on in-flight queries that
+    /// resolved the old paths before the manifest landed. Should be greater than
+    /// the longest expected query duration.
+    pub delete_grace: Duration,
+    /// Write a materialized inventory checkpoint after this many compaction
+    /// cycles. Loaders use the latest checkpoint to bound startup cost as the
+    /// number of WAL snapshots + compaction manifests grows. `0` disables.
+    pub checkpoint_every_n_cycles: u32,
+    /// How long a per-table compaction claim is considered fresh. A stale
+    /// claim left by a crashed compactor older than this can be taken over.
+    /// Should exceed the longest expected single-job compaction time.
+    pub claim_ttl: Duration,
 }
 
 impl Default for CompactionConfig {
@@ -40,6 +60,9 @@ impl Default for CompactionConfig {
             max_files_per_run: 100,
             min_files_for_compaction: 10,
             generation_durations: HashMap::new(),
+            delete_grace: Duration::from_secs(600), // 10 minutes
+            checkpoint_every_n_cycles: 10,
+            claim_ttl: Duration::from_secs(30 * 60), // 30 minutes
         }
     }
 }
@@ -48,6 +71,7 @@ impl Default for CompactionConfig {
 #[derive(Debug, Clone)]
 pub struct CompactionJob {
     pub database_id: DbId,
+    pub database_name: Arc<str>,
     pub table_id: TableId,
     pub table_name: Arc<str>,
     pub source_generation: u8,
@@ -71,9 +95,20 @@ pub struct CompactionService {
     config: CompactionConfig,
     catalog: Arc<Catalog>,
     write_buffer: Arc<dyn WriteBuffer>,
+    persister: Arc<Persister>,
     executor: Arc<Executor>,
     object_store: Arc<dyn ObjectStore>,
-    time_provider: Arc<dyn TimeProvider>,
+    /// Optional singleton lease. When set, `run_compaction_cycle` is gated on
+    /// `lease.is_leader(now)` so two compactor processes pointed at the same
+    /// bucket cannot duplicate work. When `None`, the service runs
+    /// unconditionally (legacy single-node behaviour).
+    lease: Option<Arc<Lease>>,
+    /// Optional cross-node inventory. When set, every compaction manifest is
+    /// also published into it so peer queriers see the resulting gen{N} file.
+    shared_inventory: Option<SharedInventory>,
+    /// Counter for "successful cycle" used to decide when to flush a checkpoint.
+    cycle_count: std::sync::atomic::AtomicU64,
+    time_provider: Arc<dyn iox_time::TimeProvider>,
     shutdown_token: influxdb3_shutdown::ShutdownToken,
 }
 
@@ -82,20 +117,39 @@ impl CompactionService {
         config: CompactionConfig,
         catalog: Arc<Catalog>,
         write_buffer: Arc<dyn WriteBuffer>,
+        persister: Arc<Persister>,
         executor: Arc<Executor>,
         object_store: Arc<dyn ObjectStore>,
-        time_provider: Arc<dyn TimeProvider>,
+        time_provider: Arc<dyn iox_time::TimeProvider>,
         shutdown_token: influxdb3_shutdown::ShutdownToken,
     ) -> Self {
         Self {
             config,
             catalog,
             write_buffer,
+            persister,
             executor,
             object_store,
+            lease: None,
+            shared_inventory: None,
+            cycle_count: std::sync::atomic::AtomicU64::new(0),
             time_provider,
             shutdown_token,
         }
+    }
+
+    /// Attach a singleton lease. Use [`crate::leases::run`] to drive
+    /// acquisition + refresh in the background before calling [`Self::start`].
+    pub fn with_lease(mut self, lease: Arc<Lease>) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
+    /// Publish manifests to the shared inventory so peer queriers and other
+    /// compactor processes (e.g. running under per-table claims) see them.
+    pub fn with_shared_inventory(mut self, inv: SharedInventory) -> Self {
+        self.shared_inventory = Some(inv);
+        self
     }
 
     /// Start the background compaction service
@@ -106,14 +160,24 @@ impl CompactionService {
                 return;
             }
 
-            info!("Starting compaction service with interval: {:?}", self.config.interval);
-            
+            info!(
+                "Starting compaction service with interval: {:?}",
+                self.config.interval
+            );
+
             let mut interval = tokio::time::interval(self.config.interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        if let Some(lease) = &self.lease {
+                            let now_ms = self.time_provider.now().timestamp_millis();
+                            if !lease.is_leader(now_ms) {
+                                debug!("compaction cycle skipped — lease not held");
+                                continue;
+                            }
+                        }
                         if let Err(e) = Arc::clone(&self).run_compaction_cycle().await {
                             error!("Compaction cycle failed: {}", e);
                         }
@@ -130,7 +194,7 @@ impl CompactionService {
     /// Run a single compaction cycle
     async fn run_compaction_cycle(self: &Arc<Self>) -> Result<()> {
         debug!("Starting compaction cycle");
-        
+
         let jobs = self.identify_compaction_jobs().await?;
         if jobs.is_empty() {
             debug!("No compaction jobs identified");
@@ -138,7 +202,7 @@ impl CompactionService {
         }
 
         info!("Identified {} compaction jobs", jobs.len());
-        
+
         let mut set = JoinSet::new();
         let mut completed_jobs = 0;
         let max_concurrent = std::cmp::min(jobs.len(), 4); // Limit concurrent compactions
@@ -155,9 +219,7 @@ impl CompactionService {
             }
 
             let service = Arc::clone(self);
-            set.spawn(async move {
-                service.execute_compaction_job(job).await
-            });
+            set.spawn(async move { service.execute_compaction_job(job).await });
         }
 
         // Wait for remaining jobs
@@ -169,17 +231,78 @@ impl CompactionService {
             }
         }
 
-        info!("Compaction cycle completed: {} jobs processed", completed_jobs);
+        info!(
+            "Compaction cycle completed: {} jobs processed",
+            completed_jobs
+        );
+
+        // Periodically materialize the inventory state as a checkpoint so
+        // future restart/load cost stays bounded as manifests accumulate.
+        let n = self.config.checkpoint_every_n_cycles;
+        if n > 0 && self.shared_inventory.is_some() {
+            let cycle = self
+                .cycle_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if cycle % u64::from(n) == 0 {
+                if let Err(e) = self.write_inventory_checkpoint().await {
+                    warn!(%e, "failed to write inventory checkpoint");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Build a `Checkpoint` from the current in-memory `PersistedFiles` state
+    /// and write it to the shared inventory. Future loaders will start from
+    /// the latest checkpoint instead of folding every WAL + compaction
+    /// manifest from scratch.
+    async fn write_inventory_checkpoint(&self) -> Result<()> {
+        let Some(inv) = &self.shared_inventory else {
+            return Ok(());
+        };
+        let any_arc = self.write_buffer.persisted_files();
+        let Ok(persisted_files) = Arc::downcast::<PersistedFiles>(any_arc) else {
+            return Ok(());
+        };
+
+        // Synthesize a `PersistedSnapshot` containing every live file. The
+        // checkpoint's `merged_snapshot` will be the only entry loaders need
+        // to fold before applying newer WAL/compaction manifests on top.
+        let mut merged = PersistedSnapshot::new(
+            self.persister.node_identifier_prefix().to_string(),
+            SnapshotSequenceNumber::new(0),
+            WalFileSequenceNumber::new(0),
+            self.catalog.sequence_number(),
+        );
+        for (db_id, table_id, files) in persisted_files.snapshot_all() {
+            for file in files {
+                merged.add_parquet_file(db_id, table_id, file);
+            }
+        }
+
+        // Per-node WAL high-water marks: the largest snapshot sequence number
+        // we have folded into our view. We don't track this perfectly today
+        // (the manifest doesn't expose source per-file), so we conservatively
+        // leave the map empty — loaders fall back to the per-node `load_snapshots`
+        // for safety.
+        let cp = crate::shared_inventory::Checkpoint {
+            wal_high_water: Default::default(),
+            compactions_high_water: None,
+            merged_snapshot: merged,
+        };
+        inv.write_checkpoint(&cp).await?;
         Ok(())
     }
 
     /// Identify files that need compaction
-    async fn identify_compaction_jobs(&self) -> Result<Vec<CompactionJob>> {
+    pub async fn identify_compaction_jobs(&self) -> Result<Vec<CompactionJob>> {
         let mut jobs = Vec::new();
-        
+
         // Get all databases and tables
         let databases = self.catalog.list_db_schema();
-        
+
         for db_schema in databases {
             if db_schema.deleted {
                 continue;
@@ -191,17 +314,22 @@ impl CompactionService {
                 }
 
                 // Get files for this table
-                let files = self.write_buffer.parquet_files(db_schema.id, table_def.table_id);
+                let files = self
+                    .write_buffer
+                    .parquet_files(db_schema.id, table_def.table_id);
                 if files.len() < self.config.min_files_for_compaction {
                     continue;
                 }
 
                 // Group files by generation level and check for compaction opportunities
                 let mut files_by_generation: BTreeMap<u8, Vec<ParquetFile>> = BTreeMap::new();
-                
+
                 for file in files {
                     let generation = self.get_file_generation(&file)?;
-                    files_by_generation.entry(generation).or_default().push(file);
+                    files_by_generation
+                        .entry(generation)
+                        .or_default()
+                        .push(file);
                 }
 
                 // Check each generation level for compaction opportunities
@@ -212,11 +340,14 @@ impl CompactionService {
 
                     // Check if we can compact to the next generation
                     if let Some(next_gen) = self.get_next_generation(*current_gen) {
-                        if let Some(target_duration) = self.config.generation_durations.get(&next_gen) {
+                        if let Some(target_duration) =
+                            self.config.generation_durations.get(&next_gen)
+                        {
                             // Check if files span the target duration
                             if self.can_compact_to_generation(files, *target_duration) {
                                 jobs.push(CompactionJob {
                                     database_id: db_schema.id,
+                                    database_name: Arc::clone(&db_schema.name),
                                     table_id: table_def.table_id,
                                     table_name: Arc::clone(&table_def.table_name),
                                     source_generation: *current_gen,
@@ -235,33 +366,85 @@ impl CompactionService {
         Ok(jobs)
     }
 
-    /// Execute a single compaction job
-    async fn execute_compaction_job(&self, job: CompactionJob) -> Result<CompactionResult> {
+    /// Execute a single compaction job.
+    ///
+    /// Compaction is publish-then-delete:
+    /// 1. Sort/dedupe inputs through DataFusion.
+    /// 2. Upload the resulting parquet bytes to the object store under a `gen{N}` path.
+    /// 3. Emit a `PersistedSnapshot` manifest with the new file in `databases` and the
+    ///    inputs in `removed_files`, then `put` it under `{host}/compactions/`.
+    /// 4. Update the in-memory `PersistedFiles` (add new, remove old) so queries see the
+    ///    compacted file immediately.
+    /// 5. Best-effort delete the input parquet objects.
+    ///
+    /// If the process crashes before step 3 finishes, the inputs remain referenced and
+    /// the compaction is a no-op on the next run. If it crashes between step 3 and 5,
+    /// the inputs become orphaned objects but no data is lost.
+    pub async fn execute_compaction_job(
+        &self,
+        job: CompactionJob,
+    ) -> Result<CompactionResult> {
         info!(
-            "Starting compaction job: db={}, table={}, gen{}->gen{}",
-            job.database_id, job.table_name, job.source_generation, job.target_generation
+            "Starting compaction job: db={}, table={}, gen{}->gen{}, inputs={}",
+            job.database_name,
+            job.table_name,
+            job.source_generation,
+            job.target_generation,
+            job.files.len()
         );
 
-        // Validate sort key configuration
         if job.sort_key.is_empty() {
-            return Err(anyhow::anyhow!("Cannot compact table {}: sort key is empty", job.table_name));
+            return Err(anyhow::anyhow!(
+                "Cannot compact table {}: sort key is empty",
+                job.table_name
+            ));
         }
+
+        // Per-table claim: only one compactor process at a time may work on
+        // this exact (db, table, src_gen, dst_gen) tuple. Other concurrent
+        // compactors targeting OTHER tables continue in parallel.
+        let claim_path = self.claim_path(&job);
+        if !self.acquire_claim(&claim_path).await? {
+            debug!(
+                "compaction claim {} held by another worker; skipping",
+                claim_path
+            );
+            return Ok(CompactionResult {
+                compacted_files: vec![],
+                deleted_files: vec![],
+                total_size_reduction: 0,
+                total_rows_compacted: 0,
+            });
+        }
+
+        // Defer release until the job exits (success OR failure). Use a guard
+        // so panics within DataFusion don't leak the claim.
+        struct ClaimGuard<'a> {
+            store: &'a Arc<dyn ObjectStore>,
+            path: ObjPath,
+        }
+        impl Drop for ClaimGuard<'_> {
+            fn drop(&mut self) {
+                // tokio::spawn since Drop can't be async; best-effort.
+                let store = Arc::clone(self.store);
+                let path = self.path.clone();
+                tokio::spawn(async move {
+                    let _ = store.delete(&path).await;
+                });
+            }
+        }
+        let _claim_guard = ClaimGuard {
+            store: &self.object_store,
+            path: claim_path.clone(),
+        };
 
         let start_time = std::time::Instant::now();
         let total_input_size: u64 = job.files.iter().map(|f| f.size_bytes).sum();
-        let _total_input_rows: u64 = job.files.iter().map(|f| f.row_count).sum();
 
-        // Create chunks from the parquet files
+        // Build chunks and run the compaction plan.
         let chunks = self.create_chunks_from_files(&job.files, &job.schema).await?;
-
-        // Execute compaction using DataFusion
         let ctx = self.executor.new_context();
-        
-        info!(
-            "Creating compaction plan with sort key: {:?} for table {}",
-            job.sort_key, job.table_name
-        );
-        
+
         let logical_plan = ReorgPlanner::new()
             .compact_plan(
                 data_types::TableId::new(0),
@@ -282,46 +465,60 @@ impl CompactionService {
             .await
             .context("failed to execute compaction")?;
 
-        // Write compacted data to new files
-        let compacted_files = self.write_compacted_files(
-            &job,
-            data,
-            &job.schema,
-        ).await?;
+        // Write all output batches to a single compacted parquet file. We intentionally
+        // do not split by `target_duration` here — that duration controls when
+        // compaction triggers, not how the output is sliced.
+        let compaction_id = Uuid::now_v7().to_string();
+        let compacted_file = self
+            .write_compacted_file(&job, data, &compaction_id)
+            .await?;
 
-        // Validate that the compacted data is properly sorted
-        self.validate_compacted_data(&compacted_files).await?;
+        let new_files = match compacted_file {
+            Some(file) => vec![file],
+            None => {
+                info!(
+                    "Compaction produced no rows for {}/{}; skipping publish",
+                    job.database_name, job.table_name
+                );
+                return Ok(CompactionResult {
+                    compacted_files: vec![],
+                    deleted_files: vec![],
+                    total_size_reduction: 0,
+                    total_rows_compacted: 0,
+                });
+            }
+        };
 
-        // Update catalog: add new compacted files and remove old files
-        self.update_catalog_for_compaction(&job, &compacted_files, &job.files).await?;
+        // Publish: persist the manifest, update in-memory state, then delete inputs.
+        self.publish_compaction(&job, &new_files, &job.files, &compaction_id)
+            .await?;
 
-        // Calculate results
-        let total_output_size: u64 = compacted_files.iter().map(|f| f.size_bytes).sum();
-        let total_output_rows: u64 = compacted_files.iter().map(|f| f.row_count).sum();
+        let total_output_size: u64 = new_files.iter().map(|f| f.size_bytes).sum();
+        let total_output_rows: u64 = new_files.iter().map(|f| f.row_count).sum();
         let size_reduction = total_input_size.saturating_sub(total_output_size);
 
         let result = CompactionResult {
-            compacted_files,
+            compacted_files: new_files,
             deleted_files: job.files.clone(),
             total_size_reduction: size_reduction,
             total_rows_compacted: total_output_rows,
         };
 
         let duration = start_time.elapsed();
-        let files_len = result.deleted_files.len();
         info!(
             "Compaction completed: {} files -> {} files, {} rows, {} bytes -> {} bytes ({}% reduction) in {:?}",
-            files_len,
+            result.deleted_files.len(),
             result.compacted_files.len(),
             total_output_rows,
             total_input_size,
             total_output_size,
-            if total_input_size > 0 { (size_reduction * 100) / total_input_size } else { 0 },
+            if total_input_size > 0 {
+                (size_reduction * 100) / total_input_size
+            } else {
+                0
+            },
             duration
         );
-
-        // Log detailed compaction statistics
-        self.log_compaction_statistics(&job, &result, duration).await;
 
         Ok(result)
     }
@@ -332,13 +529,13 @@ impl CompactionService {
         files: &[ParquetFile],
         schema: &Schema,
     ) -> Result<Vec<Arc<dyn iox_query::QueryChunk>>> {
-        let mut chunks = Vec::new();
-        
+        let mut chunks = Vec::with_capacity(files.len());
+
         for (i, file) in files.iter().enumerate() {
             let chunk = crate::write_buffer::parquet_chunk_from_file(
                 file,
                 schema,
-                datafusion::execution::object_store::ObjectStoreUrl::parse("file://")?,
+                self.persister.object_store_url().clone(),
                 Arc::clone(&self.object_store),
                 i as i64,
             );
@@ -348,138 +545,184 @@ impl CompactionService {
         Ok(chunks)
     }
 
-    /// Write compacted data to new parquet files
-    async fn write_compacted_files(
+    /// Serialize the compacted record batches to one parquet file and put it on the
+    /// object store. Returns `None` if there are no rows to write.
+    async fn write_compacted_file(
         &self,
         job: &CompactionJob,
         data: Vec<arrow::record_batch::RecordBatch>,
-        schema: &Schema,
-    ) -> Result<Vec<ParquetFile>> {
-        let mut compacted_files = Vec::new();
-        
-        for (i, batch) in data.into_iter().enumerate() {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-
-            // Calculate min_time and max_time from the batch
-            let (min_time, max_time) = self.calculate_time_range_from_batch(&batch)?;
-            
-            // Generate new file path for the target generation
-            let target_duration = self.config.generation_durations.get(&job.target_generation)
-                .ok_or_else(|| anyhow::anyhow!("No duration configured for generation {}", job.target_generation))?;
-            
-            let chunk_time = self.calculate_chunk_time_for_generation(&batch, target_duration);
-            let path = self.generate_file_path(job, job.target_generation, chunk_time, i).await?;
-
-            // Write the batch to parquet
-            let batch_stream = stream_from_batches(schema.as_arrow(), vec![batch.clone()]);
-            let parquet_bytes = crate::persister::serialize_to_parquet(
-                Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default()),
-                batch_stream,
-            ).await?;
-
-            let parquet_file = ParquetFile {
-                id: ParquetFileId::new(),
-                path: path.to_string(),
-                size_bytes: parquet_bytes.bytes.len() as u64,
-                row_count: batch.num_rows() as u64,
-                chunk_time,
-                min_time,
-                max_time,
-            };
-
-            compacted_files.push(parquet_file);
+        compaction_id: &str,
+    ) -> Result<Option<ParquetFile>> {
+        let non_empty: Vec<_> = data.into_iter().filter(|b| b.num_rows() > 0).collect();
+        if non_empty.is_empty() {
+            return Ok(None);
         }
 
-        Ok(compacted_files)
+        let (min_time, max_time, row_count) = batches_time_range_and_rows(&non_empty)?;
+        let target_duration = self
+            .config
+            .generation_durations
+            .get(&job.target_generation)
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No duration configured for generation {}",
+                    job.target_generation
+                )
+            })?;
+        let chunk_time = chunk_time_for_duration(min_time, target_duration);
+
+        let path = self.compacted_file_path(job, job.target_generation, chunk_time, compaction_id);
+
+        let batch_stream = stream_from_batches(job.schema.as_arrow(), non_empty);
+        let (size_bytes, _meta, _to_cache) = self
+            .persister
+            .persist_parquet_file(
+                crate::paths::ParquetFilePath::from_obj_path(path.clone()),
+                batch_stream,
+            )
+            .await
+            .context("failed to upload compacted parquet to object store")?;
+
+        Ok(Some(ParquetFile {
+            id: ParquetFileId::new(),
+            path: path.to_string(),
+            size_bytes,
+            row_count,
+            chunk_time,
+            min_time,
+            max_time,
+        }))
     }
 
-    /// Validate that the compacted data is properly sorted
-    async fn validate_compacted_data(&self, compacted_files: &[ParquetFile]) -> Result<()> {
-        if compacted_files.len() <= 1 {
-            return Ok(());
+    /// Persist a compaction manifest and update in-memory state atomically from the
+    /// query layer's perspective. The manifest is what makes the change survive a
+    /// restart; the in-memory update is what makes it visible to running queries.
+    async fn publish_compaction(
+        &self,
+        job: &CompactionJob,
+        new_files: &[ParquetFile],
+        old_files: &[ParquetFile],
+        compaction_id: &str,
+    ) -> Result<()> {
+        // Build the manifest. snapshot/wal sequence numbers are unused for compaction
+        // manifests (separate path, separate counter); set them to 0.
+        let mut snapshot = PersistedSnapshot::new(
+            self.persister.node_identifier_prefix().to_string(),
+            SnapshotSequenceNumber::new(0),
+            WalFileSequenceNumber::new(0),
+            self.catalog.sequence_number(),
+        );
+        for file in new_files {
+            snapshot.add_parquet_file(job.database_id, job.table_id, file.clone());
         }
+        let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
+        removed
+            .entry(job.database_id)
+            .or_default()
+            .tables
+            .entry(job.table_id)
+            .or_default()
+            .extend(old_files.iter().cloned());
+        snapshot.removed_files = removed;
 
-        // Check that files are sorted by min_time
-        for i in 1..compacted_files.len() {
-            let prev_file = &compacted_files[i - 1];
-            let curr_file = &compacted_files[i];
-            
-            if curr_file.min_time < prev_file.min_time {
-                return Err(anyhow::anyhow!(
-                    "Compacted files are not sorted by time. File {} (min_time: {}) comes before file {} (min_time: {})",
-                    curr_file.path, curr_file.min_time, prev_file.path, prev_file.min_time
-                ));
+        self.persister
+            .persist_compaction_snapshot(compaction_id, &snapshot)
+            .await
+            .context("failed to persist compaction manifest")?;
+
+        // Dual-publish to the cross-node inventory so peer queriers can fold
+        // this compaction into their `PersistedFiles` view on their next poll.
+        // Best-effort: a failure here doesn't roll back the primary manifest —
+        // peers see slightly stale state until the next refresh.
+        if let Some(inv) = &self.shared_inventory {
+            if let Err(e) = inv.publish_compaction(compaction_id, &snapshot).await {
+                warn!(%e, "failed to publish compaction manifest to shared inventory");
             }
         }
 
-        info!("Validated {} compacted files are properly sorted by time", compacted_files.len());
+        // Manifest is durable: now update in-memory state.
+        let any_arc = self.write_buffer.persisted_files();
+        match Arc::downcast::<PersistedFiles>(any_arc) {
+            Ok(persisted_files) => {
+                for file in new_files {
+                    persisted_files.add_persisted_file(&job.database_id, &job.table_id, file);
+                }
+                persisted_files.remove_persisted_files(
+                    &job.database_id,
+                    &job.table_id,
+                    old_files,
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "compaction publish: write_buffer.persisted_files() did not downcast to PersistedFiles; \
+                     new files will only be visible after restart"
+                );
+            }
+        }
+
+        // Best-effort delete of original objects, after `delete_grace` so any
+        // queries that resolved the old paths before the manifest landed can
+        // finish reading them. Surviving objects after retries become orphans
+        // (no manifest references them) — they don't cause data loss.
+        let grace = self.config.delete_grace;
+        for file in old_files {
+            let path = ObjPath::from(file.path.clone());
+            let object_store = Arc::clone(&self.object_store);
+            tokio::spawn(async move {
+                if !grace.is_zero() {
+                    tokio::time::sleep(grace).await;
+                }
+                let mut retry = 0u32;
+                while retry <= 5 {
+                    match object_store.delete(&path).await {
+                        Ok(()) => break,
+                        Err(object_store::Error::NotFound { .. }) => break,
+                        Err(e) => {
+                            retry += 1;
+                            warn!(
+                                "compaction delete retry {} for {}: {}",
+                                retry, path, e
+                            );
+                            tokio::time::sleep(Duration::from_secs(u64::from(retry) * 2))
+                                .await;
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(())
     }
 
-    /// Calculate min_time and max_time from a record batch
-    fn calculate_time_range_from_batch(&self, batch: &arrow::record_batch::RecordBatch) -> Result<(i64, i64)> {
-        // Find the time column index
-        let time_col_idx = batch
-            .schema()
-            .fields()
-            .iter()
-            .position(|field| field.name() == "time")
-            .ok_or_else(|| anyhow::anyhow!("No time column found in batch"))?;
-
-        // Get the time column as a timestamp array
-        let time_array = batch
-            .column(time_col_idx)
-            .as_any()
-            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
-            .ok_or_else(|| anyhow::anyhow!("Time column is not a timestamp array"))?;
-
-        if time_array.len() == 0 {
-            return Ok((0, 0));
-        }
-
-        let min_time = time_array.value(0);
-        let max_time = time_array.value(time_array.len() - 1);
-
-        // Ensure the array is sorted (it should be from ReorgPlanner)
-        for i in 1..time_array.len() {
-            let current = time_array.value(i);
-            if current < min_time {
-                return Err(anyhow::anyhow!("Time column is not sorted: found {} after {}", current, min_time));
-            }
-        }
-
-        Ok((min_time, max_time))
-    }
-
-    /// Get the generation level for a file based on its path
+    /// Get the generation level for a file based on its path.
     fn get_file_generation(&self, file: &ParquetFile) -> Result<u8> {
-        // Parse generation from file path
-        // Expected format: dbs/{table}-{db_id}/{table}-{table_id}/gen{level}/{YYYY-MM-DD}/{HH-MM}/{file_index}.parquet
         let path = &file.path;
-        
-        // Look for "gen{level}" in the path
+
         if let Some(gen_start) = path.find("/gen") {
-            let gen_part = &path[gen_start + 4..]; // Skip "/gen"
+            let gen_part = &path[gen_start + 4..];
             if let Some(gen_end) = gen_part.find('/') {
                 let gen_str = &gen_part[..gen_end];
                 match gen_str.parse::<u8>() {
-                    Ok(generation) if generation >= 1 && generation <= 5 => Ok(generation),
-                    Ok(generation) => Err(anyhow::anyhow!("Invalid generation number {} in path: {}", generation, path)),
-                    Err(e) => Err(anyhow::anyhow!("Invalid generation in path {}: {}", path, e)),
+                    Ok(level) if (1..=5).contains(&level) => return Ok(level),
+                    Ok(level) => {
+                        return Err(anyhow::anyhow!(
+                            "Invalid generation {} in path: {}",
+                            level,
+                            path
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Invalid generation in {}: {}", path, e));
+                    }
                 }
-            } else {
-                Err(anyhow::anyhow!("Could not find generation end marker in path: {}", path))
             }
-        } else {
-            // If no generation found in path, assume gen1
-            debug!("No generation found in path {}, assuming gen1", path);
-            Ok(1)
         }
+        // Files written by the WAL-driven persist path are gen1 by definition.
+        Ok(1)
     }
 
-    /// Get the next generation level
     fn get_next_generation(&self, current_gen: u8) -> Option<u8> {
         if current_gen < 5 {
             Some(current_gen + 1)
@@ -488,124 +731,175 @@ impl CompactionService {
         }
     }
 
-    /// Check if files can be compacted to the target generation
-    fn can_compact_to_generation(&self, files: &[ParquetFile], target_duration: Duration) -> bool {
+    fn can_compact_to_generation(
+        &self,
+        files: &[ParquetFile],
+        target_duration: Duration,
+    ) -> bool {
         if files.len() < self.config.min_files_for_compaction {
             return false;
         }
 
-        // Check if files span the target duration
         let min_time = files.iter().map(|f| f.min_time).min().unwrap_or(0);
         let max_time = files.iter().map(|f| f.max_time).max().unwrap_or(0);
-        let span_duration = Duration::from_nanos((max_time - min_time) as u64);
-        
-        span_duration >= target_duration
+        let span = (max_time - min_time).max(0) as u64;
+
+        Duration::from_nanos(span) >= target_duration
     }
 
-    /// Calculate chunk time for a generation based on the batch data and target duration
-    fn calculate_chunk_time_for_generation(
-        &self,
-        batch: &arrow::record_batch::RecordBatch,
-        target_duration: &Duration,
-    ) -> i64 {
-        // Calculate min_time from the batch
-        if let Ok((min_time, _)) = self.calculate_time_range_from_batch(batch) {
-            if min_time == 0 {
-                // Fallback to current time if min_time is 0
-                return self.time_provider.now().timestamp_nanos();
-            }
-            
-            // Round down to the nearest target duration boundary
-            let duration_nanos = target_duration.as_nanos() as i64;
-            if duration_nanos > 0 {
-                (min_time / duration_nanos) * duration_nanos
-            } else {
-                min_time
-            }
-        } else {
-            // Fallback to current time if we can't calculate from batch
-            warn!("Could not calculate time range from batch, using current time");
-            self.time_provider.now().timestamp_nanos()
-        }
-    }
-
-    /// Generate file path for a generation
-    async fn generate_file_path(
+    /// `{host}/dbs/{db}-{db_id}/{table}-{table_id}/gen{N}/{YYYY-MM-DD}/{HH-MM}/{compaction_id}.parquet`
+    fn compacted_file_path(
         &self,
         job: &CompactionJob,
         generation: u8,
         chunk_time: i64,
-        file_index: usize,
-    ) -> Result<ObjPath> {
+        compaction_id: &str,
+    ) -> ObjPath {
         let date_time = DateTime::<Utc>::from_timestamp_nanos(chunk_time);
-        let path = format!(
-            "dbs/{}-{}/{}-{}/gen{}/{}/{}.parquet",
-            job.table_name,
-            job.database_id,
-            job.table_name,
-            job.table_id,
-            generation,
-            date_time.format("%Y-%m-%d/%H-%M"),
-            file_index
-        );
-        
-        Ok(ObjPath::from(path))
+        ObjPath::from(format!(
+            "{host}/dbs/{db}-{db_id}/{table}-{table_id}/gen{gen}/{date}/{cid}.parquet",
+            host = self.persister.node_identifier_prefix(),
+            db = job.database_name,
+            db_id = job.database_id.get(),
+            table = job.table_name,
+            table_id = job.table_id.get(),
+            gen = generation,
+            date = date_time.format("%Y-%m-%d/%H-%M"),
+            cid = compaction_id,
+        ))
     }
 
-    /// Update catalog for compaction: add new compacted files and remove old files
-    async fn update_catalog_for_compaction(
-        &self,
-        _job: &CompactionJob,
-        _new_files: &[ParquetFile],
-        old_files: &[ParquetFile],
-    ) -> Result<()> {
-        // Delete old files from object store
-        for file in old_files {
-            let path = object_store::path::Path::from(file.path.clone());
-            if let Err(e) = self.object_store.delete(&path).await {
-                warn!("Failed to delete old compacted file {}: {}", file.path, e);
+    fn claim_path(&self, job: &CompactionJob) -> ObjPath {
+        ObjPath::from(format!(
+            "_compactor/claims/{db}-{table}-gen{src}-to-gen{dst}.claim",
+            db = job.database_id.get(),
+            table = job.table_id.get(),
+            src = job.source_generation,
+            dst = job.target_generation,
+        ))
+    }
+
+    /// Acquire a per-table claim via `PutMode::Create`. If a claim already
+    /// exists, take it over only if it's older than `claim_ttl`. Returns
+    /// `Ok(true)` when we now hold the claim.
+    async fn acquire_claim(&self, path: &ObjPath) -> Result<bool> {
+        let now_ms = self.time_provider.now().timestamp_millis();
+        let body = ClaimBody {
+            acquired_at_unix_ms: now_ms,
+        };
+        let payload = serde_json::to_vec(&body).context("serialize claim body")?;
+
+        match self
+            .object_store
+            .put_opts(
+                path,
+                Bytes::from(payload.clone()).into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                // Inspect existing claim. Take over only if stale.
+                let bytes = self
+                    .object_store
+                    .get(path)
+                    .await
+                    .context("get existing claim")?
+                    .bytes()
+                    .await
+                    .context("read claim body")?;
+                let existing: ClaimBody = serde_json::from_slice(&bytes)
+                    .context("parse existing claim body")?;
+                let age_ms = (now_ms - existing.acquired_at_unix_ms).max(0) as u128;
+                if age_ms < self.config.claim_ttl.as_millis() {
+                    return Ok(false);
+                }
+                // Stale claim — overwrite. Race window: two takeover attempts
+                // collide. Acceptable since duplicate compaction is recoverable
+                // (manifest publishes are idempotent and PersistedFiles dedupes
+                // by file id).
+                self.object_store
+                    .put(path, Bytes::from(payload).into())
+                    .await
+                    .context("overwrite stale claim")?;
+                Ok(true)
             }
+            Err(object_store::Error::NotSupported { .. }) => {
+                // Backend without conditional puts. Fall back to non-atomic
+                // "look then leap" with a brief sleep to reduce collision
+                // probability. Production deployments must use a backend
+                // with `If-None-Match` support.
+                warn!(
+                    "object store does not support PutMode::Create; \
+                     compaction claims will not be atomic"
+                );
+                self.object_store
+                    .put(path, Bytes::from(payload).into())
+                    .await
+                    .context("write claim without atomic guard")?;
+                Ok(true)
+            }
+            Err(e) => Err(e.into()),
         }
-        Ok(())
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ClaimBody {
+    acquired_at_unix_ms: i64,
+}
+
+fn batches_time_range_and_rows(
+    batches: &[arrow::record_batch::RecordBatch],
+) -> Result<(i64, i64, u64)> {
+    let mut min_time = i64::MAX;
+    let mut max_time = i64::MIN;
+    let mut total_rows: u64 = 0;
+
+    for batch in batches {
+        let time_idx = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "time")
+            .ok_or_else(|| anyhow::anyhow!("No time column in compacted batch"))?;
+        let time_array = batch
+            .column(time_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .ok_or_else(|| anyhow::anyhow!("Time column is not TimestampNanosecond"))?;
+        if time_array.is_empty() {
+            continue;
+        }
+        // ReorgPlanner emits sorted time order, so first/last suffice.
+        let first = time_array.value(0);
+        let last = time_array.value(time_array.len() - 1);
+        min_time = min_time.min(first.min(last));
+        max_time = max_time.max(first.max(last));
+        total_rows += batch.num_rows() as u64;
     }
 
-    /// Log detailed compaction statistics
-    async fn log_compaction_statistics(
-        &self,
-        job: &CompactionJob,
-        result: &CompactionResult,
-        duration: Duration,
-    ) {
-        let files_len = result.deleted_files.len();
-        let compacted_files_len = result.compacted_files.len();
-        let total_input_size: u64 = result.deleted_files.iter().map(|f| f.size_bytes).sum();
-        let total_output_size: u64 = result.compacted_files.iter().map(|f| f.size_bytes).sum();
-        let total_rows_compacted = result.total_rows_compacted;
-        let size_reduction = result.total_size_reduction;
+    if total_rows == 0 {
+        return Err(anyhow::anyhow!("No rows in compacted output"));
+    }
+    Ok((min_time, max_time, total_rows))
+}
 
-        let duration_secs = duration.as_secs();
-
-        info!(
-            "Compaction Summary: db={}, table={}, gen{}->gen{}, {} files -> {} files, {} rows, {} bytes -> {} bytes ({}% reduction) in {}s",
-            job.database_id,
-            job.table_name,
-            job.source_generation,
-            job.target_generation,
-            files_len,
-            compacted_files_len,
-            total_rows_compacted,
-            total_input_size,
-            total_output_size,
-            if total_input_size > 0 { (size_reduction * 100) / total_input_size } else { 0 },
-            duration_secs
-        );
+fn chunk_time_for_duration(min_time: i64, target_duration: Duration) -> i64 {
+    let nanos = target_duration.as_nanos() as i64;
+    if nanos > 0 {
+        (min_time / nanos) * nanos
+    } else {
+        min_time
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Bufferer;
+    use object_store::memory::InMemory;
+    use std::time::Duration;
 
     #[test]
     fn test_compaction_config_default() {
@@ -617,269 +911,117 @@ mod tests {
     }
 
     #[test]
-    fn test_get_next_generation() {
-        let config = CompactionConfig::default();
-        // Note: This test is simplified since we can't easily create mock dependencies
-        // In a real implementation, we would use proper mocking
-        assert_eq!(config.max_files_per_run, 100);
-        assert_eq!(config.min_files_for_compaction, 10);
+    fn test_chunk_time_alignment() {
+        let dur = Duration::from_secs(60);
+        let ns = dur.as_nanos() as i64;
+        // 1.5 minutes -> rounded down to 1 minute boundary
+        assert_eq!(chunk_time_for_duration(ns + ns / 2, dur), ns);
+        assert_eq!(chunk_time_for_duration(0, dur), 0);
     }
 
+    /// Verify claim mutual exclusion across two service instances pointing at
+    /// the same object store. Avoids spinning up a full WriteBuffer/Persister
+    /// stack by calling `acquire_claim` directly.
     #[tokio::test]
-    async fn test_compaction_sorts_and_updates_metadata() {
-        use crate::{ParquetFile, ParquetFileId};
+    async fn per_table_claim_blocks_concurrent_worker() {
+        use crate::leases::LeaseConfig;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let time_provider: Arc<dyn iox_time::TimeProvider> = Arc::new(
+            iox_time::MockProvider::new(iox_time::Time::from_timestamp_nanos(0)),
+        );
+        let path = ObjPath::from("_compactor/claims/1-1-gen1-to-gen2.claim");
 
-        // Create a fake ParquetFile for input
-        let input_file = ParquetFile {
-            id: ParquetFileId::new(),
-            path: "dbs/test-1/test-1/gen1/2023-01-01/00-00/0.parquet".to_string(),
-            size_bytes: 123,
-            row_count: 3,
-            chunk_time: 0,
-            min_time: 100,
-            max_time: 300,
-        };
+        // Two minimal services sharing the same store. We don't actually run
+        // compaction here — just exercise acquire_claim.
+        let svc_a = build_test_service(Arc::clone(&store), Arc::clone(&time_provider));
+        let svc_b = build_test_service(Arc::clone(&store), Arc::clone(&time_provider));
 
-        // Test basic file properties
-        assert_eq!(input_file.min_time, 100);
-        assert_eq!(input_file.max_time, 300);
-        assert_eq!(input_file.size_bytes, 123);
-        assert_eq!(input_file.row_count, 3);
-        
-        println!("✅ Mock compaction test passed! File properties verified");
-    }
-
-    #[tokio::test]
-    async fn test_minimal_line_protocol_write() {
-        use std::sync::Arc;
-        use object_store::memory::InMemory;
-        use influxdb3_catalog::catalog::Catalog;
-        use data_types::NamespaceName;
-        use crate::write_buffer::{WriteBufferImpl, WriteBufferImplArgs};
-        use crate::persister::Persister;
-        use influxdb3_cache::last_cache::LastCacheProvider;
-        use influxdb3_cache::distinct_cache::DistinctCacheProvider;
-        use iox_query::exec::Executor;
-        use iox_time::MockProvider;
-        use influxdb3_wal::WalConfig;
-        use metric::Registry;
-        use influxdb3_shutdown::ShutdownManager;
-        use crate::Precision;
-
-        // Set up in-memory object store and catalog
-        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let time_provider: Arc<dyn iox_time::TimeProvider> = Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
-        let catalog = Arc::new(
-            Catalog::new(
-                "test-host",
-                Arc::clone(&object_store),
-                Arc::clone(&time_provider),
-                Default::default(),
-            )
-            .await
-            .unwrap(),
+        assert!(svc_a.acquire_claim(&path).await.unwrap());
+        assert!(
+            !svc_b.acquire_claim(&path).await.unwrap(),
+            "second worker should be blocked while claim is fresh"
         );
 
-        // Create database
-        let db_name = "testdb";
-        catalog.create_database(db_name).await.unwrap();
+        // Force a stale-takeover scenario: drop the claim, then re-acquire
+        // from B. (TTL-based takeover is exercised in the inline path; not
+        // re-driven here since MockProvider doesn't advance automatically.)
+        store.delete(&path).await.unwrap();
+        assert!(svc_b.acquire_claim(&path).await.unwrap());
 
-        // Set up write buffer
-        let persister = Arc::new(Persister::new(
-            Arc::clone(&object_store),
+        // Use an unused binding so the lease config import isn't pulled
+        // unnecessarily by future refactors.
+        let _ = LeaseConfig::new(ObjPath::from("/tmp"), "unused", Duration::from_secs(60));
+    }
+
+    fn build_test_service(
+        store: Arc<dyn ObjectStore>,
+        time_provider: Arc<dyn iox_time::TimeProvider>,
+    ) -> CompactionService {
+        use influxdb3_catalog::catalog::Catalog;
+        use influxdb3_shutdown::ShutdownManager;
+        use iox_query::exec::Executor;
+
+        let _ = (Arc::clone(&store), Arc::clone(&time_provider));
+        // Minimal catalog/persister/executor stubs. The fields we exercise in
+        // `acquire_claim` are only `object_store`, `time_provider`, `config`.
+        let catalog = Arc::new(futures::executor::block_on(async {
+            Catalog::new_in_memory("test").await.unwrap()
+        }));
+        let persister = Arc::new(crate::persister::Persister::new(
+            Arc::clone(&store),
             "test-host",
             Arc::clone(&time_provider),
         ));
-        let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog)).await.unwrap();
-        let distinct_cache = DistinctCacheProvider::new_from_catalog(
-            Arc::clone(&time_provider),
-            Arc::clone(&catalog),
-        )
-        .await
-        .unwrap();
-        let write_buffer = WriteBufferImpl::new(WriteBufferImplArgs {
-            persister: Arc::clone(&persister),
-            catalog: Arc::clone(&catalog),
-            last_cache,
-            distinct_cache,
-            time_provider: Arc::clone(&time_provider),
-            executor: Arc::new(Executor::new_testing()),
-            wal_config: WalConfig::test_config(),
-            parquet_cache: None,
-            metric_registry: Arc::new(Registry::default()),
-            snapshotted_wal_files_to_keep: 10,
-            query_file_limit: None,
-            n_snapshots_to_load_on_start: 1,
-            shutdown: ShutdownManager::new_testing().register(),
-            wal_replay_concurrency_limit: None,
-        })
-        .await
-        .unwrap();
-
-        // Write simple line protocol
-        let lp = "testtable value=1 10";
-        let result = write_buffer
-            .write_lp(
-                NamespaceName::new(db_name).unwrap(),
-                lp,
-                iox_time::Time::from_timestamp_nanos(0),
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await;
-
-        match result {
-            Ok(_) => println!("✅ Line protocol write succeeded!"),
-            Err(e) => {
-                println!("❌ Line protocol write failed: {:?}", e);
-                panic!("Line protocol write failed: {:?}", e);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_real_compaction_sorts_and_updates_metadata() {
-        use std::sync::Arc;
-        use std::collections::HashMap;
-        use std::time::Duration;
-        use object_store::memory::InMemory;
-        use influxdb3_catalog::catalog::Catalog;
-        use data_types::NamespaceName;
-        use crate::write_buffer::{WriteBufferImpl, WriteBufferImplArgs};
-        use crate::persister::Persister;
-        use influxdb3_cache::last_cache::LastCacheProvider;
-        use influxdb3_cache::distinct_cache::DistinctCacheProvider;
-        use iox_query::exec::Executor;
-        use influxdb3_wal::WalConfig;
-        use metric::Registry;
-        use crate::compaction::{CompactionConfig, CompactionService};
-        use influxdb3_shutdown::ShutdownManager;
-        use crate::Precision;
-        use iox_time::MockProvider;
-
-        // Set up in-memory object store and catalog
-        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let time_provider: Arc<dyn iox_time::TimeProvider> = Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
-        let catalog = Arc::new(
-            Catalog::new(
-                "test-host",
-                Arc::clone(&object_store),
-                Arc::clone(&time_provider),
-                Default::default(),
-            )
-            .await
-            .unwrap(),
-        );
-
-        // Create table in catalog
-        let db_name = "testdb";
-        let table_name = "testtable";
-        catalog.create_database(db_name).await.unwrap();
-        // Let the line protocol write create the table automatically
-        let db_id = catalog.db_name_to_id(db_name).unwrap();
-        // We'll get the table_id after the line protocol write creates the table
-
-        // Set up write buffer
-        let persister = Arc::new(Persister::new(
-            Arc::clone(&object_store),
-            "test-host",
-            Arc::clone(&time_provider),
-        ));
-        let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog)).await.unwrap();
-        let distinct_cache = DistinctCacheProvider::new_from_catalog(
-            Arc::clone(&time_provider),
-            Arc::clone(&catalog),
-        )
-        .await
-        .unwrap();
-        let write_buffer = WriteBufferImpl::new(WriteBufferImplArgs {
-            persister: Arc::clone(&persister),
-            catalog: Arc::clone(&catalog),
-            last_cache,
-            distinct_cache,
-            time_provider: Arc::clone(&time_provider),
-            executor: Arc::new(Executor::new_testing()),
-            wal_config: WalConfig::test_config(),
-            parquet_cache: None,
-            metric_registry: Arc::new(Registry::default()),
-            snapshotted_wal_files_to_keep: 10,
-            query_file_limit: None,
-            n_snapshots_to_load_on_start: 1,
-            shutdown: ShutdownManager::new_testing().register(),
-            wal_replay_concurrency_limit: None,
-        })
-        .await
-        .unwrap();
-
-        // Write unsorted data using line protocol (this is how real data comes in)
-        let unsorted_lp = "testtable value=1 10000000000\ntesttable value=2 30000000000\ntesttable value=3 20000000000\ntesttable value=4 40000000000\ntesttable value=5 130000000000";
-        let _ = write_buffer
-            .write_lp(
-                NamespaceName::new(db_name).unwrap(),
-                unsorted_lp,
-                iox_time::Time::from_timestamp_nanos(0),
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
+        // We need a WriteBuffer; reuse the catalog/persister with a no-op
+        // write buffer.  The test doesn't call methods that touch it.
+        let last_cache =
+            futures::executor::block_on(influxdb3_cache::last_cache::LastCacheProvider::new_from_catalog(
+                Arc::clone(&catalog),
+            ))
             .unwrap();
-
-        // Force a snapshot to persist the data
-        let _ = write_buffer.wal().force_flush_buffer().await;
-        
-        // Get the table_id after the line protocol write creates the table
-        let table_id = catalog.db_schema(db_name).unwrap().table_definition(table_name).unwrap().table_id;
-        
-        // Wait a bit for the data to be fully persisted
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        
-        // Check if we have any persisted files
-        let files = write_buffer.persisted_files().get_files(db_id, table_id);
-        assert!(!files.is_empty(), "Should have persisted files before compaction");
-
-        // Set up compaction service
-        let mut generation_durations = HashMap::new();
-        generation_durations.insert(1, Duration::from_secs(60)); // 1 minute
-        generation_durations.insert(2, Duration::from_secs(120)); // 2 minutes
-        
-        let compaction_config = CompactionConfig {
-            enabled: true,
-            interval: Duration::from_secs(1),
-            max_files_per_run: 10,
-            min_files_for_compaction: 1,
-            generation_durations,
-        };
-
-        // Use .clone() so we can use write_buffer later
-        let compaction_service = CompactionService::new(
-            compaction_config,
-            Arc::clone(&catalog),
-            write_buffer.clone(),
+        let distinct_cache = futures::executor::block_on(
+            influxdb3_cache::distinct_cache::DistinctCacheProvider::new_from_catalog(
+                Arc::clone(&time_provider),
+                Arc::clone(&catalog),
+            ),
+        )
+        .unwrap();
+        let wb = futures::executor::block_on(
+            crate::write_buffer::WriteBufferImpl::new(crate::write_buffer::WriteBufferImplArgs {
+                persister: Arc::clone(&persister),
+                catalog: Arc::clone(&catalog),
+                last_cache,
+                distinct_cache,
+                time_provider: Arc::clone(&time_provider),
+                executor: Arc::new(Executor::new_testing()),
+                wal_config: influxdb3_wal::WalConfig::test_config(),
+                parquet_cache: None,
+                metric_registry: Arc::new(metric::Registry::default()),
+                snapshotted_wal_files_to_keep: 10,
+                query_file_limit: None,
+                n_snapshots_to_load_on_start: 1,
+                shutdown: ShutdownManager::new_testing().register(),
+                wal_replay_concurrency_limit: None,
+                shared_inventory: None,
+            }),
+        )
+        .unwrap();
+        CompactionService::new(
+            CompactionConfig {
+                claim_ttl: Duration::from_secs(60),
+                ..Default::default()
+            },
+            catalog,
+            wb as Arc<dyn WriteBuffer>,
+            persister,
             Arc::new(Executor::new_testing()),
-            Arc::clone(&object_store),
-            Arc::clone(&time_provider),
+            store,
+            time_provider,
             ShutdownManager::new_testing().register(),
-        );
-
-        // Run compaction cycle to identify and execute compaction jobs
-        let jobs = compaction_service.identify_compaction_jobs().await.unwrap();
-        assert!(!jobs.is_empty(), "Should have identified compaction jobs");
-        
-        // Verify the job properties
-        let job = &jobs[0];
-        assert_eq!(job.database_id, db_id);
-        assert_eq!(job.table_id, table_id);
-        assert_eq!(job.table_name.as_ref(), table_name);
-        assert_eq!(job.source_generation, 1);
-        assert_eq!(job.target_generation, 2);
-        assert!(!job.files.is_empty(), "Job should have files to compact");
-        
-        println!("✅ Compaction test passed! Successfully identified {} compaction jobs", jobs.len());
-        println!("   - Database: {}", job.database_id);
-        println!("   - Table: {}", job.table_name);
-        println!("   - Generation: {} -> {}", job.source_generation, job.target_generation);
-        println!("   - Files: {}", job.files.len());
+        )
     }
-} 
+}
+
+// The end-to-end compaction regression test lives in `tests/compaction_e2e.rs`
+// so it runs in its own test binary — it touches the global `NEXT_FILE_ID`
+// atomic that other unit tests in this crate assert on.

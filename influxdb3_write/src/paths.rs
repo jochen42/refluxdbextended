@@ -16,6 +16,9 @@ pub const PARQUET_FILE_EXTENSION: &str = "parquet";
 /// File extension for snapshot info files
 pub const SNAPSHOT_INFO_FILE_EXTENSION: &str = "info.json";
 
+/// File extension for compaction manifest files
+pub const COMPACTION_INFO_FILE_EXTENSION: &str = "compaction.json";
+
 fn object_store_file_stem(n: u64) -> u64 {
     u64::MAX - n
 }
@@ -63,6 +66,12 @@ impl AsRef<ObjPath> for CatalogFilePath {
 pub struct ParquetFilePath(ObjPath);
 
 impl ParquetFilePath {
+    /// Wrap a pre-computed `ObjPath` as a `ParquetFilePath`. Used by paths that don't
+    /// fit the default WAL-driven layout (e.g. compaction-generation paths).
+    pub fn from_obj_path(path: ObjPath) -> Self {
+        Self(path)
+    }
+
     /// Generate a parquet file path using the given arguments. This will convert the provided
     /// `chunk_time` into a date time string with format `'YYYY-MM-DD/HH-MM'`
     pub fn new(
@@ -126,6 +135,38 @@ impl Deref for SnapshotInfoFilePath {
 }
 
 impl AsRef<ObjPath> for SnapshotInfoFilePath {
+    fn as_ref(&self) -> &ObjPath {
+        &self.0
+    }
+}
+
+/// Path for a compaction manifest. Stored under a separate prefix from WAL-driven
+/// snapshots to avoid sequence-number collisions; identified by a unique compaction id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionInfoFilePath(ObjPath);
+
+impl CompactionInfoFilePath {
+    pub fn new(host_prefix: &str, compaction_id: &str) -> Self {
+        let path = ObjPath::from(format!(
+            "{host_prefix}/compactions/{compaction_id}.{COMPACTION_INFO_FILE_EXTENSION}"
+        ));
+        Self(path)
+    }
+
+    pub fn dir(host_prefix: &str) -> Self {
+        Self(ObjPath::from(format!("{host_prefix}/compactions")))
+    }
+}
+
+impl Deref for CompactionInfoFilePath {
+    type Target = ObjPath;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<ObjPath> for CompactionInfoFilePath {
     fn as_ref(&self) -> &ObjPath {
         &self.0
     }

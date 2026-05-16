@@ -71,6 +71,7 @@ uuid.workspace = true
 # Core Crates
 arrow_util.workspace = true
 insta.workspace = true
+object_store_size_hinting.workspace = true
 pretty_assertions.workspace = true
 test_helpers.workspace = true
 test-log.workspace = true

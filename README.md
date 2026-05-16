@@ -19,12 +19,37 @@ This fork removes the crippled limits from InfluxDB3-core (72h query restriction
 - **1GB HTTP request size** - Handle large batch operations
 
 ### 🔧 **Advanced Multi-Level Compaction**
+- **Durable compactor**: Upload-then-publish-then-delete pipeline emits a
+  `PersistedSnapshot` manifest before any input file is removed. Crash-safe;
+  no data loss path.
 - **Extended generation durations**: 1m, 5m, 10m, 30m, 1h, 6h, 12h, 1d, 7d
 - **Multi-level compaction system**: Automatic merging of files across 5 generation levels
 - **Configurable compaction**: Control timing, file limits, and generation durations
+- **Delete grace period**: Inputs deleted N minutes after manifest publish
+  (default 10m) so in-flight remote queriers don't 404.
 - **Enhanced parquet fanout**: 10,000 files
 - **Larger row groups**: 1M rows for better compression
 - **Increased system capacity**: 100K events
+
+### 🌐 **Multi-Node Deployments**
+- **Split process modes**: run one binary as `writer` (singleton ingest),
+  one or more as `compactor`, and N as `querier` against a shared bucket.
+- **Shared catalog**: every node reads/writes a single catalog under
+  `_catalog/`, kept consistent via the existing optimistic concurrency
+  (`PutMode::Create`).
+- **Shared inventory**: every snapshot/manifest is also published into a
+  cluster-wide `_inventory/` namespace so queriers see writer and compactor
+  output across the cluster.
+- **Inventory checkpoints**: compactor materializes a `_inventory/checkpoint/`
+  snapshot every N cycles → bounded loader cost as files accumulate.
+- **Advisory leases**: object-store-backed leases at `_locks/writer.lease`
+  and `_locks/compactor.lease` guard against double deployment.
+- **Per-table compactor claims**: parallel compactors can work on different
+  tables concurrently via `_compactor/claims/` conditional puts.
+- **HTTP listener enforcement**: write paths return `405 Method Not Allowed`
+  on `querier`/`compactor`; query paths return `405` on `compactor`.
+- **Migration tool**: `influxdb3 migrate catalog --to-shared` moves a
+  single-node catalog to the shared layout.
 
 ### 💾 **Flexible Caching**
 - **Large last cache**: 1M entries
@@ -348,6 +373,14 @@ The system supports up to 5 generation levels:
 --compaction-interval 1h     # Default: 1h - how often to check for compaction
 --max-compaction-files 100   # Default: 100 - max files per compaction run
 --min-files-for-compaction 10 # Default: 10 - minimum files to trigger compaction
+
+# Safety + multi-node settings
+--compaction-delete-grace 10m  # Wait this long after manifest publish
+                               # before deleting old gen{N-1} files so
+                               # in-flight remote queriers don't 404.
+                               # Set 0s for single-node use only.
+--compactor-lease-ttl 60s      # Advisory lease TTL when running --mode compactor.
+                               # 0s disables.
 ```
 
 ### Example Configurations
@@ -377,6 +410,175 @@ influxdb3 serve \
   --gen5-duration 30d \
   --compaction-interval 2h
 ```
+
+## 🌐 Multi-Node Deployments
+
+InfluxDB3-unlocked can run as four process roles against the same shared
+object-store bucket. `all` (the default) is the legacy single-binary mode.
+The split modes let you scale ingest, query, and compaction independently.
+
+### Node Modes
+
+| Mode | Accepts writes | Serves queries | Runs compaction | Notes |
+|------|----------------|----------------|-----------------|-------|
+| `all` | ✅ | ✅ | ✅ | Single-node, today's default. |
+| `writer` | ✅ | ✅ (local data) | ❌ | Singleton ingester. Owns WAL + schema DDL. |
+| `compactor` | ❌ (HTTP 405) | ❌ (HTTP 405) | ✅ | One process per cluster, or many under per-table claims. |
+| `querier` | ❌ (HTTP 405) | ✅ | ❌ | Read-only. Scales horizontally. |
+
+```bash
+# CLI flag
+--mode all|writer|compactor|querier        # default: all
+# env
+INFLUXDB3_MODE=writer
+```
+
+### Storage Layout
+
+```
+{node_id}/...                              # legacy per-node paths (writer's WAL + gen1)
+_catalog/catalogs/<seq>.catalog            # shared catalog (when --shared-catalog true)
+_inventory/wal/<node_id>/<seq>.info.json   # writer-published WAL snapshots
+_inventory/compactions/<ulid>.compaction.json   # compactor-published manifests
+_inventory/checkpoint/<ulid>.full.json     # materialized inventory snapshots
+_locks/writer.lease                        # writer singleton lease
+_locks/compactor.lease                     # compactor singleton lease
+_compactor/claims/<db>-<table>-gen<src>-to-gen<dst>.claim  # per-table claims
+```
+
+### Shared Catalog
+
+Every node in a multi-node deployment opens the catalog at the global
+`_catalog/` prefix. Writes use the existing `PutMode::Create` conditional
+puts, so multiple processes can safely register/update schema without
+losing each other's updates.
+
+```bash
+--shared-catalog true|false   # default: true when --mode != all
+INFLUXDB3_SHARED_CATALOG=true
+```
+
+**Backend requirement**: shared catalog requires an object-store that
+supports `If-None-Match: *`. S3, MinIO (recent), Azure Blob, GCS, and the
+local file backend all work. The InMemory backend works for dev/test only.
+
+### Shared Inventory
+
+Writers publish every successful WAL snapshot to `_inventory/wal/<node_id>/`
+in addition to the legacy per-node path. The compactor publishes manifests
+to `_inventory/compactions/`. Every node — writer, compactor, querier —
+folds the inventory into its in-memory `PersistedFiles` view at startup so
+queriers see the full cluster state. Automatically enabled for any mode
+other than `all`.
+
+### Inventory Checkpoints
+
+Every N compaction cycles (default 10) the compactor writes a materialized
+snapshot of every live file to `_inventory/checkpoint/`. Later loaders pick
+the newest checkpoint and only fold WAL/compaction manifests newer than the
+checkpoint — boot cost stays bounded as the cluster ages.
+
+### Advisory Leases
+
+Two leases enforce singleton-by-default invariants when the deployment
+contract is violated:
+
+| Lease | Path | Acquired by | Default TTL |
+|-------|------|-------------|-------------|
+| Writer | `_locks/writer.lease` | `--mode writer` | 60s |
+| Compactor | `_locks/compactor.lease` | `--mode compactor` | 60s |
+
+Writer lease acquisition is **required** at startup; the process refuses
+to launch if held by another. Compactor lease gates each
+`run_compaction_cycle` so a leader-loser standby never duplicates work.
+
+```bash
+--writer-lease-ttl 60s            # 0s disables
+--compactor-lease-ttl 60s         # 0s disables
+INFLUXDB3_WRITER_LEASE_TTL=60s
+INFLUXDB3_COMPACTOR_LEASE_TTL=60s
+```
+
+### Per-Table Compactor Claims
+
+For horizontal compactor scaling, each compaction job first writes a
+conditional `PutMode::Create` claim at
+`_compactor/claims/<db>-<table>-gen<src>-to-gen<dst>.claim`. Concurrent
+compactor processes targeting different tables run in parallel; two
+processes targeting the same table → second skips. Stale claims older
+than `claim_ttl` (default 30m) can be taken over by another compactor in
+case of a crash.
+
+### Catalog Migration
+
+Move a single-node catalog into the shared layout:
+
+```bash
+# dry run first
+influxdb3 migrate catalog \
+  --from-node-id local1 \
+  --object-store s3 \
+  --bucket my-influxdb-bucket \
+  --aws-access-key-id ... \
+  --aws-secret-access-key ... \
+  --dry-run
+
+# do it
+influxdb3 migrate catalog \
+  --from-node-id local1 \
+  --object-store s3 \
+  --bucket my-influxdb-bucket \
+  --aws-access-key-id ... \
+  --aws-secret-access-key ...
+```
+
+Idempotent: re-running skips objects that already exist under `_catalog/`.
+
+### Example: Writer + Compactor + Two Queriers
+
+```bash
+# writer (singleton)
+influxdb3 serve \
+  --mode writer \
+  --object-store s3 --bucket cluster-data \
+  --aws-access-key-id ... --aws-secret-access-key ... \
+  --node-id writer-1 \
+  --without-auth
+
+# compactor (singleton, can scale later via per-table claims)
+influxdb3 serve \
+  --mode compactor \
+  --object-store s3 --bucket cluster-data \
+  --aws-access-key-id ... --aws-secret-access-key ... \
+  --node-id compactor-1 \
+  --gen2-duration 1h --gen3-duration 1d \
+  --compaction-interval 30m \
+  --without-auth
+
+# querier replica (scale horizontally)
+influxdb3 serve \
+  --mode querier \
+  --object-store s3 --bucket cluster-data \
+  --aws-access-key-id ... --aws-secret-access-key ... \
+  --node-id querier-$REPLICA_ID \
+  --without-auth
+```
+
+Front each role behind your load balancer of choice: send writes only to
+writer-mode nodes, send queries only to querier-mode (or writer-mode)
+nodes. The HTTP listener also enforces this — it returns
+`405 Method Not Allowed` on the wrong endpoint per mode.
+
+### What's NOT Solved by Multi-Node
+
+Honest list:
+
+- **Writer is still a SPOF for ingest.** Standby writer with failover via
+  the writer lease is a future addition.
+- **Querier freshness is bounded by inventory poll interval.** Object
+  storage has no native pub/sub.
+- **Single compactor is a throughput ceiling for hot tables.** Run
+  multiple compactor processes; per-table claims will partition the work.
 
 ## 📊 Usage Examples
 
@@ -490,6 +692,14 @@ INFLUXDB3_ENABLE_COMPACTION=true               # Enable multi-level compaction
 INFLUXDB3_COMPACTION_INTERVAL=1h               # Compaction check interval
 INFLUXDB3_MAX_COMPACTION_FILES=100             # Max files per compaction run
 INFLUXDB3_MIN_FILES_FOR_COMPACTION=10          # Min files to trigger compaction
+INFLUXDB3_COMPACTION_DELETE_GRACE=10m          # Grace period before deleting
+                                               # compaction inputs
+
+# Multi-node deployment settings
+INFLUXDB3_MODE=all                             # all | writer | compactor | querier
+INFLUXDB3_SHARED_CATALOG=true                  # Open the global _catalog/ prefix
+INFLUXDB3_WRITER_LEASE_TTL=60s                 # Writer singleton lease TTL
+INFLUXDB3_COMPACTOR_LEASE_TTL=60s              # Compactor singleton lease TTL
 
 # S3/MinIO settings (when using object-store=s3)
 INFLUXDB3_BUCKET=my-influxdb-bucket

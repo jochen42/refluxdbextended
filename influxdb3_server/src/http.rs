@@ -544,7 +544,30 @@ impl IntoResponse for Error {
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
+/// Endpoint categories the server can be configured to refuse. Used to
+/// enforce node-mode routing at the listener: a `Compactor`-mode server
+/// rejects writes and queries; a `Querier` rejects writes; etc.
+#[derive(Debug, Clone, Copy)]
+pub struct EndpointPolicy {
+    pub allow_write: bool,
+    pub allow_query: bool,
+}
+
+impl Default for EndpointPolicy {
+    fn default() -> Self {
+        Self::allow_all()
+    }
+}
+
+impl EndpointPolicy {
+    pub fn allow_all() -> Self {
+        Self {
+            allow_write: true,
+            allow_query: true,
+        }
+    }
+}
+
 pub struct HttpApi {
     common_state: CommonServerState,
     write_buffer: Arc<dyn WriteBuffer>,
@@ -554,6 +577,16 @@ pub struct HttpApi {
     max_request_bytes: usize,
     authorizer: Arc<dyn AuthProvider>,
     legacy_write_param_unifier: SingleTenantRequestUnifier,
+    pub(crate) endpoint_policy: EndpointPolicy,
+}
+
+impl std::fmt::Debug for HttpApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpApi")
+            .field("endpoint_policy", &self.endpoint_policy)
+            .field("max_request_bytes", &self.max_request_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpApi {
@@ -579,7 +612,16 @@ impl HttpApi {
             authorizer,
             legacy_write_param_unifier,
             processing_engine,
+            endpoint_policy: EndpointPolicy::allow_all(),
         }
+    }
+
+    /// Restrict which endpoint categories are served. Used to enforce node
+    /// mode at the listener (compactor refuses queries + writes, querier
+    /// refuses writes, etc.). Idempotent; call once after construction.
+    pub fn with_endpoint_policy(mut self, policy: EndpointPolicy) -> Self {
+        self.endpoint_policy = policy;
+        self
     }
 }
 
@@ -2000,6 +2042,37 @@ pub(crate) async fn route_request(
 
     trace!(request = ?req,"Processing request");
     let content_length = req.headers().get("content-length").cloned();
+
+    // Node-mode enforcement at the listener. A `Querier` rejects writes; a
+    // `Compactor` rejects writes and queries. Returning 405 (Method Not
+    // Allowed) makes it visible to upstream load balancers without leaking
+    // server topology.
+    let is_write_path = matches!(
+        path,
+        all_paths::API_LEGACY_WRITE | all_paths::API_V2_WRITE | all_paths::API_V3_WRITE,
+    );
+    let is_query_path = matches!(
+        path,
+        all_paths::API_V3_QUERY_SQL
+            | all_paths::API_V3_QUERY_INFLUXQL
+            | all_paths::API_V1_QUERY,
+    );
+    if is_write_path && !http_server.endpoint_policy.allow_write {
+        return Ok(ResponseBuilder::new()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(bytes_to_response_body(
+                "this node is not configured to accept writes",
+            ))
+            .unwrap());
+    }
+    if is_query_path && !http_server.endpoint_policy.allow_query {
+        return Ok(ResponseBuilder::new()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(bytes_to_response_body(
+                "this node is not configured to serve queries",
+            ))
+            .unwrap());
+    }
 
     let response = match (method.clone(), path) {
         (Method::DELETE, all_paths::API_V3_CONFIGURE_TOKEN) => http_server.delete_token(req).await,

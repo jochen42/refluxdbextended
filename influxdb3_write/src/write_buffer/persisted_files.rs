@@ -78,23 +78,53 @@ impl PersistedFiles {
         inner.add_persisted_file(db_id, table_id, parquet_file);
     }
 
-    /// Remove specific files from a table (for compaction)
-    pub fn remove_persisted_files(&self, db_id: &DbId, table_id: &TableId, files_to_remove: &[ParquetFile]) {
+    /// Remove specific files from a table (for compaction). Only metrics for files
+    /// that were actually present are deducted, so callers may pass a superset.
+    pub fn remove_persisted_files(
+        &self,
+        db_id: &DbId,
+        table_id: &TableId,
+        files_to_remove: &[ParquetFile],
+    ) {
         let mut inner = self.inner.write();
-        if let Some(tables) = inner.files.get_mut(db_id) {
-            if let Some(files) = tables.get_mut(table_id) {
-                // Remove files by path
-                let paths_to_remove: std::collections::HashSet<_> = files_to_remove.iter().map(|f| &f.path).collect();
-                files.retain(|file| !paths_to_remove.contains(&file.path));
-                
-                // Update metrics
-                let removed_size: u64 = files_to_remove.iter().map(|f| f.size_bytes).sum();
-                let removed_rows: u64 = files_to_remove.iter().map(|f| f.row_count).sum();
-                inner.parquet_files_size_mb -= as_mb(removed_size);
-                inner.parquet_files_row_count -= removed_rows;
-                inner.parquet_files_count -= files_to_remove.len() as u64;
+        let Some(tables) = inner.files.get_mut(db_id) else {
+            return;
+        };
+        let Some(files) = tables.get_mut(table_id) else {
+            return;
+        };
+
+        let paths_to_remove: HashSet<&String> =
+            files_to_remove.iter().map(|f| &f.path).collect();
+
+        let (actually_removed_count, actually_removed_size, actually_removed_rows) =
+            files.iter().filter(|f| paths_to_remove.contains(&f.path)).fold(
+                (0u64, 0u64, 0u64),
+                |(c, s, r), f| (c + 1, s + f.size_bytes, r + f.row_count),
+            );
+
+        files.retain(|file| !paths_to_remove.contains(&file.path));
+
+        inner.parquet_files_size_mb -= as_mb(actually_removed_size);
+        inner.parquet_files_row_count =
+            inner.parquet_files_row_count.saturating_sub(actually_removed_rows);
+        inner.parquet_files_count =
+            inner.parquet_files_count.saturating_sub(actually_removed_count);
+    }
+
+    /// Snapshot every live file across all databases / tables. Used by the
+    /// compactor when materializing a shared-inventory checkpoint.
+    pub fn snapshot_all(&self) -> Vec<(DbId, TableId, Vec<ParquetFile>)> {
+        let inner = self.inner.read();
+        let mut out = Vec::new();
+        for (db_id, tables) in &inner.files {
+            for (table_id, files) in tables {
+                if !files.is_empty() {
+                    out.push((*db_id, *table_id, files.clone()));
+                }
             }
         }
+        out
     }
 
     /// Get the list of files for a given database and table, always return in descending order of min_time
@@ -266,20 +296,24 @@ impl Inner {
     pub(crate) fn new_from_persisted_snapshots(
         persisted_snapshots: Vec<PersistedSnapshot>,
     ) -> Self {
-        let mut file_count = 0;
-        let mut size_in_mb = 0.0;
-        let mut row_count = 0;
+        let mut file_count: u64 = 0;
+        let mut size_in_mb: f64 = 0.0;
+        let mut row_count: u64 = 0;
 
         let files = persisted_snapshots.into_iter().fold(
             hashbrown::HashMap::new(),
             |mut files, persisted_snapshot| {
                 size_in_mb += as_mb(persisted_snapshot.parquet_size_bytes);
                 row_count += persisted_snapshot.row_count;
-                let (parquet_files_added, removed_size, removed_row_count) =
-                    update_persisted_files_with_snapshot(true, persisted_snapshot, &mut files);
-                file_count += parquet_files_added;
+                let UpdateCounts {
+                    added,
+                    removed_count,
+                    removed_size,
+                    removed_row_count,
+                } = update_persisted_files_with_snapshot(true, persisted_snapshot, &mut files);
+                file_count = file_count.saturating_add(added).saturating_sub(removed_count);
                 size_in_mb -= as_mb(removed_size);
-                row_count -= removed_row_count;
+                row_count = row_count.saturating_sub(removed_row_count);
                 files
             },
         );
@@ -296,11 +330,15 @@ impl Inner {
     pub(crate) fn add_persisted_snapshot(&mut self, persisted_snapshot: PersistedSnapshot) {
         self.parquet_files_row_count += persisted_snapshot.row_count;
         self.parquet_files_size_mb += as_mb(persisted_snapshot.parquet_size_bytes);
-        let (file_count, removed_file_size, removed_row_count) =
-            update_persisted_files_with_snapshot(false, persisted_snapshot, &mut self.files);
-        self.parquet_files_row_count -= removed_row_count;
-        self.parquet_files_size_mb -= as_mb(removed_file_size);
-        self.parquet_files_count += file_count;
+        let UpdateCounts {
+            added,
+            removed_count,
+            removed_size,
+            removed_row_count,
+        } = update_persisted_files_with_snapshot(false, persisted_snapshot, &mut self.files);
+        self.parquet_files_row_count = self.parquet_files_row_count.saturating_sub(removed_row_count);
+        self.parquet_files_size_mb -= as_mb(removed_size);
+        self.parquet_files_count = self.parquet_files_count.saturating_add(added).saturating_sub(removed_count);
     }
 
     pub(crate) fn add_persisted_file(
@@ -329,12 +367,20 @@ fn as_mb(bytes: u64) -> f64 {
     bytes as f64 / factor
 }
 
+#[derive(Debug, Default)]
+struct UpdateCounts {
+    added: u64,
+    removed_count: u64,
+    removed_size: u64,
+    removed_row_count: u64,
+}
+
 fn update_persisted_files_with_snapshot(
     initial_load: bool,
     persisted_snapshot: PersistedSnapshot,
     db_to_tables: &mut HashMap<DbId, HashMap<TableId, Vec<ParquetFile>>>,
-) -> (u64, u64, u64) {
-    let (mut file_count, mut removed_size, mut removed_row_count) = (0, 0, 0);
+) -> UpdateCounts {
+    let mut counts = UpdateCounts::default();
     persisted_snapshot
         .databases
         .into_iter()
@@ -348,14 +394,14 @@ fn update_persisted_files_with_snapshot(
                 .for_each(|(table_id, mut new_parquet_files)| {
                     let table_files = db_tables.entry(table_id).or_default();
                     if initial_load {
-                        file_count += new_parquet_files.len() as u64;
+                        counts.added += new_parquet_files.len() as u64;
                         table_files.append(&mut new_parquet_files);
                     } else {
                         let mut filtered_files: Vec<ParquetFile> = new_parquet_files
                             .into_iter()
                             .filter(|file| !table_files.contains(file))
                             .collect();
-                        file_count += filtered_files.len() as u64;
+                        counts.added += filtered_files.len() as u64;
                         table_files.append(&mut filtered_files);
                     }
                 });
@@ -377,15 +423,15 @@ fn update_persisted_files_with_snapshot(
                     for file in remove_parquet_files {
                         if let Some(idx) = table_files.iter().position(|f| f.id == file.id) {
                             let file = table_files.remove(idx);
-                            file_count -= 1;
-                            removed_size -= file.size_bytes;
-                            removed_row_count -= file.row_count;
+                            counts.removed_count += 1;
+                            counts.removed_size += file.size_bytes;
+                            counts.removed_row_count += file.row_count;
                         }
                     }
                 });
         });
 
-    (file_count, removed_size, removed_row_count)
+    counts
 }
 
 #[cfg(test)]
