@@ -117,6 +117,15 @@ services:
       AWS_ALLOW_HTTP: "true"
       LOG_FILTER: ${LOG_FILTER:-info}
       INFLUXDB3_ENABLE_COMPACTION: "false"
+      # Layer A: shared-inventory poll cadence
+      INFLUXDB3_INVENTORY_POLL_INTERVAL: ${INVENTORY_POLL_INTERVAL:-1s}
+      # Layer B: writer URL(s) for live hot-chunk fetches. Comma-separated.
+      INFLUXDB3_WRITER_URLS: ${WRITER_URLS:-http://writer:8181}
+      INFLUXDB3_REMOTE_HOT_TIMEOUT: ${REMOTE_HOT_TIMEOUT:-250ms}
+      # Layer C: WAL-tail prefixes (node ids, not hosts).
+      INFLUXDB3_WRITER_NODE_IDS: ${WRITER_NODE_IDS:-writer-1}
+      INFLUXDB3_WAL_TAIL_POLL_INTERVAL: ${WAL_TAIL_POLL_INTERVAL:-1s}
+      INFLUXDB3_WAL_TAIL_MAX_FILES: ${WAL_TAIL_MAX_FILES:-4}
     command:
       - serve
       - --object-store=s3

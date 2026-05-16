@@ -34,7 +34,7 @@ cd "$(dirname "$0")"
 # emit a parquet at all (it needs >= snapshot_size + snapshot_size/2 periods).
 : "${BATCH_SIZE:=1000}"
 : "${PARALLEL:=1}"
-: "${RUNS_PER_QUERY:=15}"
+: "${RUNS_PER_QUERY:=5}"
 : "${COMPACTION_SETTLE_MAX_SEC:=180}"
 : "${COMPACTION_SETTLE_POLL_SEC:=10}"
 : "${COMPACTION_SETTLE_STABLE_SEC:=30}"
@@ -87,11 +87,8 @@ log "phase 1b: waiting for writer to flush WAL + publish inventory"
 # extra flush intervals for the snapshot job to land in object store.
 sleep "${INGEST_SETTLE_SEC:-120}"
 
-# Querier loaded the catalog before the database existed. Force a reload
-# so its catalog + inventory views see the writer's freshly persisted data.
-log "phase 1c: restarting querier to pick up new catalog + inventory"
-compose restart querier
-compose up -d --wait querier
+# Querier picks up new catalog + inventory dynamically via the
+# inventory-poll-interval (default 2s). No restart needed.
 
 # --- Phase 2: uncompacted benchmark -------------------------------------------
 log "phase 2: benchmarking uncompacted dataset"
@@ -135,11 +132,9 @@ if [ "$(date +%s)" -ge "${deadline}" ]; then
 proceeding anyway"
 fi
 
-# Force the querier to re-read the catalog + shared inventory so the
-# compactor's new gen2/3 files and `removed_files` records are visible.
-log "phase 3b: restarting querier to pick up compaction manifests"
-compose restart querier
-compose up -d --wait querier
+# Inventory poller picks up compaction manifests + `removed_files`
+# automatically. Allow one poll interval + apply latency.
+sleep "${POST_COMPACTION_OBSERVE_SEC:-5}"
 
 # --- Phase 4: compacted benchmark ---------------------------------------------
 log "phase 4: benchmarking compacted dataset"

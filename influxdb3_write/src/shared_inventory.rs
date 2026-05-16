@@ -24,6 +24,7 @@ use futures_util::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjPath;
 use observability_deps::tracing::{debug, warn};
+use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -122,24 +123,45 @@ impl SharedInventory {
         Ok(checkpoint_id)
     }
 
-    /// List every WAL-snapshot manifest written by every node. Caller may
-    /// optionally pass `since_sequence_per_node` so already-loaded entries
-    /// are skipped during refresh polling.
-    pub async fn load_all_wal_snapshots(&self) -> Result<Vec<PersistedSnapshot>> {
+    /// List every WAL-snapshot manifest written by every node. Caller passes
+    /// `since_sequence_per_node` so already-loaded entries are skipped during
+    /// refresh polling — pass an empty map to load everything. Filtering
+    /// happens against the path stem so already-seen entries skip the GET.
+    pub async fn load_all_wal_snapshots(
+        &self,
+        since_sequence_per_node: &HashMap<String, u64>,
+    ) -> Result<Vec<PersistedSnapshot>> {
         let dir = ObjPath::from(format!("{SHARED_INVENTORY_PREFIX}/wal"));
-        let mut paths = Vec::new();
+        let mut filtered: Vec<(u64, ObjPath)> = Vec::new();
         let mut listing = self.object_store.list(Some(&dir));
         while let Some(item) = listing.next().await {
-            paths.push(item?.location);
+            let location = item?.location;
+            // parts: ["_inventory", "wal", "<node_id>", "<stem>.info.json"]
+            let parts: Vec<_> = location.parts().collect();
+            if parts.len() < 4 {
+                continue;
+            }
+            let node_id = parts[2].as_ref().to_string();
+            let filename = parts[3].as_ref().to_string();
+            let stem = filename.trim_end_matches(".info.json");
+            let Ok(reversed) = stem.parse::<u64>() else {
+                continue;
+            };
+            let seq = u64::MAX - reversed;
+            let since = since_sequence_per_node
+                .get(&node_id)
+                .copied()
+                .unwrap_or(0);
+            if seq > since {
+                filtered.push((seq, location));
+            }
         }
-        // Lexicographic order: per-node, newest first (because of the
-        // u64::MAX - seq trick). We want oldest first for replay correctness
-        // when manifests reference each other's removed_files, so reverse.
-        paths.sort_unstable();
-        paths.reverse();
+        // Ascending by sequence: replay order, so `removed_files` references
+        // resolve against earlier manifests.
+        filtered.sort_unstable_by_key(|(s, _)| *s);
 
-        let mut out = Vec::with_capacity(paths.len());
-        for path in paths {
+        let mut out = Vec::with_capacity(filtered.len());
+        for (_, path) in filtered {
             match self.fetch_snapshot(&path).await {
                 Ok(s) => out.push(s),
                 Err(e) => warn!("skipping inventory entry {}: {}", path, e),
@@ -148,20 +170,38 @@ impl SharedInventory {
         Ok(out)
     }
 
-    /// List every compaction manifest, in publish order (ULID-sorted ascending).
-    pub async fn load_all_compactions(&self) -> Result<Vec<PersistedSnapshot>> {
+    /// List every compaction manifest. Returns `(compaction_id, snapshot)`
+    /// pairs in publish order (ULID-sorted ascending). If `since_compaction_id`
+    /// is `Some`, only entries with a lexicographically greater id are
+    /// returned — the path stem is the ULID so this filtering happens before
+    /// the GET.
+    pub async fn load_all_compactions(
+        &self,
+        since_compaction_id: Option<&str>,
+    ) -> Result<Vec<(String, PersistedSnapshot)>> {
         let dir = compaction_dir();
-        let mut paths = Vec::new();
+        let mut filtered: Vec<(String, ObjPath)> = Vec::new();
         let mut listing = self.object_store.list(Some(&dir));
         while let Some(item) = listing.next().await {
-            paths.push(item?.location);
+            let location = item?.location;
+            let parts: Vec<_> = location.parts().collect();
+            let Some(filename) = parts.last().map(|p| p.as_ref().to_string()) else {
+                continue;
+            };
+            let id = filename.trim_end_matches(".compaction.json").to_string();
+            if let Some(since) = since_compaction_id {
+                if id.as_str() <= since {
+                    continue;
+                }
+            }
+            filtered.push((id, location));
         }
-        paths.sort_unstable();
+        filtered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        let mut out = Vec::with_capacity(paths.len());
-        for path in paths {
+        let mut out = Vec::with_capacity(filtered.len());
+        for (id, path) in filtered {
             match self.fetch_snapshot(&path).await {
-                Ok(s) => out.push(s),
+                Ok(s) => out.push((id, s)),
                 Err(e) => warn!("skipping inventory entry {}: {}", path, e),
             }
         }
@@ -199,37 +239,36 @@ impl SharedInventory {
     ///    manifests in their stored order.
     pub async fn load_full_state(&self) -> Result<LoadedInventory> {
         let checkpoint = self.load_latest_checkpoint().await?;
+        let since_per_node = checkpoint
+            .as_ref()
+            .map(|cp| cp.wal_high_water.clone())
+            .unwrap_or_default();
+        let since_compaction = checkpoint
+            .as_ref()
+            .and_then(|cp| cp.compactions_high_water.as_deref());
 
-        let mut wal_snapshots = self.load_all_wal_snapshots().await?;
-        let mut compactions = self.load_all_compactions().await?;
+        let wal_snapshots = self.load_all_wal_snapshots(&since_per_node).await?;
+        let compactions_raw = self.load_all_compactions(since_compaction).await?;
 
-        if let Some(cp) = &checkpoint {
-            wal_snapshots.retain(|s| {
-                // Keep only entries newer than what the checkpoint already covers.
-                let node = &s.node_id;
-                let seq = s.snapshot_sequence_number.as_u64();
-                cp.wal_high_water
-                    .get(node)
-                    .map(|hwm| seq > *hwm)
-                    .unwrap_or(true)
-            });
-            // Compaction ids are ULIDs — string compare with the checkpoint's
-            // recorded high-water.
-            if let Some(hwm) = &cp.compactions_high_water {
-                compactions.retain(|s| {
-                    s.node_id.as_str() > hwm.as_str()
-                        || s.catalog_sequence_number.get() > 0
-                });
-                // `node_id` on compaction manifests is the COMPACTOR's id; we don't
-                // actually have the ULID in the persisted snapshot. Filtering by
-                // ULID requires the inventory to remember per-path. Skip this
-                // refinement for now — checkpoint-based pruning re-adds these
-                // entries but `PersistedFiles::new_from_persisted_snapshots` is
-                // idempotent for add+remove via file id matching, so duplicates
-                // are absorbed safely. Cheap correctness > clever filtering.
-                let _ = hwm;
+        // Track watermarks so a downstream poller can start from here without
+        // re-fetching anything we already saw.
+        let mut wal_watermarks = since_per_node;
+        for s in &wal_snapshots {
+            let entry = wal_watermarks
+                .entry(s.node_id.clone())
+                .or_insert(0);
+            let seq = s.snapshot_sequence_number.as_u64();
+            if seq > *entry {
+                *entry = seq;
             }
         }
+        let compaction_watermark = compactions_raw
+            .last()
+            .map(|(id, _)| id.clone())
+            .or_else(|| since_compaction.map(str::to_string));
+
+        let compactions: Vec<PersistedSnapshot> =
+            compactions_raw.into_iter().map(|(_, s)| s).collect();
 
         debug!(
             "shared inventory loaded: checkpoint={}, wal_snapshots={}, compactions={}",
@@ -242,6 +281,8 @@ impl SharedInventory {
             checkpoint,
             wal_snapshots,
             compactions,
+            wal_watermarks,
+            compaction_watermark,
         })
     }
 
@@ -271,6 +312,12 @@ pub struct LoadedInventory {
     pub checkpoint: Option<Checkpoint>,
     pub wal_snapshots: Vec<PersistedSnapshot>,
     pub compactions: Vec<PersistedSnapshot>,
+    /// Highest WAL snapshot sequence seen per node — feeds the inventory
+    /// poller's starting cursor.
+    pub wal_watermarks: HashMap<String, u64>,
+    /// Highest compaction ULID seen — feeds the inventory poller's starting
+    /// cursor for compaction listings.
+    pub compaction_watermark: Option<String>,
 }
 
 impl LoadedInventory {
@@ -331,7 +378,10 @@ mod tests {
         inv.publish_wal_snapshot("node-a", &snap_with("node-a", 2, "a/2.parquet"))
             .await
             .unwrap();
-        let loaded = inv.load_all_wal_snapshots().await.unwrap();
+        let loaded = inv
+            .load_all_wal_snapshots(&HashMap::new())
+            .await
+            .unwrap();
         assert_eq!(loaded.len(), 3);
         let paths: std::collections::HashSet<String> = loaded
             .iter()
@@ -357,8 +407,40 @@ mod tests {
         inv.publish_compaction("0002", &snap_with("compactor", 0, "gen2/1.parquet"))
             .await
             .unwrap();
-        let loaded = inv.load_all_compactions().await.unwrap();
+        let loaded = inv.load_all_compactions(None).await.unwrap();
         assert_eq!(loaded.len(), 2);
+        let ids: Vec<_> = loaded.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["0001", "0002"]);
+    }
+
+    #[tokio::test]
+    async fn since_cursors_skip_already_seen_entries() {
+        let inv = SharedInventory::new(Arc::new(InMemory::new()));
+        for seq in 1..=5u64 {
+            inv.publish_wal_snapshot(
+                "node-a",
+                &snap_with("node-a", seq, &format!("a/{seq}.parquet")),
+            )
+            .await
+            .unwrap();
+        }
+        let since: HashMap<String, u64> =
+            [("node-a".to_string(), 3u64)].into_iter().collect();
+        let loaded = inv.load_all_wal_snapshots(&since).await.unwrap();
+        let seqs: Vec<u64> = loaded
+            .iter()
+            .map(|s| s.snapshot_sequence_number.as_u64())
+            .collect();
+        assert_eq!(seqs, vec![4, 5]);
+
+        for id in ["01A", "01B", "01C"] {
+            inv.publish_compaction(id, &snap_with("compactor", 0, "x.parquet"))
+                .await
+                .unwrap();
+        }
+        let loaded = inv.load_all_compactions(Some("01A")).await.unwrap();
+        let ids: Vec<&str> = loaded.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["01B", "01C"]);
     }
 
     #[tokio::test]

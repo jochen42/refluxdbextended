@@ -568,7 +568,7 @@ fn oldest_wal_file_num(all_wal_file_paths: &[Path]) -> Option<WalFileSequenceNum
     WalFileSequenceNumber::from_str(wal_file_name).ok()
 }
 
-async fn load_all_wal_file_paths(
+pub async fn load_all_wal_file_paths(
     object_store: Arc<dyn ObjectStore>,
     node_identifier_prefix: String,
 ) -> Result<Vec<Path>, crate::Error> {

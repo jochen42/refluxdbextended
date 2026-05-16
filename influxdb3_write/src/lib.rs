@@ -7,11 +7,15 @@
 pub(crate) mod async_collections;
 pub mod chunk;
 pub mod compaction;
+pub mod composite_write_buffer;
 pub mod deleter;
+pub mod inventory_poller;
 pub mod leases;
+pub mod remote_write_buffer;
 pub mod paths;
 pub mod persister;
 pub mod shared_inventory;
+pub mod wal_tail;
 pub mod write_buffer;
 
 use anyhow::Context;
@@ -103,6 +107,22 @@ pub trait Bufferer: Debug + Send + Sync + 'static {
     fn watch_persisted_snapshots(
         &self,
     ) -> tokio::sync::watch::Receiver<Option<PersistedSnapshotVersion>>;
+
+    /// Return raw record batches for in-memory hot data in (db, table),
+    /// filtered to chunks whose timestamp range overlaps `[time_min,
+    /// time_max]`. `None` bounds mean "unbounded on that side". Used by the
+    /// cross-node hot-chunks RPC so a querier can see rows that haven't
+    /// reached object storage yet — bounding the request keeps the writer
+    /// from re-shipping cold gen1 buckets on every query.
+    async fn hot_record_batches(
+        &self,
+        _db_id: DbId,
+        _table_id: TableId,
+        _time_min_ns: Option<i64>,
+        _time_max_ns: Option<i64>,
+    ) -> Result<Vec<arrow::array::RecordBatch>, DataFusionError> {
+        Ok(vec![])
+    }
 }
 
 /// ChunkContainer is used by the query engine to get chunks for a given table. Chunks will generally be in the

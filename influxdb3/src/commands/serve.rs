@@ -348,6 +348,77 @@ pub struct Config {
     )]
     pub shared_catalog: Option<bool>,
 
+    /// How often the querier (and any reader-side mode) re-reads
+    /// `_inventory/*` to pick up peer WAL snapshots and compaction manifests.
+    /// Smaller values give fresher reads at the cost of more object-store
+    /// list calls. Set to `0s` to disable. Active only when `--mode` is not
+    /// `all`.
+    #[clap(
+        long = "inventory-poll-interval",
+        env = "INFLUXDB3_INVENTORY_POLL_INTERVAL",
+        default_value = "2s",
+        action
+    )]
+    pub inventory_poll_interval: humantime::Duration,
+
+    /// Writer HTTP base URLs the querier will hit for hot in-memory rows
+    /// (Layer B). Comma-separated; empty disables Layer B. Required for
+    /// sub-second freshness in `--mode=querier`. Wire-format:
+    /// `http://writer-1:8181,http://writer-2:8181`.
+    #[clap(
+        long = "writer-urls",
+        env = "INFLUXDB3_WRITER_URLS",
+        value_delimiter = ',',
+        default_value = "",
+        action
+    )]
+    pub writer_urls: Vec<String>,
+
+    /// Per-request timeout for remote hot-chunks fetches. On miss, the query
+    /// continues with persisted + WAL-tail data without raising an error.
+    #[clap(
+        long = "remote-hot-timeout",
+        env = "INFLUXDB3_REMOTE_HOT_TIMEOUT",
+        default_value = "250ms",
+        action
+    )]
+    pub remote_hot_timeout: humantime::Duration,
+
+    /// Writer node-id prefixes whose `_wal/` directories the querier should
+    /// tail (Layer C). Distinct from `--writer-urls` — these are object-store
+    /// path prefixes (e.g. `writer-1`), not hosts. Comma-separated; empty
+    /// disables Layer C.
+    #[clap(
+        long = "writer-node-ids",
+        env = "INFLUXDB3_WRITER_NODE_IDS",
+        value_delimiter = ',',
+        default_value = "",
+        action
+    )]
+    pub writer_node_ids: Vec<String>,
+
+    /// WAL-tail listing cadence (Layer C). Matches writer flush cadence by
+    /// default (`1s`). Set to `0s` to disable WAL tailing even when
+    /// `--writer-node-ids` is set.
+    #[clap(
+        long = "wal-tail-poll-interval",
+        env = "INFLUXDB3_WAL_TAIL_POLL_INTERVAL",
+        default_value = "1s",
+        action
+    )]
+    pub wal_tail_poll_interval: humantime::Duration,
+
+    /// Upper bound on retained WAL files per writer in the tail buffer.
+    /// Older files get evicted; their rows are already in `PersistedFiles`
+    /// by the time we drop them.
+    #[clap(
+        long = "wal-tail-max-files",
+        env = "INFLUXDB3_WAL_TAIL_MAX_FILES",
+        default_value = "64",
+        action
+    )]
+    pub wal_tail_max_files: usize,
+
     /// Interval between compaction runs. The compactor will check for files to compact at this interval.
     #[clap(
         long = "compaction-interval",
@@ -1124,6 +1195,66 @@ pub async fn command(config: Config) -> Result<()> {
 
     let persisted_files = write_buffer_impl.persisted_files();
 
+    // Construct WAL tail (Layer C) here — earlier than where the composite
+    // wraps the WriteBufferImpl — so the inventory poller can notify it of
+    // covered-through WAL sequences and the tail can drop redundant entries.
+    let wal_tail_buffer = if matches!(config.mode, NodeMode::Querier) {
+        let writer_node_ids: Vec<String> = config
+            .writer_node_ids
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .collect();
+        let wal_tail_interval: Duration = config.wal_tail_poll_interval.into();
+        if !writer_node_ids.is_empty() && !wal_tail_interval.is_zero() {
+            info!(?writer_node_ids, interval = ?wal_tail_interval,
+                "enabling layer C (wal tail)");
+            let t = influxdb3_write::wal_tail::WalTailBuffer::new(
+                Arc::clone(&object_store),
+                Arc::clone(&catalog),
+                writer_node_ids,
+                config.wal_tail_max_files,
+            );
+            Arc::clone(&t).spawn(influxdb3_write::wal_tail::WalTailBufferArgs {
+                poll_interval: wal_tail_interval,
+                shutdown: shutdown_manager.register(),
+            });
+            Some(t)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Inventory poller: pulls peer WAL snapshots + compaction manifests into
+    // PersistedFiles + catalog without a restart. Only meaningful in modes
+    // that share an inventory namespace.
+    let inventory_poll_interval: Duration = config.inventory_poll_interval.into();
+    if config.mode != NodeMode::All
+        && !inventory_poll_interval.is_zero()
+    {
+        if let Some(inv) = &shared_inventory {
+            info!(
+                interval = ?inventory_poll_interval,
+                "spawning shared-inventory poller"
+            );
+            influxdb3_write::inventory_poller::spawn(
+                influxdb3_write::inventory_poller::InventoryPollerArgs {
+                    inventory: inv.clone(),
+                    persisted_files: Arc::clone(&persisted_files),
+                    catalog: Arc::clone(&catalog),
+                    interval: inventory_poll_interval,
+                    initial_wal_watermarks: write_buffer_impl.initial_wal_watermarks(),
+                    initial_compaction_watermark: write_buffer_impl
+                        .initial_compaction_watermark(),
+                    shutdown: shutdown_manager.register(),
+                    wal_tail: wal_tail_buffer.clone(),
+                },
+            );
+        }
+    }
+
     let object_deleter = Some(Arc::clone(&persisted_files) as _);
 
     deleter::run(
@@ -1262,7 +1393,33 @@ pub async fn command(config: Config) -> Result<()> {
     })
     .await;
 
-    let write_buffer: Arc<dyn WriteBuffer> = write_buffer_impl;
+    // Querier wraps WriteBufferImpl in a CompositeWriteBuffer so reads see
+    // hot rows from the writer (Layer B) and WAL tail (Layer C) in addition
+    // to the locally-folded inventory (Layer A). Writer / compactor / all
+    // pass the WriteBufferImpl through unchanged.
+    let write_buffer: Arc<dyn WriteBuffer> = if matches!(config.mode, NodeMode::Querier) {
+        let writer_urls: Vec<String> = config
+            .writer_urls
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .collect();
+        let remote = (!writer_urls.is_empty()).then(|| {
+            info!(?writer_urls, "enabling layer B (remote hot chunks)");
+            Arc::new(influxdb3_write::remote_write_buffer::RemoteWriteBuffer::new(
+                writer_urls,
+                config.remote_hot_timeout.into(),
+            ))
+        });
+
+        Arc::new(influxdb3_write::composite_write_buffer::CompositeWriteBuffer::new(
+            Arc::clone(&write_buffer_impl),
+            remote,
+            wal_tail_buffer.clone(),
+        )) as Arc<dyn WriteBuffer>
+    } else {
+        write_buffer_impl
+    };
 
     let common_state = CommonServerState::new(
         Arc::clone(&metrics),
@@ -1331,6 +1488,10 @@ pub async fn command(config: Config) -> Result<()> {
     let endpoint_policy = influxdb3_server::http::EndpointPolicy {
         allow_write: config.mode.runs_ingest(),
         allow_query: config.mode.runs_query(),
+        // Only the writer (and legacy `all`) holds live in-memory rows that
+        // a querier could fetch. Everywhere else this RPC is dead weight,
+        // so disable it explicitly to make 405 the deliberate response.
+        allow_internal_rpc: matches!(config.mode, NodeMode::All | NodeMode::Writer),
     };
     let http = Arc::new(
         HttpApi::new(

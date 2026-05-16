@@ -166,6 +166,10 @@ pub struct WriteBufferImpl {
     last_cache: Arc<LastCacheProvider>,
     /// The number of files we will accept for a query
     query_file_limit: usize,
+    /// Watermarks observed during the initial shared-inventory load so a
+    /// downstream poller can resume polling without re-fetching every entry.
+    initial_wal_watermarks: std::collections::HashMap<String, u64>,
+    initial_compaction_watermark: Option<String>,
 }
 
 /// The maximum number of snapshots to load on start
@@ -246,9 +250,14 @@ impl WriteBufferImpl {
         // checkpoint-pruned compaction manifests from the shared inventory.
         // Order: per-node first, then global, so global `removed_files` reach
         // entries the per-node load already added.
+        let mut initial_wal_watermarks: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        let mut initial_compaction_watermark: Option<String> = None;
         if let Some(inv) = &shared_inventory {
             match inv.load_full_state().await {
                 Ok(loaded) => {
+                    initial_wal_watermarks = loaded.wal_watermarks.clone();
+                    initial_compaction_watermark = loaded.compaction_watermark.clone();
                     combined_snapshots.extend(loaded.flatten());
                 }
                 Err(e) => {
@@ -302,6 +311,8 @@ impl WriteBufferImpl {
             buffer: queryable_buffer,
             metrics: WriteMetrics::new(&metric_registry),
             query_file_limit: query_file_limit.unwrap_or(432),
+            initial_wal_watermarks,
+            initial_compaction_watermark,
         });
         Ok(result)
     }
@@ -312,6 +323,17 @@ impl WriteBufferImpl {
 
     pub fn persisted_files(&self) -> Arc<PersistedFiles> {
         Arc::clone(&self.persisted_files)
+    }
+
+    /// Watermarks captured during the initial shared-inventory load. Used by
+    /// the inventory poller as its starting cursors so it doesn't re-fetch
+    /// entries already folded into `PersistedFiles`.
+    pub fn initial_wal_watermarks(&self) -> std::collections::HashMap<String, u64> {
+        self.initial_wal_watermarks.clone()
+    }
+
+    pub fn initial_compaction_watermark(&self) -> Option<String> {
+        self.initial_compaction_watermark.clone()
     }
 
     async fn write_lp(
@@ -608,6 +630,26 @@ impl Bufferer for WriteBufferImpl {
 
     fn watch_persisted_snapshots(&self) -> Receiver<Option<PersistedSnapshotVersion>> {
         self.buffer.persisted_snapshot_notify_rx()
+    }
+
+    async fn hot_record_batches(
+        &self,
+        db_id: DbId,
+        table_id: TableId,
+        time_min_ns: Option<i64>,
+        time_max_ns: Option<i64>,
+    ) -> Result<Vec<arrow::array::RecordBatch>, DataFusionError> {
+        let db_schema = self
+            .catalog
+            .db_schema_by_id(&db_id)
+            .ok_or_else(|| DataFusionError::Execution(format!("db {db_id:?} not found")))?;
+        let table_def = db_schema
+            .table_definition_by_id(&table_id)
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!("table {table_id:?} not found"))
+            })?;
+        self.buffer
+            .hot_record_batches(db_id, table_id, table_def, time_min_ns, time_max_ns)
     }
 }
 
