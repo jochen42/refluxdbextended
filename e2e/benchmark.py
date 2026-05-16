@@ -50,8 +50,7 @@ def warm_up(sql: str) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--tag", required=True,
-                   help="label written to results/<tag>.json")
+    p.add_argument("--tag", required=True, help="label written to results/<tag>.json")
     p.add_argument("--queries-dir", default="queries")
     args = p.parse_args()
 
@@ -60,8 +59,10 @@ def main() -> int:
         print(f"no .sql files in {args.queries_dir}", file=sys.stderr)
         return 1
 
-    print(f"benchmarking {len(files)} queries × {RUNS_PER_QUERY} runs (tag={args.tag})",
-          flush=True)
+    print(
+        f"benchmarking {len(files)} queries × {RUNS_PER_QUERY} runs (tag={args.tag})",
+        flush=True,
+    )
 
     out: dict = {
         "tag": args.tag,
@@ -80,8 +81,10 @@ def main() -> int:
             elapsed, size = run_query(sql)
             times.append(elapsed)
             sizes.append(size)
-            print(f"    run {i + 1}/{RUNS_PER_QUERY}: {elapsed:.3f}s "
-                  f"({size} bytes)", flush=True)
+            print(
+                f"    run {i + 1}/{RUNS_PER_QUERY}: {elapsed:.3f}s ({size} bytes)",
+                flush=True,
+            )
         out["results"][name] = {
             "sql": sql,
             "times_s": times,

@@ -163,6 +163,8 @@ services:
       - --gen1-duration=${GEN1:-1m}
       - --gen2-duration=${GEN2:-1h}
       - --gen3-duration=${GEN3:-1d}
+      - --gen4-duration=${GEN4:-7d}
+      - --gen5-duration=${GEN5:-30d}
       - --compaction-interval=${COMPACTION_INTERVAL:-30s}
       - --min-files-for-compaction=${MIN_FILES:-2}
       - --max-compaction-files=${MAX_FILES:-500}

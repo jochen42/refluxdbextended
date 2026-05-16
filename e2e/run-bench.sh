@@ -33,11 +33,12 @@ cd "$(dirname "$0")"
 # settle window. Without enough WAL periods, the snapshot tracker won't
 # emit a parquet at all (it needs >= snapshot_size + snapshot_size/2 periods).
 : "${BATCH_SIZE:=1000}"
-: "${RUNS_PER_QUERY:=5}"
+: "${PARALLEL:=1}"
+: "${RUNS_PER_QUERY:=15}"
 : "${COMPACTION_SETTLE_MAX_SEC:=180}"
 : "${COMPACTION_SETTLE_POLL_SEC:=10}"
 : "${COMPACTION_SETTLE_STABLE_SEC:=30}"
-: "${LOG_FILTER:=debug}"
+: "${LOG_FILTER:=info}"
 
 export RUNS_PER_QUERY LOG_FILTER
 
@@ -71,7 +72,8 @@ compose run --rm gen \
     --hours "${HOURS}" \
     --hosts "${HOSTS}" \
     --points-per-host "${POINTS_PER_HOST}" \
-    --batch-size "${BATCH_SIZE}"
+    --batch-size "${BATCH_SIZE}" \
+    --parallel "${PARALLEL}"
 
 # Writer's WAL flushes at gen1_duration cadence; the dataset only lands
 # on object storage (and in the shared inventory) after at least one
