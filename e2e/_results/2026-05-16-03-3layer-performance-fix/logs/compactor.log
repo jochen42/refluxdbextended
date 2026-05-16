@@ -1,0 +1,40 @@
+compactor-1  | 2026-05-16T18:21:57.942493005Z 2026-05-16T18:21:57.942422Z  INFO influxdb3_lib::commands::serve: InfluxDB 3 Core server starting node_id=compactor-1 git_hash=c68a5712951128aa65e146169fe814ea69f22f63 version=3.3.0-nightly uuid=fdce8dd5-cabf-44e2-aa99-da9a54290fe1 num_cpus=8
+compactor-1  | 2026-05-16T18:21:57.942534755Z 2026-05-16T18:21:57.942488Z  INFO influxdb3_clap_blocks::object_store: Object Store bucket=Some("influxdb3-bench") endpoint=Some(Endpoint("http://minio:9000")) object_store_type="S3"
+compactor-1  | 2026-05-16T18:21:57.942558880Z 2026-05-16T18:21:57.942519Z  INFO object_store::aws::builder: Using Static credential provider
+compactor-1  | 2026-05-16T18:21:57.945250546Z 2026-05-16T18:21:57.945202Z  INFO influxdb3_lib::commands::serve: Creating shared query executor num_threads=8
+compactor-1  | 2026-05-16T18:21:57.947576213Z 2026-05-16T18:21:57.946913Z  INFO influxdb3_lib::commands::serve: opening shared catalog at _catalog/
+compactor-1  | 2026-05-16T18:21:57.952076046Z 2026-05-16T18:21:57.952022Z  INFO influxdb3_catalog::catalog::update: create database name="_internal"
+compactor-1  | 2026-05-16T18:21:57.952087796Z 2026-05-16T18:21:57.952050Z  INFO influxdb3_lib::commands::serve: catalog initialized catalog_uuid=cdf82d2f-2174-4ce5-9dbb-c5eee0079d42
+compactor-1  | 2026-05-16T18:21:57.952089171Z 2026-05-16T18:21:57.952052Z  INFO influxdb3_catalog::catalog::update: register node node_id="compactor-1" core_count=8 mode=[Core]
+compactor-1  | 2026-05-16T18:21:57.952132588Z 2026-05-16T18:21:57.952056Z  INFO influxdb3_catalog::catalog::update: registering new node to the catalog node_id="compactor-1" instance_id="79531d17-19f6-45f5-85c8-dc3681998864"
+compactor-1  | 2026-05-16T18:21:57.953221755Z 2026-05-16T18:21:57.953181Z  INFO influxdb3_catalog::object_store: persisted next catalog sequence put_result=PutResult { e_tag: Some("\"da05f7b359e227e12f79138156f23584\""), version: None } object_path=CatalogFilePath(Path { raw: "_catalog/catalogs/00000000000000000006.catalog" })
+compactor-1  | 2026-05-16T18:21:57.953270046Z 2026-05-16T18:21:57.953248Z  INFO influxdb3_lib::commands::serve: catalog initialized instance_id="79531d17-19f6-45f5-85c8-dc3681998864"
+compactor-1  | 2026-05-16T18:21:57.953319630Z 2026-05-16T18:21:57.953268Z  INFO influxdb3_catalog::catalog::update: set gen1 duration duration_ns=60000000000
+compactor-1  | 2026-05-16T18:21:57.962811630Z 2026-05-16T18:21:57.962746Z  INFO influxdb3_wal::object_store: replaying WAL files
+compactor-1  | 2026-05-16T18:21:57.962818755Z 2026-05-16T18:21:57.962757Z  INFO influxdb3_wal::object_store: completed replaying wal files time_taken=12.041µs
+compactor-1  | 2026-05-16T18:21:57.962819963Z 2026-05-16T18:21:57.962772Z  INFO influxdb3_lib::commands::serve: spawning shared-inventory poller interval=2s
+compactor-1  | 2026-05-16T18:21:57.962820713Z 2026-05-16T18:21:57.962781Z  INFO influxdb3_lib::commands::serve: setting up background mem check for query buffer
+compactor-1  | 2026-05-16T18:21:57.962821463Z 2026-05-16T18:21:57.962788Z  INFO influxdb3_catalog::catalog::update: set generation duration level=2 duration_ns=3600000000000
+compactor-1  | 2026-05-16T18:21:57.962830338Z 2026-05-16T18:21:57.962788Z  INFO influxdb3_write::deleter: Started catalog hard deleter task. delete_grace_period=86400s
+compactor-1  | 2026-05-16T18:21:57.963752963Z 2026-05-16T18:21:57.963724Z  INFO influxdb3_catalog::object_store: persisted next catalog sequence put_result=PutResult { e_tag: Some("\"242412cbdb479f310ef6a4f11affe3c5\""), version: None } object_path=CatalogFilePath(Path { raw: "_catalog/catalogs/00000000000000000007.catalog" })
+compactor-1  | 2026-05-16T18:21:57.963791338Z 2026-05-16T18:21:57.963777Z  INFO influxdb3_catalog::catalog::update: set generation duration level=3 duration_ns=86400000000000
+compactor-1  | 2026-05-16T18:21:57.964598005Z 2026-05-16T18:21:57.964569Z  INFO influxdb3_catalog::object_store: persisted next catalog sequence put_result=PutResult { e_tag: Some("\"5d61712b7ca0af7aec18271a1d9a2b91\""), version: None } object_path=CatalogFilePath(Path { raw: "_catalog/catalogs/00000000000000000008.catalog" })
+compactor-1  | 2026-05-16T18:21:57.964626713Z 2026-05-16T18:21:57.964608Z  INFO influxdb3_catalog::catalog::update: set generation duration level=4 duration_ns=604800000000000
+compactor-1  | 2026-05-16T18:21:57.965435421Z 2026-05-16T18:21:57.965407Z  INFO influxdb3_catalog::object_store: persisted next catalog sequence put_result=PutResult { e_tag: Some("\"7a73edb72999e9e650d08035f46d0b73\""), version: None } object_path=CatalogFilePath(Path { raw: "_catalog/catalogs/00000000000000000009.catalog" })
+compactor-1  | 2026-05-16T18:21:57.965454963Z 2026-05-16T18:21:57.965436Z  INFO influxdb3_catalog::catalog::update: set generation duration level=5 duration_ns=2592000000000000
+compactor-1  | 2026-05-16T18:21:57.966164755Z 2026-05-16T18:21:57.966113Z  INFO influxdb3_catalog::object_store: persisted next catalog sequence put_result=PutResult { e_tag: Some("\"8eab2f9fe9466ecdcf936cc0cb60714e\""), version: None } object_path=CatalogFilePath(Path { raw: "_catalog/catalogs/00000000000000000010.catalog" })
+compactor-1  | 2026-05-16T18:21:57.966169380Z 2026-05-16T18:21:57.966139Z  INFO influxdb3_lib::commands::serve: setting up compaction service (Compactor mode)
+compactor-1  | 2026-05-16T18:21:57.966170463Z 2026-05-16T18:21:57.966150Z  INFO influxdb3_lib::commands::serve: acquiring compactor lease (ttl=30s)
+compactor-1  | 2026-05-16T18:21:57.966191338Z 2026-05-16T18:21:57.966171Z  INFO influxdb3_lib::commands::serve: compaction service started
+compactor-1  | 2026-05-16T18:21:57.966193796Z 2026-05-16T18:21:57.966176Z  INFO influxdb3_write::compaction: Starting compaction service with interval: 30s
+compactor-1  | 2026-05-16T18:21:57.966194588Z 2026-05-16T18:21:57.966179Z  INFO influxdb3_lib::commands::serve: setting up telemetry store
+compactor-1  | 2026-05-16T18:21:57.966199838Z 2026-05-16T18:21:57.966184Z  WARN influxdb3_lib::commands::serve: server started without auth (`--without-auth` switch), all token creation and regeneration of admin token endpoints are disabled
+compactor-1  | 2026-05-16T18:21:57.966602838Z 2026-05-16T18:21:57.966567Z  INFO influxdb3_lib::commands::serve: setting up server with authz disabled for paths paths_without_authz=[]
+compactor-1  | 2026-05-16T18:21:57.966605880Z 2026-05-16T18:21:57.966590Z  INFO influxdb3_server: startup time: 24ms address=0.0.0.0:8181
+compactor-1  | 2026-05-16T18:22:12.978232095Z 2026-05-16T18:22:12.977948Z  INFO influxdb3_write::leases: lease _locks/compactor.lease acquired by compactor-1-fdce8dd5-cabf-44e2-aa99-da9a54290fe1 (no prior holder)
+compactor-1  | 2026-05-16T18:22:27.975075921Z 2026-05-16T18:22:27.974774Z  INFO influxdb3_write::compaction: Identified 1 compaction jobs
+compactor-1  | 2026-05-16T18:22:27.975149546Z 2026-05-16T18:22:27.974887Z  INFO influxdb3_write::compaction: Starting compaction job: db=bench, table=sensors, gen1->gen2, inputs=8000
+compactor-1  | 2026-05-16T18:22:28.013116171Z 2026-05-16T18:22:28.012979Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=500 max_dedup_split=100
+compactor-1  | 2026-05-16T18:22:28.040333380Z 2026-05-16T18:22:28.040197Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=8000 max_parquet_fanout=40
+compactor-1  | 2026-05-16T18:22:30.144583422Z 2026-05-16T18:22:30.143224Z  INFO influxdb3_write::compaction: Compaction completed: 8000 files -> 1 files, 960000 rows, 57521787 bytes -> 8677295 bytes (84% reduction) in 2.162963751s
+compactor-1  | 2026-05-16T18:22:30.144596214Z 2026-05-16T18:22:30.144213Z  INFO influxdb3_write::compaction: Compaction cycle completed: 1 jobs processed

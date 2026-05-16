@@ -1,0 +1,17 @@
+minio-1  | 2026-05-16T18:18:34.153610383Z INFO: Formatting 1st pool, 1 set(s), 1 drives per set.
+minio-1  | 2026-05-16T18:18:34.153642258Z INFO: WARNING: Host local has more than 0 drives of set. A host failure will result in data becoming unavailable.
+minio-1  | 2026-05-16T18:18:34.157618174Z MinIO Object Storage Server
+minio-1  | 2026-05-16T18:18:34.157628549Z Copyright: 2015-2026 MinIO, Inc.
+minio-1  | 2026-05-16T18:18:34.157629758Z License: GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html
+minio-1  | 2026-05-16T18:18:34.157630549Z Version: RELEASE.2024-12-13T22-19-12Z (go1.23.4 linux/arm64)
+minio-1  | 2026-05-16T18:18:34.157631216Z 
+minio-1  | 2026-05-16T18:18:34.157631758Z API: http://172.22.0.2:9000  http://127.0.0.1:9000 
+minio-1  | 2026-05-16T18:18:34.157632466Z WebUI: http://172.22.0.2:9001 http://127.0.0.1:9001  
+minio-1  | 2026-05-16T18:18:34.157633049Z 
+minio-1  | 2026-05-16T18:18:34.157633591Z Docs: https://docs.min.io
+minio-1  | 2026-05-16T18:18:34.157634174Z WARN: Detected default credentials 'minioadmin:minioadmin', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables
+minio-1  | 2026-05-16T18:18:35.205073050Z INFO: 
+minio-1  | 2026-05-16T18:18:35.205099800Z  You are running an older version of MinIO released 8 months before the latest release 
+minio-1  | 2026-05-16T18:18:35.205101925Z  Update: Run `mc admin update ALIAS` 
+minio-1  | 2026-05-16T18:18:35.205103133Z 
+minio-1  | 2026-05-16T18:18:35.205104092Z 
