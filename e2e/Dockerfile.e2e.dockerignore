@@ -1,0 +1,6 @@
+.git/
+target/
+binary/
+e2e/results/
+tests/
+**/*.snap.new

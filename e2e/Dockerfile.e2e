@@ -1,0 +1,78 @@
+# Slim builder for the e2e benchmark stack.
+#
+# Differences vs the production Dockerfile:
+# - Uses the distro's python3-dev instead of python-build-standalone. The
+#   processing engine still links cleanly because pyo3 only needs Python's
+#   headers/libs at build/link time.
+# - Disables the gcp/azure/jemalloc features; only `aws` is required for the
+#   MinIO-backed benchmark.
+# - Single-arch — built for whatever the host docker daemon is (arm64 on
+#   Apple Silicon, amd64 elsewhere).
+#
+# Build from the repo root:
+#
+#     docker build -t influxdb3-unlocked:e2e -f e2e/Dockerfile.e2e .
+
+# syntax=docker/dockerfile:1.4
+
+ARG RUST_VERSION=1.88
+
+FROM rust:${RUST_VERSION}-slim-bookworm AS build
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        build-essential clang lld pkg-config libssl-dev \
+        protobuf-compiler libprotobuf-dev \
+        python3 python3-dev libpython3-dev \
+        ca-certificates curl git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Bring in the source tree. `.dockerignore` keeps target/ out so the build
+# starts from a clean cache mount. The dockerignore also excludes `.git/`,
+# but `influxdb3_process/build.rs` shells out to `git rev-parse HEAD` and
+# panics if empty — so we initialize a stub repository inside the context
+# to give it something to read.
+COPY . /src
+
+RUN cd /src \
+    && git init -q \
+    && git -c user.email=build@local -c user.name=build add -A \
+    && git -c user.email=build@local -c user.name=build commit -q --allow-empty -m "e2e build snapshot"
+
+# LTO=fat in the workspace's release profile peaks at ~10GB RSS during the
+# final link of the `influxdb3` binary, which OOM-kills under the default
+# Docker Desktop memory cap on most workstations. Disable LTO and bump
+# codegen-units for the e2e image — slightly larger / slower binary, fits
+# in 4-6GB of build memory. Strip debug info to shrink the result.
+ENV CARGO_PROFILE_RELEASE_LTO=off \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_PROFILE_RELEASE_DEBUG=false \
+    CARGO_PROFILE_RELEASE_INCREMENTAL=false
+
+RUN --mount=type=cache,id=influxdb3_e2e_registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=influxdb3_e2e_git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=influxdb3_e2e_target,target=/src/target \
+    cargo build --release \
+        --package influxdb3 \
+        --no-default-features --features aws \
+    && cp /src/target/release/influxdb3 /usr/local/bin/influxdb3
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates libssl3 libpython3.11 curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1500 influxdb3 \
+    && useradd  --uid 1500 --gid influxdb3 --shell /bin/bash --create-home influxdb3 \
+    && mkdir -p /var/lib/influxdb3 /plugins \
+    && chown -R influxdb3:influxdb3 /var/lib/influxdb3 /plugins
+
+COPY --from=build /usr/local/bin/influxdb3 /usr/local/bin/influxdb3
+
+USER influxdb3
+WORKDIR /home/influxdb3
+EXPOSE 8181
+ENTRYPOINT ["/usr/local/bin/influxdb3"]
+CMD ["serve"]

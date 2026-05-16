@@ -1,0 +1,209 @@
+# End-to-end benchmark stack for influxdb3-unlocked.
+#
+# Topology (matches the multi-node modes documented in the top-level README):
+#
+#   minio  ──┬── writer    (--mode writer, ingest only)
+#            ├── compactor (--mode compactor, gated by `compactor` profile)
+#            └── querier   (--mode querier, read-only)
+#
+# All three influxdb3 services share the same S3 bucket on the local MinIO.
+#
+# `gen` and `bench` are one-shot helper containers driven by the orchestrator
+# script (`run-bench.sh`). They are only started explicitly via `docker compose
+# run --rm`.
+#
+# The compactor is in its own `compactor` profile so the benchmark harness can
+# bring it up *after* the uncompacted baseline has been measured.
+#
+# Image: build locally via `docker build -t influxdb3-unlocked:e2e .` from the
+# repo root, or override INFLUXDB3_IMAGE in your shell.
+
+# Common env block. Note the env-var names: AWS_* (not INFLUXDB3_AWS_*),
+# LOG_FILTER (not INFLUXDB3_LOG_FILTER), INFLUXDB3_BUCKET / INFLUXDB3_HTTP_BIND_ADDR
+# do use the INFLUXDB3_ prefix. `--object-store s3` has no env binding so
+# every service passes it on the command line.
+x-influxdb3-common: &influxdb3-common
+  image: ${INFLUXDB3_IMAGE:-influxdb3-unlocked:e2e}
+  depends_on:
+    minio-setup:
+      condition: service_completed_successfully
+  environment:
+    INFLUXDB3_BUCKET: ${BUCKET:-influxdb3-bench}
+    INFLUXDB3_HTTP_BIND_ADDR: 0.0.0.0:8181
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+    AWS_ENDPOINT: http://minio:9000
+    AWS_ALLOW_HTTP: "true"
+    LOG_FILTER: ${LOG_FILTER:-info}
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2024-12-13T22-19-12Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - minio-data:/data
+
+  # One-shot bucket creation. Compose dependency uses
+  # service_completed_successfully so dependents wait for this to exit cleanly.
+  minio-setup:
+    image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -eu
+        until mc alias set local http://minio:9000 minioadmin minioadmin; do
+          sleep 1
+        done
+        mc mb --ignore-existing "local/${BUCKET:-influxdb3-bench}"
+        echo "bucket ready"
+
+  writer:
+    <<: *influxdb3-common
+    environment:
+      INFLUXDB3_BUCKET: ${BUCKET:-influxdb3-bench}
+      INFLUXDB3_HTTP_BIND_ADDR: 0.0.0.0:8181
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT: http://minio:9000
+      AWS_ALLOW_HTTP: "true"
+      LOG_FILTER: ${LOG_FILTER:-info}
+      # Compaction off here so the out-of-band compactor (or none) controls
+      # the gen{N>1} layer. Matches the multi-node contract.
+      INFLUXDB3_ENABLE_COMPACTION: "false"
+      # Aggressive WAL flushing so the dataset reaches object storage (and
+      # the shared inventory) within seconds of ingest. Default
+      # `wal_snapshot_size=600` × 1s flush interval = ~10 min until first
+      # parquet — too slow for an e2e benchmark.
+      INFLUXDB3_WAL_FLUSH_INTERVAL: "${WAL_FLUSH_INTERVAL:-1s}"
+      INFLUXDB3_WAL_SNAPSHOT_SIZE: "${WAL_SNAPSHOT_SIZE:-1}"
+    command:
+      - serve
+      - --object-store=s3
+      - --mode=writer
+      - --node-id=writer-1
+      - --gen1-duration=${GEN1:-1m}
+      - --without-auth
+    ports:
+      - "${WRITER_PORT:-8181}:8181"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8181/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  querier:
+    <<: *influxdb3-common
+    environment:
+      INFLUXDB3_BUCKET: ${BUCKET:-influxdb3-bench}
+      INFLUXDB3_HTTP_BIND_ADDR: 0.0.0.0:8181
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT: http://minio:9000
+      AWS_ALLOW_HTTP: "true"
+      LOG_FILTER: ${LOG_FILTER:-info}
+      INFLUXDB3_ENABLE_COMPACTION: "false"
+    command:
+      - serve
+      - --object-store=s3
+      - --mode=querier
+      - --node-id=querier-1
+      # Lift the default 432-parquet-file query guardrail: the *uncompacted*
+      # phase produces thousands of small gen1 files by design, and a single
+      # whole-range scan needs to touch all of them. Compacted phase has far
+      # fewer files so the limit doesn't matter there.
+      - --query-file-limit=${QUERY_FILE_LIMIT:-100000}
+      - --without-auth
+    depends_on:
+      minio-setup:
+        condition: service_completed_successfully
+      writer:
+        condition: service_healthy
+    ports:
+      - "${QUERIER_PORT:-8281}:8181"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8181/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  # Started only when `--profile compactor` is passed, so the harness can run
+  # the uncompacted baseline first.
+  compactor:
+    <<: *influxdb3-common
+    profiles: ["compactor"]
+    environment:
+      INFLUXDB3_BUCKET: ${BUCKET:-influxdb3-bench}
+      INFLUXDB3_HTTP_BIND_ADDR: 0.0.0.0:8181
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT: http://minio:9000
+      AWS_ALLOW_HTTP: "true"
+      LOG_FILTER: ${LOG_FILTER:-info}
+      INFLUXDB3_ENABLE_COMPACTION: "true"
+    command:
+      - serve
+      - --object-store=s3
+      - --mode=compactor
+      - --node-id=compactor-1
+      - --gen1-duration=${GEN1:-1m}
+      - --gen2-duration=${GEN2:-1h}
+      - --gen3-duration=${GEN3:-1d}
+      - --compaction-interval=${COMPACTION_INTERVAL:-30s}
+      - --min-files-for-compaction=${MIN_FILES:-2}
+      - --max-compaction-files=${MAX_FILES:-500}
+      # Zero grace so benchmark sees a stable post-compaction file set.
+      # Production deployments should leave this at the 10m default.
+      - --compaction-delete-grace=0s
+      - --compactor-lease-ttl=30s
+      - --without-auth
+
+  # One-shot generator. Driven via `docker compose run --rm gen ...`.
+  gen:
+    image: python:3.12-alpine
+    profiles: ["tools"]
+    depends_on:
+      writer:
+        condition: service_healthy
+    volumes:
+      - ./generate.py:/work/generate.py:ro
+    working_dir: /work
+    environment:
+      WRITER_URL: http://writer:8181
+      DB: ${DB:-bench}
+    entrypoint: ["python", "/work/generate.py"]
+
+  # One-shot benchmark. Driven via `docker compose run --rm bench ...`.
+  bench:
+    image: python:3.12-alpine
+    profiles: ["tools"]
+    depends_on:
+      querier:
+        condition: service_healthy
+    volumes:
+      - ./benchmark.py:/work/benchmark.py:ro
+      - ./queries:/work/queries:ro
+      - ./results:/work/results
+    working_dir: /work
+    environment:
+      QUERIER_URL: http://querier:8181
+      DB: ${DB:-bench}
+      RUNS_PER_QUERY: ${RUNS_PER_QUERY:-5}
+    entrypoint: ["python", "/work/benchmark.py"]
+
+volumes:
+  minio-data:
