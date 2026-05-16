@@ -2808,6 +2808,7 @@ dependencies = [
  "num_cpus",
  "object_store",
  "object_store_metrics",
+ "object_store_size_hinting",
  "observability_deps",
  "owo-colors",
  "panic_logging",

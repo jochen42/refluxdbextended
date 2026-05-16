@@ -25,6 +25,7 @@ iox_time.workspace = true
 metric.workspace = true
 object_store.workspace = true
 object_store_metrics.workspace = true
+object_store_size_hinting.workspace = true
 observability_deps.workspace = true
 panic_logging.workspace = true
 parquet_file.workspace = true

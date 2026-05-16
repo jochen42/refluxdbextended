@@ -844,6 +844,17 @@ pub async fn command(config: Config) -> Result<()> {
         .make_object_store()
         .map_err(Error::ObjectStoreParsing)?;
 
+    // Strip the synthetic `iox_size_hint` If-Match header before it reaches
+    // the real backend. iox_query's cached parquet loader emits this header
+    // unconditionally (gated by `hint_known_object_size_to_object_store=true`
+    // which is the default). Real backends — MinIO, AWS S3, GCS — validate
+    // If-Match strictly and return 412 Precondition Failed because the
+    // sentinel string doesn't match the object's e_tag. Wrapping here is
+    // the same workaround upstream uses in its own size-hinting tests.
+    let object_store: Arc<dyn ObjectStore> = Arc::new(
+        object_store_size_hinting::ObjectStoreStripSizeHinting::new(object_store),
+    );
+
     // setup metrics'd object store:
     let object_store: Arc<dyn ObjectStore> = Arc::new(ObjectStoreMetrics::new(
         object_store,
