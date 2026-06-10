@@ -120,6 +120,19 @@ async fn compaction_publishes_and_replaces_files() {
     let mut gen_durations = HashMap::new();
     gen_durations.insert(1, Duration::from_nanos(1));
     gen_durations.insert(2, Duration::from_nanos(1));
+    // The compactor reads parquet through DataFusion, which resolves
+    // iox://influxdb3/ via the executor runtime's object store registry.
+    let compaction_executor = Arc::new(Executor::new_testing());
+    {
+        let ctx = compaction_executor.new_context();
+        let runtime_env = ctx.inner().runtime_env();
+        datafusion_util::config::register_iox_object_store(
+            runtime_env,
+            "influxdb3",
+            Arc::clone(&object_store),
+        );
+    }
+
     let compaction_service = CompactionService::new(
         CompactionConfig {
             enabled: true,
@@ -136,7 +149,7 @@ async fn compaction_publishes_and_replaces_files() {
         Arc::clone(&catalog),
         write_buffer.clone() as Arc<dyn WriteBuffer>,
         Arc::clone(&persister),
-        Arc::new(Executor::new_testing()),
+        compaction_executor,
         Arc::clone(&object_store),
         Arc::clone(&time_provider),
         ShutdownManager::new_testing().register(),

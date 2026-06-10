@@ -127,10 +127,11 @@ fn test_telemetry_enabled_with_debug_msg() {
         "0.0.0.0:0",
     ];
 
-    let expected_enabled: &str =
-        "Initializing TelemetryStore with upload enabled for http://localhost:9999.";
+    // This fork hard-disables telemetry upload (default_value_t = true on
+    // --disable-telemetry-upload), so even with an explicit endpoint the
+    // store must come up with upload disabled.
+    let expected_disabled: &str = "Initializing TelemetryStore with upload disabled.";
 
-    // validate debug output shows which endpoint we are hitting when telemetry enabled
     let output = cargo_bin_cmd!("influxdb3")
         .args(serve_args)
         .arg("-vv")
@@ -143,7 +144,8 @@ fn test_telemetry_enabled_with_debug_msg() {
         .stdout
         .clone();
     let output = String::from_utf8(output).expect("must be able to convert output to String");
-    assert_contains!(output, expected_enabled);
+    assert_contains!(&output, expected_disabled);
+    assert_not_contains!(&output, "upload enabled");
 }
 
 #[test_log::test]
@@ -263,26 +265,17 @@ async fn test_create_database() {
 
 #[test_log::test(tokio::test)]
 async fn test_create_database_limit() {
+    // This fork removes the upstream 5-database limit; the 6th create must
+    // succeed.
     let server = TestServer::spawn().await;
     let db_name = "foo";
 
-    // Create 5 databases successfully
-    for i in 0..5 {
+    for i in 0..6 {
         let name = format!("{db_name}{i}");
         let result = server.create_database(&name).run().unwrap();
         debug!(result = ?result, "create database");
         assert_contains!(&result, format!("Database \"{name}\" created successfully"));
     }
-
-    // Try to create a 6th database, which should fail
-    let result = server.create_database("foo5").run();
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    debug!(error = ?err, "create database error");
-    assert_contains!(
-        &err,
-        "Adding a new database would exceed limit of 5 databases"
-    );
 }
 
 #[test_log::test(tokio::test)]
@@ -4164,15 +4157,16 @@ fn test_create_token_requires_subcommand() {
 
     let stderr = String::from_utf8(output.stderr).unwrap();
 
-    // Should show our custom error message
-    assert_contains!(&stderr, "Missing required subcommand");
-    assert_contains!(&stderr, "Use: influxdb3 create token --admin");
+    // This fork supports scoped/named tokens, so a bare `create token`
+    // reports the missing selector instead of a missing subcommand.
+    assert_contains!(&stderr, "Either --admin or --name must be specified");
 
     // Should not have panic messages in stderr
     assert_not_contains!(&stderr, "panic");
     assert_not_contains!(&stderr, "thread 'main' panicked");
 
-    // Test that --name alone also shows the error
+    // --name alone is a valid named-admin-token request in this fork; it must
+    // parse (no clap error) even though the server call then fails offline.
     let output_name_only = cargo_bin_cmd!("influxdb3")
         .args(["create", "token", "--name", "test"])
         .output()
@@ -4180,10 +4174,8 @@ fn test_create_token_requires_subcommand() {
 
     let stderr_name_only = String::from_utf8(output_name_only.stderr).unwrap();
 
-    assert_contains!(
-        &stderr_name_only,
-        "error: unexpected argument '--name' found"
-    );
+    assert_not_contains!(&stderr_name_only, "unexpected argument");
+    assert_not_contains!(&stderr_name_only, "panic");
 
     // Test that --help works properly (help goes to stdout when explicitly requested)
     let output_help = cargo_bin_cmd!("influxdb3")

@@ -959,14 +959,16 @@ async fn api_v3_configure_db_create_db_with_same_name() {
 }
 
 #[test_log::test(tokio::test)]
-async fn api_v3_configure_db_create_db_hit_limit() {
+async fn api_v3_configure_db_create_db_no_limit() {
+    // This fork removes the upstream 5-database limit; creating more than 5
+    // databases must succeed.
     let server = TestServer::spawn().await;
     let client = server.http_client();
     let url = format!(
         "{base}/api/v3/configure/database",
         base = server.client_addr()
     );
-    for i in 0..5 {
+    for i in 0..6 {
         let resp = client
             .post(&url)
             .json(&json!({ "db": format!("foo{i}") }))
@@ -975,14 +977,6 @@ async fn api_v3_configure_db_create_db_hit_limit() {
             .expect("create database call did not succeed");
         assert_eq!(StatusCode::OK, resp.status());
     }
-
-    let resp = client
-        .post(&url)
-        .json(&json!({ "db": "foo5" }))
-        .send()
-        .await
-        .expect("create database succeeded");
-    assert_eq!(StatusCode::UNPROCESSABLE_ENTITY, resp.status());
 }
 
 #[test_log::test(tokio::test)]

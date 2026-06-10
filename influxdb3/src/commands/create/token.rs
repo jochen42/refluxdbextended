@@ -412,11 +412,23 @@ impl FromArgMatches for CreateTokenConfig {
             });
         }
 
-        // If we have --name but no --permissions, it's a named admin token
+        // If we have --name but no --permissions, it's a named admin token.
+        // The top-level command only defines the scoped-token args (no
+        // `regenerate`/`offline` ids), so parse those and map them into the
+        // admin config instead of derive-parsing CreateAdminTokenConfig
+        // against matches that lack its arg ids (clap panics on that).
         if matches.contains_id("name") && !matches.contains_id("permissions") {
-            // This is a named admin token, not a scoped token
+            let scoped = CreateScopedTokenConfig::from_arg_matches(matches)?;
             return Ok(Self {
-                admin_config: Some(CreateAdminTokenConfig::from_arg_matches(matches)?),
+                admin_config: Some(CreateAdminTokenConfig {
+                    regenerate: false,
+                    name: scoped.name,
+                    expiry: scoped.expiry,
+                    host: scoped.host,
+                    format: scoped.format,
+                    offline: false,
+                    output_file: None,
+                }),
                 scoped_config: None,
             });
         }
