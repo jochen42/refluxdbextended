@@ -10,7 +10,7 @@ permissions:
   packages: write
 
 env:
-  CARGO_INCREMENTAL: "yes"
+  CARGO_INCREMENTAL: "0"
   CARGO_NET_GIT_FETCH_WITH_CLI: "false"
   PROFILE: "release"
   FEATURES: "aws,gcp,azure,jemalloc_replacing_malloc"
@@ -56,15 +56,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Rust registry
-        uses: actions/cache@v4
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.arch }}-cargo-registry-
+          key: ${{ matrix.arch }}
+          # cache target/ too, not just the registry; survives across the
+          # different binary names this build produces
+          cache-all-crates: "true"
 
       - name: Install dependencies
         run: |
