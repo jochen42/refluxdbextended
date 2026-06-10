@@ -88,7 +88,9 @@ jobs:
       - name: Extract version
         id: version
         run: |
-          VERSION=$(./target/$PROFILE/$PACKAGE --version | cut -d' ' -f2 | cut -d',' -f1)
+          # v3.9.3 prints "influxdb3 InfluxDB 3 Core, 3.9.3, revision <sha>";
+          # extract the first full semver instead of relying on field position
+          VERSION=$(./target/$PROFILE/$PACKAGE --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
 
