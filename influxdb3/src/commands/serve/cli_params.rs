@@ -20,6 +20,8 @@ const SENSITIVE_PARAMS: &[&str] = &[
     "tls-key",
     "tls-cert",
     "without-auth",
+    // Multi-node: internal writer endpoints (same treatment as aws-endpoint)
+    "writer-urls",
 ];
 
 /// List of all known non-sensitive CLI parameters - only used in test but declared at module level
@@ -66,6 +68,26 @@ const NON_SENSITIVE_PARAMS: &[&str] = &[
     "retention-check-interval",
     "delete-grace-period",
     "hard-delete-default-duration",
+    // Multi-gen compaction parameters
+    "gen2-duration",
+    "gen3-duration",
+    "gen4-duration",
+    "gen5-duration",
+    "enable-compaction",
+    "compaction-interval",
+    "max-compaction-files",
+    "min-files-for-compaction",
+    "compaction-delete-grace",
+    // Multi-node deployment parameters
+    "mode",
+    "shared-catalog",
+    "compactor-lease-ttl",
+    "writer-lease-ttl",
+    "inventory-poll-interval",
+    "writer-node-ids",
+    "remote-hot-timeout",
+    "wal-tail-poll-interval",
+    "wal-tail-max-files",
     // Generation configuration
     "gen1-duration",
     "gen1-lookback-duration",
