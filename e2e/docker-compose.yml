@@ -35,6 +35,7 @@ x-influxdb3-common: &influxdb3-common
     AWS_ENDPOINT: http://minio:9000
     AWS_ALLOW_HTTP: "true"
     LOG_FILTER: ${LOG_FILTER:-info}
+    INFLUXDB3_PACKAGE_MANAGER: ${INFLUXDB3_PACKAGE_MANAGER:-disabled}
 
 services:
   minio:
@@ -84,6 +85,7 @@ services:
       LOG_FILTER: ${LOG_FILTER:-info}
       # Compaction off here so the out-of-band compactor (or none) controls
       # the gen{N>1} layer. Matches the multi-node contract.
+      INFLUXDB3_PACKAGE_MANAGER: ${INFLUXDB3_PACKAGE_MANAGER:-disabled}
       INFLUXDB3_ENABLE_COMPACTION: "false"
       # Aggressive WAL flushing so the dataset reaches object storage (and
       # the shared inventory) within seconds of ingest. Default
@@ -116,6 +118,7 @@ services:
       AWS_ENDPOINT: http://minio:9000
       AWS_ALLOW_HTTP: "true"
       LOG_FILTER: ${LOG_FILTER:-info}
+      INFLUXDB3_PACKAGE_MANAGER: ${INFLUXDB3_PACKAGE_MANAGER:-disabled}
       INFLUXDB3_ENABLE_COMPACTION: "false"
       # Layer A: shared-inventory poll cadence
       INFLUXDB3_INVENTORY_POLL_INTERVAL: ${INVENTORY_POLL_INTERVAL:-1s}
@@ -163,6 +166,7 @@ services:
       AWS_ENDPOINT: http://minio:9000
       AWS_ALLOW_HTTP: "true"
       LOG_FILTER: ${LOG_FILTER:-info}
+      INFLUXDB3_PACKAGE_MANAGER: ${INFLUXDB3_PACKAGE_MANAGER:-disabled}
       INFLUXDB3_ENABLE_COMPACTION: "true"
     command:
       - serve
