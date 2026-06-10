@@ -73,19 +73,19 @@ InfluxDB3 requires two essential parameters to start:
 
 ```bash
 # Pull the image
-docker pull ghcr.io/metrico/influxdb3-unlocked:latest
+docker pull docker.io/jochen42/refluxdbextended:latest
 
 # Basic run with local storage
 docker run -p 8181:8181 \
   -v /data:/var/lib/influxdb3 \
-  ghcr.io/metrico/influxdb3-unlocked:latest serve \
+  docker.io/jochen42/refluxdbextended:latest serve \
   --object-store file \
   --node-id local1
 
 # Run with advanced compaction
 docker run -p 8181:8181 \
   -v /data:/var/lib/influxdb3 \
-  ghcr.io/metrico/influxdb3-unlocked:latest serve \
+  docker.io/jochen42/refluxdbextended:latest serve \
   --object-store file \
   --node-id local1 \
   --gen1-duration 5m \
@@ -102,7 +102,7 @@ docker run -p 8181:8181 \
   -e INFLUXDB3_AWS_SECRET_ACCESS_KEY=your-secret-key \
   -e INFLUXDB3_AWS_ENDPOINT=http://minio:9000 \
   -e INFLUXDB3_AWS_ALLOW_HTTP=true \
-  ghcr.io/metrico/influxdb3-unlocked:latest serve
+  docker.io/jochen42/refluxdbextended:latest serve
 ```
 
 ### Binary Download
@@ -979,8 +979,8 @@ Automated GitHub Actions provide:
 - GitHub releases with binaries
 
 ### Docker Images
-- `ghcr.io/metrico/influxdb3-unlocked:latest`
-- `ghcr.io/metrico/influxdb3-unlocked:v3.3.0-nightly` (versioned)
+- `docker.io/jochen42/refluxdbextended:latest`
+- `docker.io/jochen42/refluxdbextended:v3.3.0-nightly` (versioned)
 
 ## 📚 Documentation
 
