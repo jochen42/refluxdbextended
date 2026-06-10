@@ -1,5 +1,6 @@
 //! Entrypoint for InfluxDB 3 Core Server
 
+use crate::commands::create::token::AdminTokenFile;
 use anyhow::{Context, bail};
 use futures::{FutureExt, future::FusedFuture, pin_mut};
 use influxdb3_authz::TokenAuthenticator;
@@ -11,8 +12,8 @@ use influxdb3_cache::{
 use influxdb3_catalog::{CatalogError, catalog::Catalog};
 use influxdb3_clap_blocks::plugins::{PackageManager, ProcessingEngineConfig};
 use influxdb3_clap_blocks::{
-    datafusion::IoxQueryDatafusionConfig, memory_size::MemorySize, object_store::ObjectStoreConfig,
-    socket_addr::SocketAddr, tokio::TokioDatafusionConfig,
+    datafusion::IoxQueryDatafusionConfig, memory_size::MemorySizeMb,
+    object_store::ObjectStoreConfig, socket_addr::SocketAddr, tokio::TokioDatafusionConfig,
 };
 use influxdb3_process::{
     INFLUXDB3_GIT_HASH, INFLUXDB3_VERSION, PROCESS_START_TIME, PROCESS_UUID_STR, ProcessUuidGetter,
@@ -20,26 +21,28 @@ use influxdb3_process::{
 };
 use influxdb3_processing_engine::ProcessingEngineManagerImpl;
 use influxdb3_processing_engine::environment::{
-    DisabledManager, PipManager, PythonEnvironmentManager, UVManager,
+    DisabledManager, DisabledPackageManager, PipManager, PythonEnvironmentManager, UVManager,
 };
 use influxdb3_processing_engine::plugins::ProcessingEngineEnvironmentManager;
 use influxdb3_processing_engine::virtualenv::find_python;
+use influxdb3_query_executor::{CreateQueryExecutorArgs, QueryExecutorImpl};
+use influxdb3_server::http::HttpApi;
 use influxdb3_server::{
-    CommonServerState, CreateServerArgs, Server,
-    http::HttpApi,
-    query_executor::{CreateQueryExecutorArgs, QueryExecutorImpl},
-    serve,
+    CommonServerState, CreateServerArgs, Server, serve, serve_admin_token_recovery_endpoint,
 };
-use influxdb3_shutdown::{ShutdownManager, wait_for_signal};
+use influxdb3_shutdown::{ShutdownManager, ShutdownToken, wait_for_signal};
 use influxdb3_sys_events::SysEventStore;
 use influxdb3_telemetry::{
-    ProcessingEngineMetrics,
+    ProcessingEngineMetrics, ServeInvocationMethod,
     store::{CreateTelemetryStoreArgs, TelemetryStore},
 };
 use influxdb3_wal::{Gen1Duration, WalConfig};
+use influxdb3_write::table_index_cache::TableIndexCache;
 use influxdb3_write::{
     WriteBuffer, deleter,
     persister::Persister,
+    retention_period_handler::RetentionPeriodHandler,
+    table_index_cache::TableIndexCacheConfig,
     write_buffer::{
         WriteBufferImpl, WriteBufferImplArgs, check_mem_and_force_snapshot_loop,
         persisted_files::PersistedFiles,
@@ -53,16 +56,19 @@ use object_store_metrics::ObjectStoreMetrics;
 use observability_deps::tracing::*;
 use panic_logging::SendPanicsToTracing;
 use parquet_file::storage::{ParquetStorage, StorageId};
-use rustls::{
-    SupportedProtocolVersion,
-    version::{TLS12, TLS13},
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::{
+    env,
+    num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
+    time::Duration,
 };
-use std::{env, num::NonZeroUsize, sync::Arc, time::Duration};
-use std::{path::Path, str::FromStr};
 use std::{path::PathBuf, process::Command};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::time::Instant;
+use tokio_rustls::rustls::{SupportedProtocolVersion, version::TLS12, version::TLS13};
 use tokio_util::sync::CancellationToken;
 use trace_exporters::TracingConfig;
 use trace_http::ctx::TraceHeaderParser;
@@ -76,13 +82,19 @@ use super::helpers::DisableAuthzList;
 mod jemalloc;
 
 /// The default name of the influxdb data directory
-#[allow(dead_code)]
 pub const DEFAULT_DATA_DIRECTORY_NAME: &str = ".influxdb3";
 
 /// The default bind address for the HTTP API.
 pub const DEFAULT_HTTP_BIND_ADDR: &str = "0.0.0.0:8181";
 
+/// The default bind address for admin token recovery HTTP API.
+pub const DEFAULT_ADMIN_TOKEN_RECOVERY_BIND_ADDR: &str = "127.0.0.1:8182";
+
 pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "https://telemetry.v3.influxdata.com";
+
+const MIN_SNAPSHOTS_TO_LOAD_ON_START: u64 = 100;
+
+mod cli_params;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -99,7 +111,10 @@ pub enum Error {
     BindAddress(#[source] std::io::Error),
 
     #[error("Server error: {0}")]
-    Server(#[from] influxdb3_server::Error),
+    Server(#[source] influxdb3_server::Error),
+
+    #[error("Token error: {0}")]
+    TokenError(CatalogError),
 
     #[error("Write buffer error: {0}")]
     WriteBuffer(#[from] influxdb3_write::write_buffer::Error),
@@ -107,11 +122,14 @@ pub enum Error {
     #[error("invalid token: {0}")]
     InvalidToken(#[from] hex::FromHexError),
 
-    #[error("failed to initialized write buffer: {0}")]
+    #[error("failed to initialize write buffer: {0:?}")]
     WriteBufferInit(#[source] anyhow::Error),
 
     #[error("failed to initialize catalog: {0}")]
-    InitializeCatalog(#[from] CatalogError),
+    InitializeCatalog(#[source] CatalogError),
+
+    #[error("catalog error: {0}")]
+    Catalog(#[from] CatalogError),
 
     #[error("failed to initialize last cache: {0}")]
     InitializeLastCache(#[source] last_cache::Error),
@@ -125,8 +143,28 @@ pub enum Error {
     #[error("lost HTTP/gRPC service")]
     LostHttpGrpc,
 
+    #[error("lost admin token recovery service")]
+    LostAdminTokenRecovery,
+
     #[error("tls requires both a cert and a key file to be passed in to work")]
     NoCertOrKeyFile,
+
+    #[error("table cache index initialization failed: {0}")]
+    TableIndexCacheInitialization(
+        #[source] influxdb3_write::table_index_cache::TableIndexCacheError,
+    ),
+
+    #[error(
+        "Must set INFLUXDB3_NODE_IDENTIFIER_PREFIX={0} to a valid env var value for the node id"
+    )]
+    NodeIdEnvVarMissing(String),
+
+    #[error(
+        "Python environment initialization failed: {0}\nPlease ensure Python and either pip or uv package manager is installed"
+    )]
+    PythonEnvironmentInitialization(
+        #[source] influxdb3_processing_engine::environment::PluginEnvironmentError,
+    ),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -179,9 +217,20 @@ impl NodeMode {
     }
 }
 
+const MIN_REPLAY_PRELOAD_CONCURRENCY: usize = 10; // the min number of files that will be held in memory
+fn wal_replay_concurrency_limit_default() -> String {
+    std::cmp::max(num_cpus::get(), MIN_REPLAY_PRELOAD_CONCURRENCY).to_string()
+}
+
+fn parse_snapshot_concurrency_limit(s: &str) -> Result<NonZeroUsize, String> {
+    let n: usize = s.parse().map_err(|e| format!("{e}"))?;
+    NonZeroUsize::new(n)
+        .ok_or_else(|| "snapshot concurrency limit must be greater than 0".to_string())
+}
+
 /// Try to keep all the memory size in MB instead of raw bytes, also allow
 /// them to be configured as a percentage of total memory using MemorySizeMb
-#[derive(Debug, clap::Parser)]
+#[derive(Clone, Debug, clap::Parser)]
 pub struct Config {
     /// object store options
     #[clap(flatten)]
@@ -205,21 +254,34 @@ pub struct Config {
 
     /// Maximum size of HTTP requests.
     #[clap(
-    long = "max-http-request-size",
-    env = "INFLUXDB3_MAX_HTTP_REQUEST_SIZE",
-    default_value = "1073741824", // 1 GiB (removed crippled limit)
-    action,
+        long = "max-http-request-size",
+        env = "INFLUXDB3_MAX_HTTP_REQUEST_SIZE",
+        default_value = "1073741824", // 1 GiB (removed crippled limit)
+        action,
     )]
     pub max_http_request_size: usize,
 
     /// The address on which InfluxDB will serve HTTP API requests
     #[clap(
-    long = "http-bind",
-    env = "INFLUXDB3_HTTP_BIND_ADDR",
-    default_value = DEFAULT_HTTP_BIND_ADDR,
-    action,
+        long = "http-bind",
+        env = "INFLUXDB3_HTTP_BIND_ADDR",
+        default_value = DEFAULT_HTTP_BIND_ADDR,
+        action,
     )]
     pub http_bind_address: SocketAddr,
+
+    /// Enable admin token recovery endpoint on the specified address.
+    /// Use flag alone for default address (127.0.0.1:8182) or provide a custom address.
+    /// WARNING: This endpoint allows unauthenticated admin token regeneration - use with caution!
+    #[clap(
+        long = "admin-token-recovery-http-bind",
+        env = "INFLUXDB3_ADMIN_TOKEN_RECOVERY_HTTP_BIND_ADDR",
+        num_args = 0..=1,
+        default_missing_value = DEFAULT_ADMIN_TOKEN_RECOVERY_BIND_ADDR,
+        help = "Enable admin token recovery endpoint. Use flag alone for default address (127.0.0.1:8182) or with value for custom address",
+        action,
+    )]
+    pub admin_token_recovery_bind_address: Option<SocketAddr>,
 
     /// Size of memory pool used during query exec, in megabytes.
     ///
@@ -540,6 +602,17 @@ pub struct Config {
     )]
     pub snapshotted_wal_files_to_keep: u64,
 
+    /// Interval between snapshot checkpoint creation.
+    ///
+    /// Checkpoints aggregate multiple snapshots into a single file per month, speeding up
+    /// server startup by reducing the number of files to load. Disabled by default.
+    #[clap(
+        long = "checkpoint-interval",
+        env = "INFLUXDB3_CHECKPOINT_INTERVAL",
+        action
+    )]
+    pub checkpoint_interval: Option<humantime::Duration>,
+
     // TODO - tune this default:
     /// The size of the query log. Up to this many queries will remain in the log before
     /// old queries are evicted to make room for new ones.
@@ -551,17 +624,42 @@ pub struct Config {
     )]
     pub query_log_size: usize,
 
-    /// The node idendifier used as a prefix in all object store file paths. This should be unique
-    /// for any InfluxDB 3 Core servers that share the same object store configuration, i.e., the
-    /// same bucket.
+    #[clap(flatten)]
+    pub node_id: NodeId,
+
+    /// Maximum number of table indices to cache in memory.
+    ///
+    /// Defaults to 100 entries. Set to 0 for unlimited cache size.
     #[clap(
-        long = "node-id",
-        // TODO: deprecate this alias in future version
-        alias = "host-id",
-        env = "INFLUXDB3_NODE_IDENTIFIER_PREFIX",
+        long = "table-index-cache-max-entries",
+        env = "INFLUXDB3_TABLE_INDEX_CACHE_MAX_ENTRIES",
+        default_value = "100",
         action
     )]
-    pub node_identifier_prefix: String,
+    pub table_index_cache_max_entries: usize,
+
+    /// Maximum concurrent operations between table index cache and object store.
+    ///
+    /// This limits how many parallel requests can be made to object storage
+    /// when loading or updating table indices.
+    #[clap(
+        long = "table-index-cache-concurrency-limit",
+        env = "INFLUXDB3_TABLE_INDEX_CACHE_CONCURRENCY_LIMIT",
+        default_value = "20",
+        action
+    )]
+    pub table_index_cache_concurrency_limit: usize,
+
+    /// The interval at which retention policies are checked and enforced.
+    ///
+    /// Enter as a human-readable time, e.g., "30m", "1h", etc.
+    #[clap(
+        long = "retention-check-interval",
+        env = "INFLUXDB3_RETENTION_CHECK_INTERVAL",
+        default_value = "30m",
+        action
+    )]
+    pub retention_check_interval: humantime::Duration,
 
     /// The size of the in-memory Parquet cache in megabytes or percentage of total available mem.
     /// breaking: removed parquet-mem-cache-size-mb and env var INFLUXDB3_PARQUET_MEM_CACHE_SIZE_MB
@@ -668,6 +766,17 @@ pub struct Config {
     )]
     pub telemetry_endpoint: String,
 
+    /// Information on how the serve command was used
+    #[clap(
+        long = "serve-invocation-method",
+        env = "INFLUXDB3_SERVE_INVOCATION_METHOD",
+        hide = true,
+        value_parser = ServeInvocationMethod::parse,
+        action
+    )]
+    #[arg(default_value_t = ServeInvocationMethod::Explicit)]
+    pub serve_invocation_method: ServeInvocationMethod,
+
     /// Set the limit for number of parquet files allowed in a query. Defaults
     /// to 432 which is about 3 days worth of files using default settings.
     /// This number can be increased to allow more files to be queried, but
@@ -700,11 +809,36 @@ pub struct Config {
     )]
     pub tcp_listener_file_path: Option<PathBuf>,
 
+    /// Provide a file path to write the address that the admin token recovery server is listening on to.
+    ///
+    /// This is mainly intended for testing purposes and is not considered stable.
+    #[clap(
+        long = "admin-token-recovery-tcp-listener-file-path",
+        env = "INFLUXDB3_ADMIN_TOKEN_RECOVERY_TCP_LISTENER_FILE_PATH",
+        hide = true
+    )]
+    pub admin_token_recovery_tcp_listener_file_path: Option<PathBuf>,
+
+    /// File path containing offline admin token (JSON format with token and metadata)
+    #[clap(long = "admin-token-file", env = "INFLUXDB3_ADMIN_TOKEN_FILE")]
+    pub admin_token_file: Option<PathBuf>,
+
     #[clap(
         long = "wal-replay-concurrency-limit",
-        env = "INFLUXDB3_WAL_REPLAY_CONCURRENCY_LIMIT"
+        env = "INFLUXDB3_WAL_REPLAY_CONCURRENCY_LIMIT",
+        default_value = wal_replay_concurrency_limit_default()
     )]
-    pub wal_replay_concurrency_limit: Option<usize>,
+    pub wal_replay_concurrency_limit: usize,
+
+    /// Maximum number of concurrent snapshot persistence tasks.
+    /// Setting this too high can lead to OOM
+    #[clap(
+        long = "snapshot-concurrency-limit",
+        env = "INFLUXDB3_SNAPSHOT_CONCURRENCY_LIMIT",
+        default_value_t = NonZeroUsize::new(num_cpus::get()).expect("num_cpus returns non-zero"),
+        value_parser = parse_snapshot_concurrency_limit,
+    )]
+    pub parquet_snapshot_concurrency_limit: NonZeroUsize,
 
     /// The duration from when a database or table is soft-deleted until the data is scheduled to
     /// be hard deleted.
@@ -724,6 +858,74 @@ pub struct Config {
         action
     )]
     pub delete_grace_period: humantime::Duration,
+
+    /// The cluster-id is an enterprise config option to identify nodes belonging to the same cluster.
+    /// Core OSS is single node only. We've seen folks install Core OSS thinking they installed Enterprise.
+    /// They use --cluster-id and get the error `unexpected argument` which is confusing. So we generate
+    /// a custom error message if they use this arg.
+    #[clap(long = "cluster-id", value_parser=fail_cluster_id)]
+    pub cluster_id: Option<String>,
+}
+
+pub fn fail_cluster_id(_: &str) -> Result<String, anyhow::Error> {
+    Err(anyhow::anyhow!(
+        "You've incorrectly specified a cluster-id for InfluxDB 3 Core OSS.\n\nCluster-id is an InfluxDB 3 Enterprise parameter. \
+    \nDid you install Core in an upgrade or run Core by mistake?\n\nRemove --cluster-id to run InfluxDB 3 Core OSS."
+    ))
+}
+
+#[derive(Clone, Debug, clap::Args)]
+#[group(required = true)]
+pub struct NodeId {
+    /// The node identifier used as a prefix in all object store file paths. This should be unique
+    /// for any InfluxDB 3 Core servers that share the same object store configuration, i.e., the
+    /// same bucket.
+    #[clap(
+        long = "node-id",
+        // TODO: deprecate this alias in future version
+        alias = "host-id",
+        env = "INFLUXDB3_NODE_IDENTIFIER_PREFIX",
+        group = "node_id",
+        action
+    )]
+    pub prefix: Option<String>,
+
+    /// Alternative to node-id which allows the node identifier to be derived from the specified
+    /// environment variable. This allows the node identifier to be dynamically detected at runtime
+    /// in environments like Docker Compose or Kubernetes.
+    #[clap(
+        long = "node-id-from-env",
+        env = "INFLUXDB3_NODE_IDENTIFIER_FROM_ENV",
+        group = "node_id",
+        action
+    )]
+    pub from_env_var: Option<String>,
+}
+
+impl NodeId {
+    pub(crate) fn get_node_id(&self) -> Result<String> {
+        self.prefix.clone().map_or_else(
+            || {
+                std::env::var(
+                    self.from_env_var
+                        .clone()
+                        .expect(".from_env_var must be Some if .prefix is None"),
+                )
+                .map_err(|_| {
+                    Error::NodeIdEnvVarMissing(
+                        self.from_env_var.clone().unwrap_or("missing".to_string()),
+                    )
+                })
+            },
+            Ok,
+        )
+    }
+}
+
+impl Config {
+    fn get_node_id(&self) -> Result<String> {
+        self.node_id.get_node_id()
+    }
 }
 
 /// The minimum version of TLS to use for InfluxDB
@@ -746,44 +948,14 @@ impl FromStr for TlsMinimumVersion {
     }
 }
 
-impl From<TlsMinimumVersion> for &'static [&'static SupportedProtocolVersion] {
-    fn from(val: TlsMinimumVersion) -> Self {
+impl From<&TlsMinimumVersion> for &'static [&'static SupportedProtocolVersion] {
+    fn from(val: &TlsMinimumVersion) -> Self {
         static TLS1_2: &[&SupportedProtocolVersion] = &[&TLS12, &TLS13];
         static TLS1_3: &[&SupportedProtocolVersion] = &[&TLS13];
         match val {
             TlsMinimumVersion::Tls1_2 => TLS1_2,
             TlsMinimumVersion::Tls1_3 => TLS1_3,
         }
-    }
-}
-
-/// Specified size of the Parquet cache in megabytes (MB)
-#[derive(Debug, Clone, Copy)]
-pub struct MemorySizeMb(usize);
-
-impl MemorySizeMb {
-    /// Express this cache size in terms of bytes (B)
-    fn as_num_bytes(&self) -> usize {
-        self.0
-    }
-}
-
-impl FromStr for MemorySizeMb {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::prelude::v1::Result<Self, Self::Err> {
-        let num_bytes = if s.contains("%") {
-            let mem_size = MemorySize::from_str(s)?;
-            mem_size.bytes()
-        } else if let Some(suffix) = s.strip_suffix('b') {
-            usize::from_str(suffix)
-                .map_err(|_| "failed to parse value as unsigned integer".to_string())?
-        } else {
-            let num_mb = usize::from_str(s)
-                .map_err(|_| "failed to parse value as unsigned integer".to_string())?;
-            num_mb * 1000 * 1000
-        };
-        Ok(Self(num_bytes))
     }
 }
 
@@ -807,20 +979,6 @@ impl FromStr for ParquetCachePrunePercent {
             bail!("prune percent must be between 0 and 1");
         }
         Ok(Self(p))
-    }
-}
-
-/// If `p` does not exist, try to create it as a directory.
-///
-/// panic's if the directory does not exist and can not be created
-#[allow(dead_code)]
-fn ensure_directory_exists(p: &Path) {
-    if !p.exists() {
-        info!(
-            p=%p.display(),
-            "Creating directory",
-        );
-        std::fs::create_dir_all(p).expect("Could not create default directory");
     }
 }
 
@@ -853,7 +1011,9 @@ async fn set_generation_duration_with_error_handling(
     Ok(())
 }
 
-pub async fn command(config: Config) -> Result<()> {
+pub async fn command(config: Config, user_params: HashMap<String, String>) -> Result<()> {
+    let node_id = config.get_node_id()?;
+
     // Check that both a cert file and key file are present if TLS is being set up
     match (&config.cert_file, &config.key_file) {
         (Some(_), None) | (None, Some(_)) => {
@@ -866,12 +1026,13 @@ pub async fn command(config: Config) -> Result<()> {
     let num_cpus = num_cpus::get();
     let build_malloc_conf = build_malloc_conf();
     info!(
-        node_id = %config.node_identifier_prefix,
+        node_id = %node_id,
         git_hash = %INFLUXDB3_GIT_HASH as &str,
         version = %INFLUXDB3_VERSION.as_ref() as &str,
         uuid = %PROCESS_UUID_STR.as_ref() as &str,
         num_cpus,
-        "InfluxDB 3 Core server starting",
+        product_name = influxdb3_server::PRODUCT_NAME,
+        "server starting",
     );
     debug!(%build_malloc_conf, "build configuration");
 
@@ -912,19 +1073,8 @@ pub async fn command(config: Config) -> Result<()> {
     // setup base object store:
     let object_store: Arc<dyn ObjectStore> = config
         .object_store_config
-        .make_object_store()
+        .make_object_store_with_metrics(&metrics)
         .map_err(Error::ObjectStoreParsing)?;
-
-    // Strip the synthetic `iox_size_hint` If-Match header before it reaches
-    // the real backend. iox_query's cached parquet loader emits this header
-    // unconditionally (gated by `hint_known_object_size_to_object_store=true`
-    // which is the default). Real backends — MinIO, AWS S3, GCS — validate
-    // If-Match strictly and return 412 Precondition Failed because the
-    // sentinel string doesn't match the object's e_tag. Wrapping here is
-    // the same workaround upstream uses in its own size-hinting tests.
-    let object_store: Arc<dyn ObjectStore> = Arc::new(
-        object_store_size_hinting::ObjectStoreStripSizeHinting::new(object_store),
-    );
 
     // setup metrics'd object store:
     let object_store: Arc<dyn ObjectStore> = Arc::new(ObjectStoreMetrics::new(
@@ -937,6 +1087,7 @@ pub async fn command(config: Config) -> Result<()> {
 
     // setup cached object store:
     let (object_store, parquet_cache) = if !config.disable_parquet_mem_cache {
+        info!("initialising parquet cache");
         let (object_store, parquet_cache) = create_cached_obj_store_and_oracle(
             object_store,
             Arc::clone(&time_provider) as _,
@@ -983,6 +1134,10 @@ pub async fn command(config: Config) -> Result<()> {
             "datafusion",
             tokio_datafusion_config
                 .builder()
+                .map(|mut builder| {
+                    builder.enable_all();
+                    builder
+                })
                 .map_err(Error::TokioRuntime)?,
             Arc::clone(&metrics),
         ),
@@ -1026,10 +1181,21 @@ pub async fn command(config: Config) -> Result<()> {
         )
         .with_jaeger_debug_name(config.tracing_config.traces_jaeger_debug_name);
 
+    // Create table index cache configuration from CLI arguments
+    let table_index_cache_config = TableIndexCacheConfig {
+        max_entries: if config.table_index_cache_max_entries == 0 {
+            None
+        } else {
+            Some(config.table_index_cache_max_entries)
+        },
+        concurrency_limit: config.table_index_cache_concurrency_limit,
+    };
+
     let persister = Arc::new(Persister::new(
         Arc::clone(&object_store),
-        config.node_identifier_prefix.as_str(),
+        node_id.as_str(),
         Arc::clone(&time_provider) as _,
+        config.checkpoint_interval.map(|v| v.into()),
     ));
 
     let process_uuid_getter: Arc<dyn ProcessUuidGetter> = Arc::new(ProcessUuidWrapper::new());
@@ -1041,42 +1207,77 @@ pub async fn command(config: Config) -> Result<()> {
     let catalog = if shared_catalog {
         info!("opening shared catalog at _catalog/");
         Catalog::open_shared_with_shutdown(
-            config.node_identifier_prefix.as_str(),
+            node_id.as_str(),
             Arc::clone(&object_store),
             Arc::clone(&time_provider),
             Arc::clone(&metrics),
             shutdown_manager.register(),
             Arc::clone(&process_uuid_getter),
         )
-        .await?
+        .await
+        .map_err(Error::InitializeCatalog)?
     } else {
         Catalog::new_with_shutdown(
-            config.node_identifier_prefix.as_str(),
+            node_id.as_str(),
             Arc::clone(&object_store),
             Arc::clone(&time_provider),
             Arc::clone(&metrics),
             shutdown_manager.register(),
             Arc::clone(&process_uuid_getter),
         )
-        .await?
+        .await
+        .map_err(Error::InitializeCatalog)?
     };
     info!(catalog_uuid = ?catalog.catalog_uuid(), "catalog initialized");
 
+    let retention_handler_token = shutdown_manager.register();
+    let _table_index_cache = initialize_table_index_cache(
+        node_id.clone(),
+        config.retention_check_interval.into(),
+        table_index_cache_config,
+        Arc::clone(&object_store),
+        Arc::clone(&catalog),
+        Arc::clone(&time_provider) as _,
+        retention_handler_token,
+    )
+    .await
+        .inspect_err(|_e| {
+            warn!("TableIndexCache initialization failed, continuing in degraded state.");
+            warn!("Without TableIndexCache, object store cleanup for retention policies and hard deletes will temporarily be unable to proceed; compacted data and queries should not be affected.");
+        })
+    .unwrap_or(None);
+
+    // Initialize tokens from files if provided and auth is enabled
+    if !config.without_auth {
+        // Initialize admin token from file if provided
+        if let Some(admin_token_file) = &config.admin_token_file
+            && let Err(e) = initialize_admin_token_from_file(&catalog, admin_token_file).await
+        {
+            error!("Failed to initialize admin token from file: {}", e);
+            return Err(e);
+        }
+    }
+
+    // Capture and filter CLI parameters
+    let cli_params = cli_params::capture_cli_params(user_params);
+
     let _ = catalog
         .register_node(
-            &config.node_identifier_prefix,
+            &node_id,
             num_cpus as u64,
             vec![influxdb3_catalog::log::NodeMode::Core],
             process_uuid_getter,
+            Some(cli_params),
         )
-        .await?;
+        .await
+        .map_err(Error::InitializeCatalog)?;
     let node_def = catalog
-        .node(&config.node_identifier_prefix)
+        .node(&node_id)
         .expect("node should be registered in catalog");
     info!(instance_id = ?node_def.instance_id(), "catalog initialized");
 
     let last_cache = LastCacheProvider::new_from_catalog_with_background_eviction(
-        Arc::clone(&catalog) as _,
+        Arc::clone(&catalog),
         config.last_cache_eviction_interval.into(),
     )
     .await
@@ -1110,11 +1311,15 @@ pub async fn command(config: Config) -> Result<()> {
             );
             existing
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(Error::InitializeCatalog(error)),
     };
 
-    let n_snapshots_to_load_on_start =
+    let num_snapshots_to_load =
         config.gen1_lookback_duration.as_secs() / gen1_duration.as_duration().as_secs();
+
+    let n_snapshots_to_load_on_start =
+        NonZeroU64::new(MIN_SNAPSHOTS_TO_LOAD_ON_START.max(num_snapshots_to_load))
+            .expect("n_snapshots_to_load_on_start is always >= 1");
 
     let wal_config = WalConfig {
         gen1_duration,
@@ -1142,11 +1347,7 @@ pub async fn command(config: Config) -> Result<()> {
     let writer_lease_ttl: Duration = config.writer_lease_ttl.into();
     if matches!(config.mode, NodeMode::Writer) && !writer_lease_ttl.is_zero() {
         info!("acquiring writer lease (ttl={:?})", writer_lease_ttl);
-        let owner = format!(
-            "{}-{}",
-            config.node_identifier_prefix.as_str(),
-            *PROCESS_UUID_STR
-        );
+        let owner = format!("{}-{}", node_id.as_str(), *PROCESS_UUID_STR);
         let writer_lease = Arc::new(influxdb3_write::leases::Lease::new(
             influxdb3_write::leases::LeaseConfig::new(
                 object_store::path::Path::from("_locks/writer.lease"),
@@ -1185,10 +1386,11 @@ pub async fn command(config: Config) -> Result<()> {
         metric_registry: Arc::clone(&metrics),
         snapshotted_wal_files_to_keep: config.snapshotted_wal_files_to_keep,
         query_file_limit: config.query_file_limit,
-        n_snapshots_to_load_on_start: n_snapshots_to_load_on_start as usize,
+        n_snapshots_to_load_on_start,
         shutdown: shutdown_manager.register(),
         wal_replay_concurrency_limit: config.wal_replay_concurrency_limit,
         shared_inventory: shared_inventory.clone(),
+        parquet_snapshot_concurrency_limit: config.parquet_snapshot_concurrency_limit,
     })
     .await
     .map_err(|e| Error::WriteBufferInit(e.into()))?;
@@ -1347,11 +1549,7 @@ pub async fn command(config: Config) -> Result<()> {
         let lease_ttl: Duration = config.compactor_lease_ttl.into();
         if !lease_ttl.is_zero() && matches!(config.mode, NodeMode::Compactor) {
             info!("acquiring compactor lease (ttl={:?})", lease_ttl);
-            let lease_owner = format!(
-                "{}-{}",
-                config.node_identifier_prefix.as_str(),
-                *PROCESS_UUID_STR
-            );
+            let lease_owner = format!("{}-{}", node_id.as_str(), *PROCESS_UUID_STR);
             let lease = Arc::new(influxdb3_write::leases::Lease::new(
                 influxdb3_write::leases::LeaseConfig::new(
                     object_store::path::Path::from("_locks/compactor.lease"),
@@ -1388,6 +1586,7 @@ pub async fn command(config: Config) -> Result<()> {
         persisted_files: Some(persisted_files),
         telemetry_endpoint: &config.telemetry_endpoint,
         disable_upload: config.disable_telemetry_upload,
+        serve_invocation_method: config.serve_invocation_method,
         catalog_uuid: catalog.catalog_uuid().to_string(),
         processing_engine_metrics: Arc::clone(&catalog) as Arc<dyn ProcessingEngineMetrics>,
     })
@@ -1422,6 +1621,7 @@ pub async fn command(config: Config) -> Result<()> {
     };
 
     let common_state = CommonServerState::new(
+        Arc::clone(&catalog),
         Arc::clone(&metrics),
         trace_exporter,
         trace_header_parser,
@@ -1446,22 +1646,36 @@ pub async fn command(config: Config) -> Result<()> {
         // convert to positive here so that we can avoid double negatives downstream
         started_with_auth: !config.without_auth,
         time_provider: Arc::clone(&time_provider) as _,
+        processing_engine: None,
     }));
 
     let listener = TcpListener::bind(*config.http_bind_address)
         .await
         .map_err(Error::BindAddress)?;
 
+    // Only create recovery listener if explicitly enabled
+    let admin_token_recovery_listener = if let Some(addr) = config.admin_token_recovery_bind_address
+    {
+        info!(%addr, "Admin token recovery endpoint enabled - WARNING: This allows unauthenticated admin token regeneration!");
+        Some(TcpListener::bind(*addr).await.map_err(Error::BindAddress)?)
+    } else {
+        None
+    };
+
     let processing_engine = ProcessingEngineManagerImpl::new(
         setup_processing_engine_env_manager(&config.processing_engine_config),
         write_buffer.catalog(),
-        config.node_identifier_prefix,
-        Arc::clone(&write_buffer),
+        node_id,
+        Arc::clone(&write_buffer) as Arc<dyn influxdb3_write::Bufferer>,
         Arc::clone(&query_executor) as _,
         Arc::clone(&time_provider) as _,
         sys_events_store,
     )
-    .await;
+    .await
+    .map_err(Error::PythonEnvironmentInitialization)?;
+
+    // Update query executor with processing engine reference
+    query_executor.set_processing_engine(Arc::clone(&processing_engine));
 
     let cert_file = config.cert_file;
     let key_file = config.key_file;
@@ -1506,6 +1720,19 @@ pub async fn command(config: Config) -> Result<()> {
         .with_endpoint_policy(endpoint_policy),
     );
 
+    // Only create recovery server if listener was created
+    let admin_token_recovery_server = admin_token_recovery_listener.map(|listener| {
+        Server::new(CreateServerArgs {
+            common_state: common_state.clone(),
+            http: Arc::clone(&http),
+            authorizer: Arc::clone(&authorizer),
+            listener,
+            cert_file: cert_file.clone(),
+            key_file: key_file.clone(),
+            tls_minimum_version: (&config.tls_minimum_version).into(),
+        })
+    });
+
     let server = Server::new(CreateServerArgs {
         common_state,
         http,
@@ -1513,7 +1740,7 @@ pub async fn command(config: Config) -> Result<()> {
         listener,
         cert_file,
         key_file,
-        tls_minimum_version: config.tls_minimum_version.into(),
+        tls_minimum_version: (&config.tls_minimum_version).into(),
     });
 
     // There are two different select! macros - tokio::select and futures::select
@@ -1548,6 +1775,7 @@ pub async fn command(config: Config) -> Result<()> {
         ?paths_without_authz,
         "setting up server with authz disabled for paths"
     );
+
     let frontend = serve(
         server,
         frontend_shutdown.clone(),
@@ -1559,13 +1787,33 @@ pub async fn command(config: Config) -> Result<()> {
     .fuse();
     let backend = shutdown_manager.join().fuse();
 
+    // Only start recovery endpoint if server was created
+    let recovery_endpoint_enabled = admin_token_recovery_server.is_some();
+    let recovery_frontend = if let Some(recovery_server) = admin_token_recovery_server {
+        futures::future::Either::Left(
+            serve_admin_token_recovery_endpoint(
+                recovery_server,
+                frontend_shutdown.clone(),
+                config.admin_token_recovery_tcp_listener_file_path,
+            )
+            .fuse(),
+        )
+    } else {
+        // Provide a future that never completes if recovery endpoint is disabled
+        futures::future::Either::Right(
+            futures::future::pending::<Result<(), influxdb3_server::Error>>().fuse(),
+        )
+    };
+
     // pin_mut constructs a Pin<&mut T> from a T by preventing moving the T
     // from the current stack frame and constructing a Pin<&mut T> to it
     pin_mut!(signal);
     pin_mut!(frontend);
     pin_mut!(backend);
+    pin_mut!(recovery_frontend);
 
     let mut res = Ok(());
+    let mut recovery_endpoint_active = recovery_endpoint_enabled;
 
     // Graceful shutdown can be triggered by sending SIGINT or SIGTERM to the
     // process, or by a background task exiting - most likely with an error
@@ -1590,23 +1838,57 @@ pub async fn command(config: Config) -> Result<()> {
                 res = res.and(Err(Error::LostBackend));
             }
             // HTTP/gRPC frontend has stopped
-            result = frontend => match result {
-                Ok(_) if frontend_shutdown.is_cancelled() => info!("HTTP/gRPC service shutdown"),
-                Ok(_) => {
-                    error!("early HTTP/gRPC service exit");
-                    res = res.and(Err(Error::LostHttpGrpc));
-                },
-                Err(error) => {
-                    error!("HTTP/gRPC error");
-                    res = res.and(Err(Error::Server(error)));
+            result = frontend => {
+                match result {
+                    Ok(_) if frontend_shutdown.is_cancelled() => info!("HTTP/gRPC service shutdown"),
+                    Ok(_) => {
+                        error!("early HTTP/gRPC service exit");
+                        res = res.and(Err(Error::LostHttpGrpc));
+                    },
+                    Err(error) => {
+                        error!("HTTP/gRPC error");
+                        res = res.and(Err(Error::Server(error)));
+                    },
                 }
+            },
+            // Admin token recovery endpoint has stopped
+            recovery_result = recovery_frontend => {
+                // Only process recovery endpoint results if it was actually enabled and active
+                if recovery_endpoint_enabled && recovery_endpoint_active {
+                    match recovery_result {
+                        Ok(_) if frontend_shutdown.is_cancelled() => {
+                            info!("Admin token recovery service shutdown");
+                            // Only break if the main shutdown was also requested
+                            if frontend.is_terminated() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {
+                            // Recovery endpoint can shut down normally after token regeneration
+                            // This is expected behavior and should not cause an error
+                            info!("Admin token recovery service exited normally after token regeneration");
+                            recovery_endpoint_active = false;
+                            // Since recovery_frontend is a FusedFuture, it won't be polled again
+                            // after completion, so we don't need to do anything else
+                            // Continue the loop - do NOT break or call shutdown
+                            continue; // Skip shutdown_manager.shutdown() for this iteration
+                        }
+                        Err(error) => {
+                            error!(%error, "admin token recovery service error");
+                            res = res.and(Err(Error::Server(error)));
+                            // Continue running the main server even if recovery endpoint had an error
+                        }
+                    }
+                }
+                // If recovery endpoint was disabled, this branch will never be taken again
+                // because pending() futures never complete
             }
         }
         shutdown_manager.shutdown()
     }
     // ensure that the frontend has fully terminated so we dont close the connection on any clients
     if !frontend.is_terminated() {
-        res = res.and(frontend.await.map_err(Into::into));
+        res = res.and(frontend.await.map_err(Error::Server));
     }
     info!("frontend shutdown completed");
 
@@ -1625,11 +1907,13 @@ pub(crate) fn setup_processing_engine_env_manager(
         PackageManager::Discover => determine_package_manager(),
         PackageManager::Pip => Arc::new(PipManager),
         PackageManager::UV => Arc::new(UVManager),
+        PackageManager::Disabled => Arc::new(DisabledPackageManager),
     };
     ProcessingEngineEnvironmentManager {
         plugin_dir: config.plugin_dir.clone(),
         virtual_env_location: config.virtual_env_location.clone(),
         package_manager,
+        plugin_repo: config.plugin_repo.clone(),
     }
 }
 
@@ -1641,21 +1925,73 @@ fn determine_package_manager() -> Arc<dyn PythonEnvironmentManager> {
     if let Ok(output) = Command::new(&python_exe)
         .args(["-m", "pip", "--version"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            return Arc::new(PipManager);
-        }
+        return Arc::new(PipManager);
     }
 
     // Check for uv second (ie, prefer python standalone pip)
-    if let Ok(output) = Command::new("uv").arg("--version").output() {
-        if output.status.success() {
-            return Arc::new(UVManager);
-        }
+    if let Ok(output) = Command::new("uv").arg("--version").output()
+        && output.status.success()
+    {
+        return Arc::new(UVManager);
     }
 
     // If neither is available, return DisabledManager
     Arc::new(DisabledManager)
+}
+
+async fn initialize_table_index_cache(
+    node_id: String,
+    retention_check_interval: Duration,
+    table_index_cache_config: TableIndexCacheConfig,
+    object_store: Arc<dyn ObjectStore>,
+    catalog: Arc<Catalog>,
+    time_provider: Arc<dyn TimeProvider>,
+    retention_handler_token: ShutdownToken,
+) -> Result<Option<TableIndexCache>> {
+    let table_index_cache = TableIndexCache::new(
+        node_id.clone(),
+        table_index_cache_config,
+        Arc::clone(&object_store),
+    );
+
+    info!(
+        node_id = node_id.clone(),
+        max_entries = ?table_index_cache_config.max_entries,
+        concurrency_limit = table_index_cache_config.concurrency_limit,
+        "Initializing table index cache"
+    );
+
+    // Initialize table index cache from any existing snapshots
+    //
+    // This needs to happen before WAL snapshotting, retention handling, or hard deletion could
+    // begin executing so we have a quiescent time during which we can transform
+    // `PersistedSnapshot` to `TableIndexSnapshot` to `TableIndex` to completion.
+    table_index_cache.initialize().await.map_err(|e| {
+        warn!("Failed to initialize table index cache: {}", e);
+        Error::WriteBufferInit(anyhow::anyhow!(
+            "Failed to initialize table index cache: {}",
+            e
+        ))
+    })?;
+
+    // Create and start the retention period handler
+    let retention_handler = Arc::new(RetentionPeriodHandler::new(
+        table_index_cache.clone(),
+        Arc::clone(&catalog),
+        Arc::clone(&time_provider) as _,
+        retention_check_interval,
+        node_id.to_string(),
+    ));
+
+    tokio::spawn(async move {
+        retention_handler
+            .background_task(retention_handler_token)
+            .await
+    });
+
+    Ok(Some(table_index_cache))
 }
 
 struct TelemetryStoreSetupArgs<'a> {
@@ -1666,6 +2002,7 @@ struct TelemetryStoreSetupArgs<'a> {
     telemetry_endpoint: &'a str,
     disable_upload: bool,
     catalog_uuid: String,
+    serve_invocation_method: ServeInvocationMethod,
     processing_engine_metrics: Arc<dyn ProcessingEngineMetrics>,
 }
 
@@ -1678,6 +2015,7 @@ async fn setup_telemetry_store(
         telemetry_endpoint,
         disable_upload,
         catalog_uuid,
+        serve_invocation_method,
         processing_engine_metrics,
     }: TelemetryStoreSetupArgs<'_>,
 ) -> Arc<TelemetryStore> {
@@ -1706,6 +2044,7 @@ async fn setup_telemetry_store(
             persisted_files: persisted_files.map(|p| p as _),
             telemetry_endpoint: telemetry_endpoint.to_string(),
             catalog_uuid,
+            serve_invocation_method,
             processing_engine_metrics,
         })
         .await
@@ -1761,6 +2100,7 @@ pub fn setup_metric_registry() -> Arc<metric::Registry> {
             "Start time of the process since unix epoch in seconds.",
         )
         .recorder(&[
+            ("product_name", influxdb3_server::PRODUCT_NAME),
             ("version", INFLUXDB3_VERSION.as_ref()),
             ("git_hash", INFLUXDB3_GIT_HASH),
             ("uuid", PROCESS_UUID_STR.as_ref()),
@@ -1780,4 +2120,89 @@ pub fn setup_metric_registry() -> Arc<metric::Registry> {
     );
 
     registry
+}
+
+/// Initialize an admin token from a JSON file.
+///
+/// The token file must be in this format: `{"token": "apiv3_...", "name": "custom_name", "expiry_millis": 1234567890}`
+///
+/// If an admin token with the same name already exists, this function will succeed without creating a duplicate.
+/// File permissions should be restricted (0600) to protect the token.
+async fn initialize_admin_token_from_file(catalog: &Catalog, token_file: &PathBuf) -> Result<()> {
+    use sha2::{Digest, Sha512};
+
+    info!(
+        "Initializing admin token from file: {}",
+        token_file.display()
+    );
+
+    // Check file permissions on Unix systems
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = tokio::fs::metadata(token_file).await.map_err(|e| {
+            Error::TokenError(CatalogError::unexpected(format!(
+                "Failed to read admin token file metadata: {e}",
+            )))
+        })?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            warn!(
+                "Admin token file has insecure permissions: {:o}. Consider using chmod 0600.",
+                mode & 0o777
+            );
+        }
+    }
+
+    // Read file content
+    let content = tokio::fs::read_to_string(token_file).await.map_err(|e| {
+        Error::TokenError(CatalogError::unexpected(format!(
+            "Failed to read admin token file: {e}",
+        )))
+    })?;
+
+    // Parse JSON format
+    let admin_token_file: AdminTokenFile = serde_json::from_str(&content).map_err(|e| {
+        Error::TokenError(CatalogError::unexpected(format!(
+            "Failed to parse admin token file as JSON: {e}",
+        )))
+    })?;
+
+    info!(
+        "Loaded admin token from file, name: {}",
+        admin_token_file.name
+    );
+
+    let token = admin_token_file.token;
+    let name = admin_token_file.name;
+    let expiry_millis = admin_token_file.expiry_millis;
+
+    // Validate token format
+    if !token.starts_with("apiv3_") {
+        return Err(Error::TokenError(CatalogError::unexpected(
+            "Invalid token format: must start with 'apiv3_'",
+        )));
+    }
+
+    // Compute hash from token (same as authentication does)
+    let hash = Sha512::digest(&token).to_vec();
+
+    // Create admin token with computed hash and name
+    match catalog
+        .create_named_admin_token_with_hash(name.clone(), hash, expiry_millis)
+        .await
+    {
+        Ok(()) => {
+            info!("Admin token '{}' initialized from file", name);
+            Ok(())
+        }
+        Err(CatalogError::TokenNameAlreadyExists(existing_name)) => {
+            info!(
+                "Admin token '{}' already exists, skipping initialization",
+                existing_name
+            );
+            Ok(())
+        }
+        Err(e) => Err(Error::TokenError(e)),
+    }
 }

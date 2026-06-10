@@ -16,15 +16,17 @@ pub struct Config {
 
 impl Config {
     fn get_client(&self) -> Result<Client, Box<dyn Error>> {
-        match &self.cmd {
+        let (host_url, auth_token, ca_cert, tls_no_verify) = match &self.cmd {
             SubCommand::Database(DatabaseConfig {
                 host_url,
                 auth_token,
                 ca_cert,
+                tls_no_verify,
                 ..
             })
             | SubCommand::LastCache(LastCacheConfig {
                 ca_cert,
+                tls_no_verify,
                 influxdb3_config:
                     InfluxDb3Config {
                         host_url,
@@ -35,6 +37,7 @@ impl Config {
             })
             | SubCommand::DistinctCache(DistinctCacheConfig {
                 ca_cert,
+                tls_no_verify,
                 influxdb3_config:
                     InfluxDb3Config {
                         host_url,
@@ -45,6 +48,7 @@ impl Config {
             })
             | SubCommand::Table(TableConfig {
                 ca_cert,
+                tls_no_verify,
                 influxdb3_config:
                     InfluxDb3Config {
                         host_url,
@@ -55,6 +59,7 @@ impl Config {
             })
             | SubCommand::Trigger(TriggerConfig {
                 ca_cert,
+                tls_no_verify,
                 influxdb3_config:
                     InfluxDb3Config {
                         host_url,
@@ -65,17 +70,17 @@ impl Config {
             })
             | SubCommand::Token(TokenConfig {
                 ca_cert,
+                tls_no_verify,
                 host_url,
                 auth_token,
                 ..
-            }) => {
-                let mut client = Client::new(host_url.clone(), ca_cert.clone())?;
-                if let Some(token) = &auth_token {
-                    client = client.with_auth_token(token.expose_secret());
-                }
-                Ok(client)
-            }
+            }) => (host_url, auth_token, ca_cert, tls_no_verify),
+        };
+        let mut client = Client::new(host_url.clone(), ca_cert.clone(), *tls_no_verify)?;
+        if let Some(token) = &auth_token {
+            client = client.with_auth_token(token.expose_secret());
         }
+        Ok(client)
     }
 }
 
@@ -109,7 +114,7 @@ pub struct DatabaseConfig {
     pub host_url: Url,
 
     /// The token for authentication with the InfluxDB 3 Core server
-    #[clap(long = "token", env = "INFLUXDB3_AUTH_TOKEN")]
+    #[clap(long = "token", env = "INFLUXDB3_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<Secret<String>>,
 
     /// The name of the database to be deleted
@@ -124,6 +129,14 @@ pub struct DatabaseConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
+
+    /// Skip confirmation prompt
+    #[clap(long, short = 'y')]
+    yes: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -142,6 +155,10 @@ pub struct LastCacheConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -160,6 +177,10 @@ pub struct DistinctCacheConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -178,6 +199,14 @@ pub struct TableConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
+
+    /// Skip confirmation prompt
+    #[clap(long, short = 'y')]
+    yes: bool,
 }
 
 #[derive(Debug, clap::Parser)]
@@ -196,6 +225,10 @@ pub struct TriggerConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -210,7 +243,7 @@ pub struct TokenConfig {
     pub host_url: Url,
 
     /// The token for authentication with the InfluxDB 3 Core server
-    #[clap(long = "token", env = "INFLUXDB3_AUTH_TOKEN")]
+    #[clap(long = "token", env = "INFLUXDB3_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<Secret<String>>,
 
     /// The name of the token to be deleted
@@ -220,6 +253,14 @@ pub struct TokenConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
+
+    /// Skip confirmation prompt
+    #[clap(long, short = 'y')]
+    yes: bool,
 }
 
 fn parse_hard_delete_time(value: Option<String>) -> Option<HardDeletionTime> {
@@ -234,35 +275,50 @@ fn parse_hard_delete_time(value: Option<String>) -> Option<HardDeletionTime> {
     }
 }
 
+fn confirm_delete(message: &str, yes: bool) -> Result<(), Box<dyn Error>> {
+    if yes {
+        return Ok(());
+    }
+
+    eprintln!("{message}");
+    let mut confirmation = String::new();
+    io::stdin().read_line(&mut confirmation)?;
+
+    let input = confirmation.trim();
+    if !input.eq_ignore_ascii_case("yes") && !input.eq_ignore_ascii_case("y") {
+        return Err("Cannot proceed without confirmation".into());
+    }
+
+    Ok(())
+}
+
 pub async fn command(config: Config) -> Result<(), Box<dyn Error>> {
     let client = config.get_client()?;
     match config.cmd {
         SubCommand::Database(DatabaseConfig {
             database_name,
             hard_delete,
+            yes,
             ..
         }) => {
-            println!("Are you sure you want to delete {database_name:?}? Enter 'yes' to confirm");
-            let mut confirmation = String::new();
-            let _ = io::stdin().read_line(&mut confirmation);
-            if confirmation.trim() != "yes" {
-                println!("Cannot delete database without confirmation");
+            confirm_delete(
+                &format!(
+                    "Are you sure you want to delete {database_name:?}? Enter 'yes' or 'y' to confirm"
+                ),
+                yes,
+            )?;
+
+            let hard_delete_time = parse_hard_delete_time(hard_delete);
+
+            if hard_delete_time.is_some() {
+                client
+                    .api_v3_configure_db_delete_with_hard_delete(&database_name, hard_delete_time)
+                    .await?;
             } else {
-                let hard_delete_time = parse_hard_delete_time(hard_delete);
-
-                if hard_delete_time.is_some() {
-                    client
-                        .api_v3_configure_db_delete_with_hard_delete(
-                            &database_name,
-                            hard_delete_time,
-                        )
-                        .await?;
-                } else {
-                    client.api_v3_configure_db_delete(&database_name).await?;
-                }
-
-                println!("Database {:?} deleted successfully", &database_name);
+                client.api_v3_configure_db_delete(&database_name).await?;
             }
+
+            println!("Database {:?} deleted successfully", &database_name);
         }
         SubCommand::LastCache(LastCacheConfig {
             influxdb3_config: InfluxDb3Config { database_name, .. },
@@ -292,38 +348,37 @@ pub async fn command(config: Config) -> Result<(), Box<dyn Error>> {
             influxdb3_config: InfluxDb3Config { database_name, .. },
             table_name,
             hard_delete,
+            yes,
             ..
         }) => {
-            println!(
-                "Are you sure you want to delete {:?}.{:?}? Enter 'yes' to confirm",
-                database_name, &table_name,
-            );
-            let mut confirmation = String::new();
-            let _ = io::stdin().read_line(&mut confirmation);
-            if confirmation.trim() != "yes" {
-                println!("Cannot delete table without confirmation");
+            confirm_delete(
+                &format!(
+                    "Are you sure you want to delete {:?}.{:?}? Enter 'yes' or 'y' to confirm",
+                    database_name, &table_name,
+                ),
+                yes,
+            )?;
+
+            let hard_delete_time = parse_hard_delete_time(hard_delete);
+
+            if hard_delete_time.is_some() {
+                client
+                    .api_v3_configure_table_delete_with_hard_delete(
+                        &database_name,
+                        &table_name,
+                        hard_delete_time,
+                    )
+                    .await?;
             } else {
-                let hard_delete_time = parse_hard_delete_time(hard_delete);
-
-                if hard_delete_time.is_some() {
-                    client
-                        .api_v3_configure_table_delete_with_hard_delete(
-                            &database_name,
-                            &table_name,
-                            hard_delete_time,
-                        )
-                        .await?;
-                } else {
-                    client
-                        .api_v3_configure_table_delete(&database_name, &table_name)
-                        .await?;
-                }
-
-                println!(
-                    "Table {:?}.{:?} deleted successfully",
-                    &database_name, &table_name
-                );
+                client
+                    .api_v3_configure_table_delete(&database_name, &table_name)
+                    .await?;
             }
+
+            println!(
+                "Table {:?}.{:?} deleted successfully",
+                &database_name, &table_name
+            );
         }
         SubCommand::Trigger(TriggerConfig {
             influxdb3_config: InfluxDb3Config { database_name, .. },
@@ -340,7 +395,9 @@ pub async fn command(config: Config) -> Result<(), Box<dyn Error>> {
                 .await?;
             println!("Trigger {trigger_name} deleted successfully");
         }
-        SubCommand::Token(TokenConfig { token_name, .. }) => {
+        SubCommand::Token(TokenConfig {
+            token_name, yes, ..
+        }) => {
             if token_name == "_admin" {
                 println!(
                     "The operator token \"_admin\" is required and cannot be deleted. To regenerate an operator token, use: influxdb3 create token --admin --regenerate --token [TOKEN]"
@@ -348,15 +405,15 @@ pub async fn command(config: Config) -> Result<(), Box<dyn Error>> {
                 return Ok(());
             }
 
-            println!("Are you sure you want to delete {token_name:?}? Enter 'yes' to confirm");
-            let mut confirmation = String::new();
-            let _ = io::stdin().read_line(&mut confirmation);
-            if confirmation.trim() != "yes" {
-                println!("Cannot delete token without confirmation");
-            } else {
-                client.api_v3_configure_token_delete(&token_name).await?;
-                println!("Token {token_name:?} deleted successfully");
-            }
+            confirm_delete(
+                &format!(
+                    "Are you sure you want to delete {token_name:?}? Enter 'yes' or 'y' to confirm"
+                ),
+                yes,
+            )?;
+
+            client.api_v3_configure_token_delete(&token_name).await?;
+            println!("Token {token_name:?} deleted successfully");
         }
     }
     Ok(())

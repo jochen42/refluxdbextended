@@ -25,18 +25,13 @@ use metric::Registry;
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjPath;
-use object_store_size_hinting::ObjectStoreStripSizeHinting;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 #[tokio::test]
 async fn compaction_publishes_and_replaces_files() {
-    // The strip-size-hinting wrapper lets DataFusion's cached-parquet optimizer
-    // (turned on by `Executor::new_testing`) pass its synthetic `iox_size_hint`
-    // if-match through to the InMemory backend without tripping its precondition.
-    let object_store: Arc<dyn ObjectStore> =
-        Arc::new(ObjectStoreStripSizeHinting::new(Arc::new(InMemory::new())));
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let time_provider: Arc<dyn iox_time::TimeProvider> = Arc::new(MockProvider::new(
         iox_time::Time::from_timestamp_nanos(0),
     ));
@@ -54,6 +49,7 @@ async fn compaction_publishes_and_replaces_files() {
         Arc::clone(&object_store),
         "test-host",
         Arc::clone(&time_provider),
+        None,
     ));
     let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog))
         .await
@@ -76,9 +72,10 @@ async fn compaction_publishes_and_replaces_files() {
         metric_registry: Arc::new(Registry::default()),
         snapshotted_wal_files_to_keep: 10,
         query_file_limit: None,
-        n_snapshots_to_load_on_start: 1,
+        n_snapshots_to_load_on_start: std::num::NonZeroU64::new(1).unwrap(),
         shutdown: ShutdownManager::new_testing().register(),
-        wal_replay_concurrency_limit: None,
+        wal_replay_concurrency_limit: 1,
+        parquet_snapshot_concurrency_limit: std::num::NonZeroUsize::new(1).unwrap(),
         shared_inventory: None,
     })
     .await
@@ -221,7 +218,7 @@ async fn compaction_publishes_and_replaces_files() {
     let comp_snapshots = persister.load_compaction_snapshots().await.unwrap();
     let mut combined = wal_snapshots;
     combined.extend(comp_snapshots);
-    let replayed = PersistedFiles::new_from_persisted_snapshots(combined);
+    let replayed = PersistedFiles::new_from_persisted_snapshots(None, Arc::new(combined));
     let replayed_paths: std::collections::HashSet<_> = replayed
         .get_files(db_id, table_id)
         .into_iter()

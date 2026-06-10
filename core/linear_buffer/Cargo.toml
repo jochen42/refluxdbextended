@@ -1,0 +1,12 @@
+[package]
+name = "linear_buffer"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+
+[dev-dependencies]

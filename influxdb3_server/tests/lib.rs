@@ -7,7 +7,7 @@ use futures::TryStreamExt;
 use influxdb3_cache::{distinct_cache::DistinctCacheProvider, last_cache::LastCacheProvider};
 use influxdb3_catalog::catalog::Catalog;
 use influxdb3_internal_api::query_executor::QueryExecutor;
-use influxdb3_server::query_executor::{CreateQueryExecutorArgs, QueryExecutorImpl};
+use influxdb3_query_executor::{CreateQueryExecutorArgs, QueryExecutorImpl};
 use influxdb3_shutdown::ShutdownManager;
 use influxdb3_sys_events::SysEventStore;
 use influxdb3_telemetry::store::TelemetryStore;
@@ -241,6 +241,7 @@ impl TestService {
             Arc::clone(&object_store) as _,
             node_id,
             Arc::clone(&time_provider) as _,
+            None,
         ));
         let write_buffer: Arc<dyn WriteBuffer> = WriteBufferImpl::new(WriteBufferImplArgs {
             persister: Arc::clone(&persister),
@@ -263,7 +264,9 @@ impl TestService {
             query_file_limit: None,
             shutdown: ShutdownManager::new_testing().register(),
             n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
-            wal_replay_concurrency_limit: Some(1),
+            wal_replay_concurrency_limit: 1,
+            shared_inventory: None,
+            parquet_snapshot_concurrency_limit: NonZeroUsize::new(10).unwrap(),
         })
         .await
         .unwrap();
@@ -286,6 +289,7 @@ impl TestService {
             sys_events_store: Arc::clone(&sys_events_store),
             started_with_auth: false,
             time_provider: Arc::clone(&time_provider) as _,
+            processing_engine: None,
         }));
 
         Self {

@@ -188,8 +188,7 @@ pub fn batches_to_buffer_chunks(
     chunk_order: i64,
 ) -> Vec<Arc<dyn iox_query::QueryChunk>> {
     use crate::chunk::BufferChunk;
-    use data_types::{ChunkId, ChunkOrder, PartitionHashId, PartitionId, PartitionKey,
-        TransitionPartitionId};
+    use data_types::{ChunkId, ChunkOrder, PartitionHashId, PartitionKey};
     use iox_query::chunk_statistics::{NoColumnRanges, create_chunk_statistics};
 
     if batches.is_empty() {
@@ -204,12 +203,9 @@ pub fn batches_to_buffer_chunks(
         batches,
         schema: influx_schema,
         stats: Arc::new(stats),
-        partition_id: TransitionPartitionId::from_parts(
-            PartitionId::new(0),
-            Some(PartitionHashId::new(
-                data_types::TableId::new(0),
-                &PartitionKey::from("remote-hot".to_string()),
-            )),
+        partition_id: PartitionHashId::new(
+            data_types::TableId::new(0),
+            &PartitionKey::from("remote-hot".to_string()),
         ),
         sort_key: None,
         id: ChunkId::new(),

@@ -3,16 +3,17 @@ use crate::manager::ProcessingEngineError;
 
 use crate::plugins::PluginContext;
 use crate::plugins::{PluginError, ProcessingEngineEnvironmentManager};
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use bytes::Bytes;
 use hashbrown::HashMap;
 use influxdb3_catalog::CatalogError;
 use influxdb3_catalog::catalog::Catalog;
 use influxdb3_catalog::channel::CatalogUpdateReceiver;
 use influxdb3_catalog::log::{
-    CatalogBatch, DatabaseCatalogOp, DeleteTriggerLog, PluginType, TriggerDefinition,
-    TriggerIdentifier, TriggerSpecificationDefinition, ValidPluginFilename,
+    CatalogBatch, DatabaseCatalogOp, DeleteOp, DeleteTriggerLog, PluginType, SoftDeleteDatabaseLog,
+    TriggerDefinition, TriggerIdentifier, TriggerSpecificationDefinition, ValidPluginFilename,
 };
+use influxdb3_id::DbId;
 use influxdb3_internal_api::query_executor::QueryExecutor;
 use influxdb3_py_api::system_py::CacheStore;
 use influxdb3_sys_events::SysEventStore;
@@ -21,21 +22,86 @@ use influxdb3_types::http::{
     WalPluginTestResponse,
 };
 use influxdb3_wal::{SnapshotDetails, WalContents, WalFileNotifier};
-use influxdb3_write::WriteBuffer;
+use influxdb3_write::Bufferer;
 use iox_http_util::Response;
 use iox_time::TimeProvider;
-use observability_deps::tracing::{debug, error, warn};
+use observability_deps::tracing::{debug, error, info, warn};
 use parking_lot::Mutex;
 use std::any::Any;
+use std::fs;
+use std::io::{Error as IoError, ErrorKind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use tokio::fs as async_fs;
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 pub mod environment;
 pub mod manager;
 pub mod plugins;
+
+// Constants for plugin file naming
+const INIT_PY: &str = "__init__.py";
+const PY_EXTENSION: &str = "py";
+const PYCACHE_DIR: &str = "__pycache__";
+
+use std::path::Path;
+
+/// Validates that a user-provided path stays within the plugin directory.
+/// Prevents path traversal attacks via "..", absolute paths, and symlinks.
+fn validate_path_within_plugin_dir(
+    plugin_dir: &Path,
+    user_path: &str,
+) -> Result<PathBuf, PluginError> {
+    // 1. Check for "..", absolute path components, and Windows prefixes (C:\, \\server\share)
+    let normalized_path = Path::new(user_path);
+    for component in normalized_path.components() {
+        match component {
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(PluginError::PathTraversal(user_path.to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    // 2. Build target path and canonicalize for symlink protection
+    let target_path = plugin_dir.join(user_path);
+    let canonical_plugin_dir = plugin_dir.canonicalize()?;
+
+    // 3. Handle non-existent files by canonicalizing deepest existing ancestor
+    let canonical_target_path = if target_path.exists() {
+        target_path.canonicalize()?
+    } else {
+        // Find deepest existing ancestor, canonicalize, append missing components
+        let mut existing = target_path.as_path();
+        let mut missing = Vec::new();
+        while !existing.exists() {
+            missing.push(
+                existing
+                    .file_name()
+                    .ok_or_else(|| PluginError::PathTraversal(user_path.to_string()))?,
+            );
+            existing = existing
+                .parent()
+                .ok_or_else(|| PluginError::PathTraversal(user_path.to_string()))?;
+        }
+        let mut canonical = existing.canonicalize()?;
+        for c in missing.into_iter().rev() {
+            canonical.push(c);
+        }
+        canonical
+    };
+
+    // 4. Verify target is within plugin directory
+    if !canonical_target_path.starts_with(&canonical_plugin_dir) {
+        return Err(PluginError::PathTraversal(user_path.to_string()));
+    }
+
+    Ok(target_path)
+}
 
 pub mod virtualenv;
 
@@ -44,12 +110,17 @@ pub struct ProcessingEngineManagerImpl {
     environment_manager: ProcessingEngineEnvironmentManager,
     catalog: Arc<Catalog>,
     node_id: Arc<str>,
-    write_buffer: Arc<dyn WriteBuffer>,
+    write_buffer: Arc<dyn Bufferer>,
     query_executor: Arc<dyn QueryExecutor>,
     time_provider: Arc<dyn TimeProvider>,
     sys_event_store: Arc<SysEventStore>,
     cache: Arc<Mutex<CacheStore>>,
     plugin_event_tx: RwLock<PluginChannels>,
+    /// Stores (original_db_name, request_trigger_paths) during soft delete for use
+    /// during the subsequent hard delete. After soft delete, the database is renamed
+    /// and may be removed from the catalog entirely, so the hard delete handler cannot
+    /// reliably resolve the original name or trigger paths from the catalog.
+    soft_deleted_trigger_info: RwLock<HashMap<DbId, (String, Vec<String>)>>,
 }
 
 #[derive(Debug, Default)]
@@ -75,34 +146,34 @@ impl PluginChannels {
         match trigger_spec {
             TriggerSpecificationDefinition::SingleTableWalWrite { .. }
             | TriggerSpecificationDefinition::AllTablesWalWrite => {
-                if let Some(trigger_map) = self.wal_triggers.get(&db) {
-                    if let Some(sender) = trigger_map.get(&trigger) {
-                        // create a one shot to wait for the shutdown to complete
-                        let (tx, rx) = oneshot::channel();
-                        if sender.send(WalEvent::Shutdown(tx)).await.is_err() {
-                            return Err(ProcessingEngineError::TriggerShutdownError {
-                                database: db,
-                                trigger_name: trigger,
-                            });
-                        }
-                        return Ok(Some(rx));
+                if let Some(trigger_map) = self.wal_triggers.get(&db)
+                    && let Some(sender) = trigger_map.get(&trigger)
+                {
+                    // create a one shot to wait for the shutdown to complete
+                    let (tx, rx) = oneshot::channel();
+                    if sender.send(WalEvent::Shutdown(tx)).await.is_err() {
+                        return Err(ProcessingEngineError::TriggerShutdownError {
+                            database: db,
+                            trigger_name: trigger,
+                        });
                     }
+                    return Ok(Some(rx));
                 }
             }
             TriggerSpecificationDefinition::Schedule { .. }
             | TriggerSpecificationDefinition::Every { .. } => {
-                if let Some(trigger_map) = self.schedule_triggers.get(&db) {
-                    if let Some(sender) = trigger_map.get(&trigger) {
-                        // create a one shot to wait for the shutdown to complete
-                        let (tx, rx) = oneshot::channel();
-                        if sender.send(ScheduleEvent::Shutdown(tx)).await.is_err() {
-                            return Err(ProcessingEngineError::TriggerShutdownError {
-                                database: db,
-                                trigger_name: trigger,
-                            });
-                        }
-                        return Ok(Some(rx));
+                if let Some(trigger_map) = self.schedule_triggers.get(&db)
+                    && let Some(sender) = trigger_map.get(&trigger)
+                {
+                    // create a one shot to wait for the shutdown to complete
+                    let (tx, rx) = oneshot::channel();
+                    if sender.send(ScheduleEvent::Shutdown(tx)).await.is_err() {
+                        return Err(ProcessingEngineError::TriggerShutdownError {
+                            database: db,
+                            trigger_name: trigger,
+                        });
                     }
+                    return Ok(Some(rx));
                 }
             }
             TriggerSpecificationDefinition::RequestPath { .. } => {
@@ -145,6 +216,64 @@ impl PluginChannels {
             TriggerSpecificationDefinition::RequestPath { .. } => {
                 self.request_triggers.remove(&trigger);
             }
+        }
+    }
+
+    async fn shutdown_all_for_db(&self, db: &str, request_paths: &[String]) -> Vec<Receiver<()>> {
+        let mut receivers = Vec::new();
+
+        if let Some(trigger_map) = self.wal_triggers.get(db) {
+            for (trigger_name, sender) in trigger_map {
+                let (tx, rx) = oneshot::channel();
+                if sender.send(WalEvent::Shutdown(tx)).await.is_err() {
+                    warn!(
+                        db,
+                        trigger_name,
+                        "failed to send shutdown to WAL trigger during database deletion"
+                    );
+                } else {
+                    receivers.push(rx);
+                }
+            }
+        }
+
+        if let Some(trigger_map) = self.schedule_triggers.get(db) {
+            for (trigger_name, sender) in trigger_map {
+                let (tx, rx) = oneshot::channel();
+                if sender.send(ScheduleEvent::Shutdown(tx)).await.is_err() {
+                    warn!(
+                        db,
+                        trigger_name,
+                        "failed to send shutdown to schedule trigger during database deletion"
+                    );
+                } else {
+                    receivers.push(rx);
+                }
+            }
+        }
+
+        for path in request_paths {
+            if let Some(sender) = self.request_triggers.get(path.as_str()) {
+                let (tx, rx) = oneshot::channel();
+                if sender.send(RequestEvent::Shutdown(tx)).await.is_err() {
+                    warn!(
+                        db,
+                        path, "failed to send shutdown to request trigger during database deletion"
+                    );
+                } else {
+                    receivers.push(rx);
+                }
+            }
+        }
+
+        receivers
+    }
+
+    fn remove_all_for_db(&mut self, db: &str, request_paths: &[String]) {
+        self.wal_triggers.remove(db);
+        self.schedule_triggers.remove(db);
+        for path in request_paths {
+            self.request_triggers.remove(path.as_str());
         }
     }
 
@@ -209,18 +338,18 @@ impl ProcessingEngineManagerImpl {
         environment: ProcessingEngineEnvironmentManager,
         catalog: Arc<Catalog>,
         node_id: impl Into<Arc<str>>,
-        write_buffer: Arc<dyn WriteBuffer>,
+        write_buffer: Arc<dyn Bufferer>,
         query_executor: Arc<dyn QueryExecutor>,
         time_provider: Arc<dyn TimeProvider>,
         sys_event_store: Arc<SysEventStore>,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, environment::PluginEnvironmentError> {
         // if given a plugin dir, try to initialize the virtualenv.
-        if let Some(plugin_dir) = &environment.plugin_dir {
+        if environment.plugin_dir.is_some() {
             {
-                environment
-                    .package_manager
-                    .init_pyenv(plugin_dir, environment.virtual_env_location.as_ref())
-                    .expect("unable to initialize python environment");
+                environment.package_manager.init_pyenv(
+                    environment.plugin_dir.as_deref(),
+                    environment.virtual_env_location.as_ref(),
+                )?;
                 virtualenv::init_pyo3();
             }
         }
@@ -242,11 +371,12 @@ impl ProcessingEngineManagerImpl {
             time_provider,
             plugin_event_tx: Default::default(),
             cache,
+            soft_deleted_trigger_info: Default::default(),
         });
 
         background_catalog_update(Arc::clone(&pem), catalog_sub);
 
-        pem
+        Ok(pem)
     }
 
     pub fn node_id(&self) -> Arc<str> {
@@ -262,40 +392,82 @@ impl ProcessingEngineManagerImpl {
     }
 
     pub async fn read_plugin_code(&self, name: &str) -> Result<PluginCode, PluginError> {
-        // if the name starts with gh: then we need to get it from the public github repo at https://github.com/influxdata/influxdb3_plugins/tree/main
+        // if the name starts with gh: then we use the custom repo if set or we need to get it from
+        // the public github repo at https://github.com/influxdata/influxdb3_plugins/tree/main
         if name.starts_with("gh:") {
             let plugin_path = name.strip_prefix("gh:").unwrap();
-            let url = format!(
-                "https://raw.githubusercontent.com/influxdata/influxdb3_plugins/main/{plugin_path}"
-            );
+            let plugin_repo =
+                self.environment_manager.plugin_repo.as_deref().unwrap_or(
+                    "https://raw.githubusercontent.com/influxdata/influxdb3_plugins/main/",
+                );
+
+            // combine the repo and path, adjusting for ending / if needed
+            let url = if plugin_repo.ends_with('/') {
+                format!("{plugin_repo}{plugin_path}")
+            } else {
+                format!("{plugin_repo}/{plugin_path}")
+            };
+
             let resp = reqwest::get(&url)
                 .await
-                .context("error getting plugin from github repo")?;
+                .context("error getting plugin from repository")?;
 
             // verify the response is a success
             if !resp.status().is_success() {
-                return Err(PluginError::FetchingFromGithub(resp.status(), url));
+                return Err(PluginError::FetchingFromRepository(resp.status(), url));
             }
 
             let resp_body = resp
                 .text()
                 .await
-                .context("error reading plugin from github repo")?;
+                .context("error reading plugin from repository")?;
             return Ok(PluginCode::Github(Arc::from(resp_body)));
         }
 
-        // otherwise we assume it is a local file
+        // otherwise we assume it is a local file or directory
         let plugin_dir = self
             .environment_manager
             .plugin_dir
             .clone()
             .ok_or(PluginError::NoPluginDir)?;
-        let plugin_path = plugin_dir.join(name);
 
-        // read it at least once to make sure it's there
-        let code = std::fs::read_to_string(plugin_path.clone())?;
+        let plugin_name = name.trim_end_matches('/');
 
-        // now we can return it
+        // Validate path stays within plugin directory (prevents path traversal via .., absolute paths, symlinks)
+        let plugin_path = validate_path_within_plugin_dir(&plugin_dir, plugin_name)?;
+
+        if !plugin_path.exists() {
+            return Err(PluginError::ReadPluginError(IoError::new(
+                ErrorKind::NotFound,
+                format!("Plugin not found: {}", plugin_path.display()),
+            )));
+        }
+
+        if plugin_path.is_dir() {
+            let entry_point = plugin_path.join(INIT_PY);
+            if !entry_point.exists() {
+                return Err(PluginError::ReadPluginError(IoError::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "Multi-file plugin directory must contain {}: {}",
+                        INIT_PY,
+                        plugin_path.display()
+                    ),
+                )));
+            }
+
+            let code = async_fs::read_to_string(&entry_point).await?;
+
+            return Ok(PluginCode::LocalDirectory(LocalPluginDirectory {
+                plugin_root: plugin_path,
+                entry_point,
+                last_read_and_code: Mutex::new((SystemTime::now(), Arc::from(code))),
+            }));
+        }
+
+        // Single file plugin
+        let code = async_fs::read_to_string(&plugin_path).await?;
+
         Ok(PluginCode::Local(LocalPlugin {
             plugin_path,
             last_read_and_code: Mutex::new((SystemTime::now(), Arc::from(code))),
@@ -307,6 +479,7 @@ impl ProcessingEngineManagerImpl {
 pub enum PluginCode {
     Github(Arc<str>),
     Local(LocalPlugin),
+    LocalDirectory(LocalPluginDirectory),
 }
 
 impl PluginCode {
@@ -314,6 +487,19 @@ impl PluginCode {
         match self {
             PluginCode::Github(code) => Arc::clone(code),
             PluginCode::Local(plugin) => plugin.read_if_modified(),
+            PluginCode::LocalDirectory(plugin) => plugin.read_entry_point_if_modified(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_directory(&self) -> bool {
+        matches!(self, PluginCode::LocalDirectory(_))
+    }
+
+    pub(crate) fn plugin_root(&self) -> Option<&PathBuf> {
+        match self {
+            PluginCode::LocalDirectory(plugin) => Some(&plugin.plugin_root),
+            _ => None,
         }
     }
 }
@@ -327,7 +513,7 @@ pub struct LocalPlugin {
 
 impl LocalPlugin {
     fn read_if_modified(&self) -> Arc<str> {
-        let metadata = std::fs::metadata(&self.plugin_path);
+        let metadata = fs::metadata(&self.plugin_path);
 
         let mut last_read_and_code = self.last_read_and_code.lock();
         let (last_read, code) = &mut *last_read_and_code;
@@ -341,11 +527,11 @@ impl LocalPlugin {
 
                 if is_modified {
                     // attempt to read the code, if it fails we will return the last known code
-                    if let Ok(new_code) = std::fs::read_to_string(&self.plugin_path) {
+                    if let Ok(new_code) = fs::read_to_string(&self.plugin_path) {
                         *last_read = SystemTime::now();
                         *code = Arc::from(new_code);
                     } else {
-                        error!("error reading plugin file {:?}", self.plugin_path);
+                        error!(plugin_path = ?self.plugin_path, "error reading plugin file");
                     }
                 }
 
@@ -353,6 +539,78 @@ impl LocalPlugin {
             }
             Err(_) => Arc::clone(code),
         }
+    }
+}
+
+/// A multi-file plugin stored as a directory on the local filesystem.
+///
+/// Multi-file plugins must have an `__init__.py` file at the root that serves as
+/// the entry point and contains the trigger functions (e.g., `process_writes`).
+/// Other Python files in the directory can be imported using standard Python import syntax.
+///
+/// # Example Structure
+///
+/// ```text
+/// my_plugin/
+///   __init__.py      (contains process_writes, imports from utils)
+///   utils.py         (helper functions)
+///   models/
+///     __init__.py
+///     data.py        (data models)
+/// ```
+#[derive(Debug)]
+pub struct LocalPluginDirectory {
+    plugin_root: PathBuf,
+    entry_point: PathBuf,
+    last_read_and_code: Mutex<(SystemTime, Arc<str>)>,
+}
+
+impl LocalPluginDirectory {
+    /// Reads the plugin entry point (`__init__.py`) if any Python file in the
+    /// directory has been modified.
+    fn read_entry_point_if_modified(&self) -> Arc<str> {
+        let mut last_read_and_code = self.last_read_and_code.lock();
+        let (last_read, code) = &mut *last_read_and_code;
+
+        if let Some(latest_modified) = self.find_latest_modified_time()
+            && latest_modified > *last_read
+        {
+            if let Ok(new_code) = fs::read_to_string(&self.entry_point) {
+                *last_read = SystemTime::now();
+                *code = Arc::from(new_code);
+            } else {
+                error!(entry_point = ?self.entry_point, "error reading plugin entry point");
+            }
+        }
+
+        Arc::clone(code)
+    }
+
+    /// Finds the latest modification time of any `.py` file in the plugin directory.
+    fn find_latest_modified_time(&self) -> Option<SystemTime> {
+        use walkdir::WalkDir;
+
+        WalkDir::new(&self.plugin_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                // Skip __pycache__ directories entirely
+                e.file_name()
+                    .to_str()
+                    .map(|s| s != PYCACHE_DIR)
+                    .unwrap_or(true)
+            })
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().extension().and_then(|s| s.to_str()) == Some(PY_EXTENSION)
+                    && entry.file_type().is_file()
+            })
+            .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+            .max()
+    }
+
+    pub fn plugin_root(&self) -> &PathBuf {
+        &self.plugin_root
     }
 }
 
@@ -381,7 +639,7 @@ impl ProcessingEngineManagerImpl {
 
             if trigger.node_id != self.node_id {
                 error!(
-                    "Not running trigger {}, as it is configured for node id {}. Multi-node not supported in core, so this shouldn't happen.",
+                    "Not running trigger {}, as it is configured for node id {}. Multi-node not supported in core.",
                     trigger_name, trigger.node_id
                 );
                 return Ok(());
@@ -511,7 +769,10 @@ impl ProcessingEngineManagerImpl {
         Ok(())
     }
 
-    pub async fn test_wal_plugin(
+    /// dry_run_wal_plugin doesn't write data to the DB but it does perform
+    /// real queries. If the plugin under test does other actions with side
+    /// effects those will be real too.
+    pub async fn dry_run_wal_plugin(
         &self,
         request: WalPluginTestRequest,
         query_executor: Arc<dyn QueryExecutor>,
@@ -525,10 +786,11 @@ impl ProcessingEngineManagerImpl {
             let code_string = code.code().to_string();
 
             let res = tokio::task::spawn_blocking(move || {
-                plugins::run_test_wal_plugin(
+                plugins::run_dry_run_wal_plugin(
                     now,
                     catalog,
                     query_executor,
+                    Arc::new(plugins::DryRunBufferer::new()),
                     code_string,
                     cache,
                     request,
@@ -559,10 +821,11 @@ impl ProcessingEngineManagerImpl {
             let cache = Arc::clone(&self.cache);
 
             let res = tokio::task::spawn_blocking(move || {
-                plugins::run_test_schedule_plugin(
+                plugins::run_dry_run_schedule_plugin(
                     now,
                     catalog,
                     query_executor,
+                    Arc::new(plugins::DryRunBufferer::new()),
                     code_string,
                     cache,
                     request,
@@ -603,13 +866,303 @@ impl ProcessingEngineManagerImpl {
             .await?;
 
         rx.await.map_err(|e| {
-            error!(%e, "error receiving response from plugin");
+            error!(error = %e, "error receiving response from plugin");
             ProcessingEngineError::RequestHandlerDown
         })
     }
 
     pub fn get_environment_manager(&self) -> Arc<dyn PythonEnvironmentManager> {
         Arc::clone(&self.environment_manager.package_manager)
+    }
+
+    pub async fn list_plugin_files(&self) -> Vec<PluginFileInfo> {
+        use walkdir::WalkDir;
+
+        let mut plugin_files = Vec::new();
+
+        for db_schema in self.catalog.list_db_schema() {
+            for trigger in db_schema.processing_engine_triggers.resource_iter() {
+                let plugin_name = Arc::<str>::clone(&trigger.trigger_name);
+                debug!(
+                    "Processing trigger '{}' with plugin_filename '{}'",
+                    trigger.trigger_name, trigger.plugin_filename
+                );
+
+                if let Some(ref plugin_dir) = self.environment_manager.plugin_dir {
+                    let plugin_filename = trigger.plugin_filename.trim_end_matches('/');
+                    let plugin_path = plugin_dir.join(plugin_filename);
+
+                    if let Ok(metadata) = async_fs::metadata(&plugin_path).await {
+                        if metadata.is_file() {
+                            plugin_files.push(PluginFileInfo {
+                                plugin_name: Arc::<str>::clone(&plugin_name),
+                                file_name: trigger.plugin_filename.clone().into(),
+                                file_path: plugin_path.to_string_lossy().into(),
+                                size_bytes: metadata.len() as i64,
+                                last_modified_millis: metadata
+                                    .modified()
+                                    .ok()
+                                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0),
+                            });
+                        } else if metadata.is_dir() {
+                            for entry in WalkDir::new(&plugin_path)
+                                .follow_links(false)
+                                .into_iter()
+                                .filter_entry(|e| {
+                                    // Skip __pycache__ directories
+                                    e.file_name()
+                                        .to_str()
+                                        .map(|s| s != PYCACHE_DIR)
+                                        .unwrap_or(true)
+                                })
+                                .filter_map(Result::ok)
+                            {
+                                if entry.file_type().is_file()
+                                    && entry.path().extension().and_then(|s| s.to_str())
+                                        == Some(PY_EXTENSION)
+                                    && let Ok(file_metadata) = entry.metadata()
+                                {
+                                    let relative_path = entry
+                                        .path()
+                                        .strip_prefix(&plugin_path)
+                                        .unwrap_or(entry.path());
+
+                                    plugin_files.push(PluginFileInfo {
+                                        plugin_name: Arc::<str>::clone(&plugin_name),
+                                        file_name: relative_path.to_string_lossy().into(),
+                                        file_path: entry.path().to_string_lossy().into(),
+                                        size_bytes: file_metadata.len() as i64,
+                                        last_modified_millis: file_metadata
+                                            .modified()
+                                            .ok()
+                                            .and_then(|t| {
+                                                t.duration_since(SystemTime::UNIX_EPOCH).ok()
+                                            })
+                                            .map(|d| d.as_millis() as i64)
+                                            .unwrap_or(0),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        plugin_files
+    }
+
+    pub async fn create_plugin_file(
+        self: &Arc<Self>,
+        plugin_filename: &str,
+        content: &str,
+    ) -> Result<(), ProcessingEngineError> {
+        let plugin_dir = self
+            .environment_manager
+            .plugin_dir
+            .as_ref()
+            .ok_or_else(|| {
+                ProcessingEngineError::PluginError(plugins::PluginError::AnyhowError(anyhow!(
+                    "No plugin directory configured"
+                )))
+            })?;
+
+        let plugin_path = validate_path_within_plugin_dir(plugin_dir, plugin_filename)?;
+
+        // Create parent directories if they don't exist (for multi-file plugins)
+        if let Some(parent) = plugin_path.parent() {
+            async_fs::create_dir_all(parent).await.map_err(|e| {
+                ProcessingEngineError::PluginError(plugins::PluginError::ReadPluginError(e))
+            })?;
+        }
+
+        async_fs::write(&plugin_path, content).await.map_err(|e| {
+            ProcessingEngineError::PluginError(plugins::PluginError::ReadPluginError(e))
+        })?;
+
+        Ok(())
+    }
+
+    pub async fn update_plugin_file(
+        self: &Arc<Self>,
+        plugin_name: &str,
+        content: &str,
+    ) -> Result<String, ProcessingEngineError> {
+        for db_schema in self.catalog.list_db_schema() {
+            if let Some(trigger) = db_schema
+                .processing_engine_triggers
+                .resource_iter()
+                .find(|t| t.trigger_name.as_ref() == plugin_name)
+                && let Some(ref plugin_dir) = self.environment_manager.plugin_dir
+            {
+                // Validate path stays within plugin directory
+                let plugin_path =
+                    validate_path_within_plugin_dir(plugin_dir, &trigger.plugin_filename)?;
+
+                // For single-file plugins, update the file directly
+                if !plugin_path.is_dir() {
+                    async_fs::write(&plugin_path, content).await.map_err(|e| {
+                        ProcessingEngineError::PluginError(plugins::PluginError::ReadPluginError(e))
+                    })?;
+
+                    return Ok(db_schema.name.to_string());
+                }
+
+                // For multi-file plugins (directories), update __init__.py by default
+                let init_file = plugin_path.join(INIT_PY);
+                async_fs::write(&init_file, content).await.map_err(|e| {
+                    ProcessingEngineError::PluginError(plugins::PluginError::ReadPluginError(e))
+                })?;
+
+                return Ok(db_schema.name.to_string());
+            }
+        }
+
+        Err(ProcessingEngineError::PluginError(
+            plugins::PluginError::AnyhowError(anyhow::anyhow!("Plugin not found: {}", plugin_name)),
+        ))
+    }
+
+    /// Replace an entire plugin directory atomically with new files.
+    pub async fn replace_plugin_directory(
+        self: &Arc<Self>,
+        plugin_name: &str,
+        files: Vec<(String, String)>, // Vec of (relative_path, content)
+    ) -> Result<String, ProcessingEngineError> {
+        // Find the trigger to get the plugin filename
+        let (db_name, plugin_filename) = {
+            let mut result = None;
+            for db_schema in self.catalog.list_db_schema() {
+                if let Some(trigger) = db_schema
+                    .processing_engine_triggers
+                    .resource_iter()
+                    .find(|t| t.trigger_name.as_ref() == plugin_name)
+                {
+                    result = Some((
+                        db_schema.name.to_string(),
+                        trigger.plugin_filename.to_string(),
+                    ));
+                    break;
+                }
+            }
+            result.ok_or_else(|| {
+                ProcessingEngineError::PluginError(PluginError::AnyhowError(anyhow!(
+                    "Plugin not found: {}",
+                    plugin_name
+                )))
+            })?
+        };
+
+        let plugin_dir = self
+            .environment_manager
+            .plugin_dir
+            .as_ref()
+            .ok_or_else(|| {
+                ProcessingEngineError::PluginError(PluginError::AnyhowError(anyhow!(
+                    "No plugin directory configured"
+                )))
+            })?;
+
+        // Validate all paths stay within plugin directory
+        let plugin_path = validate_path_within_plugin_dir(plugin_dir, &plugin_filename)?;
+        let temp_suffix = format!("{}.tmp", plugin_filename);
+        let old_suffix = format!("{}.old", plugin_filename);
+        let temp_path = validate_path_within_plugin_dir(plugin_dir, &temp_suffix)?;
+        let old_path = validate_path_within_plugin_dir(plugin_dir, &old_suffix)?;
+
+        if temp_path.exists() {
+            async_fs::remove_dir_all(&temp_path)
+                .await
+                .context("Failed to remove existing temp directory")
+                .map_err(|e| ProcessingEngineError::PluginError(PluginError::AnyhowError(e)))?;
+        }
+
+        async_fs::create_dir_all(&temp_path)
+            .await
+            .context("Failed to create temp directory")
+            .map_err(|e| ProcessingEngineError::PluginError(PluginError::AnyhowError(e)))?;
+
+        // Write all files to temp directory
+        for (relative_path, content) in files {
+            let file_path = validate_path_within_plugin_dir(&temp_path, &relative_path)?;
+
+            // Create parent directories if needed
+            if let Some(parent) = file_path.parent() {
+                async_fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to create parent directory for {}", relative_path)
+                    })
+                    .map_err(|e| {
+                        // Cleanup temp dir on failure
+                        let temp_clone = temp_path.clone();
+                        tokio::spawn(async move {
+                            let _ = async_fs::remove_dir_all(temp_clone).await;
+                        });
+                        ProcessingEngineError::PluginError(PluginError::AnyhowError(e))
+                    })?;
+            }
+
+            async_fs::write(&file_path, content)
+                .await
+                .with_context(|| format!("Failed to write file {}", relative_path))
+                .map_err(|e| {
+                    // Cleanup temp dir on failure
+                    let temp_clone = temp_path.clone();
+                    tokio::spawn(async move {
+                        let _ = async_fs::remove_dir_all(temp_clone).await;
+                    });
+                    ProcessingEngineError::PluginError(PluginError::AnyhowError(e))
+                })?;
+        }
+
+        if plugin_path.exists() {
+            if old_path.exists() {
+                async_fs::remove_dir_all(&old_path)
+                    .await
+                    .context("Failed to remove existing old directory")
+                    .map_err(|e| ProcessingEngineError::PluginError(PluginError::AnyhowError(e)))?;
+            }
+
+            async_fs::rename(&plugin_path, &old_path)
+                .await
+                .context("Failed to rename old directory")
+                .map_err(|e| {
+                    // Cleanup temp dir on failure
+                    let temp_clone = temp_path.clone();
+                    tokio::spawn(async move {
+                        let _ = async_fs::remove_dir_all(temp_clone).await;
+                    });
+                    ProcessingEngineError::PluginError(PluginError::AnyhowError(e))
+                })?;
+        }
+
+        let rename_result = async_fs::rename(&temp_path, &plugin_path).await;
+
+        if let Err(e) = rename_result {
+            // Rollback: restore old directory if it exists
+            if old_path.exists() {
+                let _ = async_fs::rename(&old_path, &plugin_path).await;
+            }
+            let _ = async_fs::remove_dir_all(&temp_path).await;
+
+            return Err(ProcessingEngineError::PluginError(
+                PluginError::AnyhowError(
+                    anyhow!(e).context("Failed to rename temp directory to target"),
+                ),
+            ));
+        }
+
+        if old_path.exists() {
+            async_fs::remove_dir_all(&old_path)
+                .await
+                .context("Failed to delete old directory")
+                .map_err(|e| ProcessingEngineError::PluginError(PluginError::AnyhowError(e)))?;
+        }
+
+        Ok(db_name)
     }
 }
 
@@ -665,75 +1218,218 @@ pub(crate) struct Request {
     pub response_tx: oneshot::Sender<Response>,
 }
 
+#[derive(Debug)]
+pub struct PluginFileInfo {
+    pub plugin_name: Arc<str>,
+    pub file_name: Arc<str>,
+    pub file_path: Arc<str>,
+    pub size_bytes: i64,
+    pub last_modified_millis: i64,
+}
+
+fn request_trigger_paths(catalog: &Catalog, db_id: &DbId) -> Option<Vec<String>> {
+    let db_schema = catalog.db_schema_by_id(db_id)?;
+    Some(
+        db_schema
+            .processing_engine_triggers
+            .resource_iter()
+            .filter_map(|trigger| {
+                if let TriggerSpecificationDefinition::RequestPath { path } = &trigger.trigger {
+                    Some(path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
 fn background_catalog_update(
     processing_engine_manager: Arc<ProcessingEngineManagerImpl>,
     mut subscription: CatalogUpdateReceiver,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(catalog_update) = subscription.recv().await {
-            for batch in catalog_update
-                .batches()
-                .filter_map(CatalogBatch::as_database)
-            {
-                for op in batch.ops.iter() {
-                    let processing_engine_manager = Arc::clone(&processing_engine_manager);
-                    match op {
-                        DatabaseCatalogOp::CreateTrigger(TriggerDefinition {
-                            trigger_name,
-                            database_name,
-                            disabled,
-                            ..
-                        }) => {
-                            if !disabled {
-                                if let Err(error) = processing_engine_manager
-                                    .run_trigger(database_name, trigger_name)
-                                    .await
-                                {
-                                    error!(?error, "failed to run the created trigger");
+            for batch in catalog_update.batches() {
+                match batch {
+                    CatalogBatch::Database(batch) => {
+                        for op in batch.ops.iter() {
+                            let processing_engine_manager = Arc::clone(&processing_engine_manager);
+                            match op {
+                                DatabaseCatalogOp::CreateTrigger(TriggerDefinition {
+                                    trigger_name,
+                                    database_name,
+                                    disabled,
+                                    ..
+                                }) => {
+                                    if !disabled
+                                        && let Err(error) = processing_engine_manager
+                                            .run_trigger(database_name, trigger_name)
+                                            .await
+                                    {
+                                        error!(?error, "failed to run the created trigger");
+                                    }
                                 }
+                                DatabaseCatalogOp::EnableTrigger(TriggerIdentifier {
+                                    db_name,
+                                    trigger_name,
+                                    ..
+                                }) => {
+                                    if let Err(error) = processing_engine_manager
+                                        .run_trigger(db_name, trigger_name)
+                                        .await
+                                    {
+                                        error!(?error, "failed to run the trigger");
+                                    }
+                                }
+                                DatabaseCatalogOp::DeleteTrigger(DeleteTriggerLog {
+                                    trigger_name,
+                                    force: true,
+                                    ..
+                                }) => {
+                                    if let Err(error) = processing_engine_manager
+                                        .stop_trigger(&batch.database_name, trigger_name)
+                                        .await
+                                    {
+                                        error!(?error, "failed to disable the trigger");
+                                    }
+                                }
+                                DatabaseCatalogOp::DisableTrigger(TriggerIdentifier {
+                                    db_name,
+                                    trigger_name,
+                                    ..
+                                }) => {
+                                    if let Err(error) = processing_engine_manager
+                                        .stop_trigger(db_name, trigger_name)
+                                        .await
+                                    {
+                                        error!(?error, "failed to disable the trigger");
+                                    }
+                                }
+                                DatabaseCatalogOp::SoftDeleteDatabase(SoftDeleteDatabaseLog {
+                                    database_id,
+                                    database_name,
+                                    hard_deletion_time,
+                                    ..
+                                }) => {
+                                    info!(
+                                        %database_name,
+                                        "database soft deleted, disabling all triggers"
+                                    );
+                                    let request_paths = request_trigger_paths(
+                                        &processing_engine_manager.catalog,
+                                        database_id,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        warn!(
+                                            ?database_id,
+                                            "database schema not found when collecting \
+                                             request trigger paths; request triggers \
+                                             may not be cleaned up"
+                                        );
+                                        Vec::new()
+                                    });
+                                    if hard_deletion_time.is_some() {
+                                        // Store info for the subsequent hard delete
+                                        // handler, which cannot resolve the original
+                                        // name from the catalog (the db is renamed on
+                                        // soft delete and may be fully removed on hard
+                                        // delete before the event reaches us).
+                                        processing_engine_manager
+                                            .soft_deleted_trigger_info
+                                            .write()
+                                            .await
+                                            .insert(
+                                                *database_id,
+                                                (database_name.to_string(), request_paths.clone()),
+                                            );
+                                    }
+                                    let shutdown_rxs = processing_engine_manager
+                                        .plugin_event_tx
+                                        .write()
+                                        .await
+                                        .shutdown_all_for_db(database_name, &request_paths)
+                                        .await;
+                                    for rx in shutdown_rxs {
+                                        if rx.await.is_err() {
+                                            warn!(
+                                                %database_name,
+                                                "shutdown receiver dropped during \
+                                                 database soft delete"
+                                            );
+                                        }
+                                    }
+                                    if hard_deletion_time.is_none() {
+                                        // No hard delete will follow, so do
+                                        // full cleanup now.
+                                        processing_engine_manager
+                                            .plugin_event_tx
+                                            .write()
+                                            .await
+                                            .remove_all_for_db(database_name, &request_paths);
+                                        processing_engine_manager
+                                            .cache
+                                            .lock()
+                                            .drop_all_trigger_caches_for_db(database_name);
+                                    }
+                                }
+                                _ => (),
                             }
                         }
-                        DatabaseCatalogOp::EnableTrigger(TriggerIdentifier {
-                            db_name,
-                            trigger_name,
-                            ..
-                        }) => {
-                            if let Err(error) = processing_engine_manager
-                                .run_trigger(db_name, trigger_name)
-                                .await
-                            {
-                                error!(?error, "failed to run the trigger");
-                            }
-                        }
-                        DatabaseCatalogOp::DeleteTrigger(DeleteTriggerLog {
-                            trigger_name,
-                            force: true,
-                            ..
-                        }) => {
-                            if let Err(error) = processing_engine_manager
-                                .stop_trigger(&batch.database_name, trigger_name)
-                                .await
-                            {
-                                error!(?error, "failed to disable the trigger");
-                            }
-                        }
-                        DatabaseCatalogOp::DisableTrigger(TriggerIdentifier {
-                            db_name,
-                            trigger_name,
-                            ..
-                        }) => {
-                            if let Err(error) = processing_engine_manager
-                                .stop_trigger(db_name, trigger_name)
-                                .await
-                            {
-                                error!(?error, "failed to disable the trigger");
-                            }
-                        }
-                        // NOTE(trevor/catalog-refactor): it is not clear that any other operation needs to be
-                        // handled, based on the existing code, but we could potentially
-                        // handle database deletion, trigger creation/deletion/enable here
-                        _ => (),
                     }
+                    CatalogBatch::Delete(batch) => {
+                        for op in batch.ops.iter() {
+                            let processing_engine_manager = Arc::clone(&processing_engine_manager);
+                            if let DeleteOp::DeleteDatabase(db_id) = op {
+                                // Use info stored during soft delete — the catalog may
+                                // have already renamed or removed the database by this
+                                // point.
+                                let Some((database_name, request_paths)) =
+                                    processing_engine_manager
+                                        .soft_deleted_trigger_info
+                                        .write()
+                                        .await
+                                        .remove(db_id)
+                                else {
+                                    warn!(
+                                        ?db_id,
+                                        "no soft delete info found for hard delete, \
+                                         triggers may have already been cleaned up"
+                                    );
+                                    continue;
+                                };
+                                info!(
+                                    %database_name,
+                                    "database hard deleted, removing all triggers"
+                                );
+                                let shutdown_rxs = processing_engine_manager
+                                    .plugin_event_tx
+                                    .write()
+                                    .await
+                                    .shutdown_all_for_db(&database_name, &request_paths)
+                                    .await;
+                                for rx in shutdown_rxs {
+                                    if rx.await.is_err() {
+                                        warn!(
+                                            %database_name,
+                                            "shutdown receiver dropped during \
+                                             database hard delete"
+                                        );
+                                    }
+                                }
+                                processing_engine_manager
+                                    .plugin_event_tx
+                                    .write()
+                                    .await
+                                    .remove_all_for_db(&database_name, &request_paths);
+                                processing_engine_manager
+                                    .cache
+                                    .lock()
+                                    .drop_all_trigger_caches_for_db(&database_name);
+                            }
+                        }
+                    }
+                    _ => (),
                 }
             }
         }
@@ -741,342 +1437,4 @@ fn background_catalog_update(
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::ProcessingEngineManagerImpl;
-    use crate::environment::DisabledManager;
-    use crate::plugins::ProcessingEngineEnvironmentManager;
-    use data_types::NamespaceName;
-    use datafusion_util::config::register_iox_object_store;
-    use influxdb3_cache::distinct_cache::DistinctCacheProvider;
-    use influxdb3_cache::last_cache::LastCacheProvider;
-    use influxdb3_catalog::CatalogError;
-    use influxdb3_catalog::catalog::Catalog;
-    use influxdb3_catalog::log::{TriggerSettings, TriggerSpecificationDefinition};
-    use influxdb3_internal_api::query_executor::UnimplementedQueryExecutor;
-    use influxdb3_shutdown::ShutdownManager;
-    use influxdb3_sys_events::SysEventStore;
-    use influxdb3_wal::{Gen1Duration, WalConfig};
-    use influxdb3_write::persister::Persister;
-    use influxdb3_write::write_buffer::{
-        N_SNAPSHOTS_TO_LOAD_ON_START, WriteBufferImpl, WriteBufferImplArgs,
-    };
-    use influxdb3_write::{Precision, WriteBuffer};
-    use iox_query::exec::{
-        DedicatedExecutor, Executor, ExecutorConfig, IOxSessionContext, PerQueryMemoryPoolConfig,
-    };
-    use iox_time::{MockProvider, Time, TimeProvider};
-    use metric::Registry;
-    use object_store::ObjectStore;
-    use object_store::memory::InMemory;
-    use parquet_file::storage::{ParquetStorage, StorageId};
-    use std::io::Write;
-    use std::num::NonZeroUsize;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tempfile::NamedTempFile;
-
-    #[test_log::test(tokio::test)]
-    async fn test_trigger_lifecycle() -> influxdb3_write::write_buffer::Result<()> {
-        let start_time = Time::from_rfc3339("2024-11-14T11:00:00+00:00").unwrap();
-        let test_store = Arc::new(InMemory::new());
-        let wal_config = WalConfig {
-            gen1_duration: Gen1Duration::new_1m(),
-            max_write_buffer_size: 100,
-            flush_interval: Duration::from_millis(10),
-            snapshot_size: 1,
-            ..Default::default()
-        };
-        let (pem, file) = setup(start_time, test_store, wal_config).await;
-        let file_name = file
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        // convert to Arc<WriteBuffer>
-        let write_buffer: Arc<dyn WriteBuffer> = Arc::clone(&pem.write_buffer);
-
-        // Create the DB by inserting a line.
-        write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu,warehouse=us-east,room=01a,device=10001 reading=37\n",
-                start_time,
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await?;
-
-        // Create an enabled trigger
-        let file_name = pem
-            .validate_plugin_filename(file_name.as_str())
-            .await
-            .unwrap();
-
-        write_buffer
-            .catalog()
-            .create_processing_engine_trigger(
-                "foo",
-                "test_trigger",
-                Arc::clone(&pem.node_id),
-                file_name,
-                &TriggerSpecificationDefinition::AllTablesWalWrite.string_rep(),
-                TriggerSettings::default(),
-                &None,
-                false,
-            )
-            .await
-            .unwrap();
-
-        // Verify trigger is not disabled in schema
-        let schema = write_buffer.catalog().db_schema("foo").unwrap();
-        let trigger = schema
-            .processing_engine_triggers
-            .get_by_name("test_trigger")
-            .unwrap();
-        assert!(!trigger.disabled);
-
-        // Disable the trigger
-        write_buffer
-            .catalog()
-            .disable_processing_engine_trigger("foo", "test_trigger")
-            .await
-            .unwrap();
-
-        // Verify trigger is disabled in schema
-        let schema = write_buffer.catalog().db_schema("foo").unwrap();
-        let trigger = schema
-            .processing_engine_triggers
-            .get_by_name("test_trigger")
-            .unwrap();
-        assert!(trigger.disabled);
-
-        // Enable the trigger
-        write_buffer
-            .catalog()
-            .enable_processing_engine_trigger("foo", "test_trigger")
-            .await
-            .unwrap();
-
-        // Verify trigger is enabled and running
-        let schema = write_buffer.catalog().db_schema("foo").unwrap();
-        let trigger = schema
-            .processing_engine_triggers
-            .get_by_name("test_trigger")
-            .unwrap();
-        assert!(!trigger.disabled);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_create_disabled_trigger() -> influxdb3_write::write_buffer::Result<()> {
-        let start_time = Time::from_rfc3339("2024-11-14T11:00:00+00:00").unwrap();
-        let test_store = Arc::new(InMemory::new());
-        let wal_config = WalConfig {
-            gen1_duration: Gen1Duration::new_1m(),
-            max_write_buffer_size: 100,
-            flush_interval: Duration::from_millis(10),
-            snapshot_size: 1,
-            ..Default::default()
-        };
-        let (pem, file) = setup(start_time, test_store, wal_config).await;
-        let file_name = file
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        // Create the DB by inserting a line.
-        pem.write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu,warehouse=us-east,room=01a,device=10001 reading=37\n",
-                start_time,
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await?;
-
-        let file_name = pem.validate_plugin_filename(&file_name).await.unwrap();
-        // Create a disabled trigger
-        pem.catalog
-            .create_processing_engine_trigger(
-                "foo",
-                "test_trigger",
-                Arc::clone(&pem.node_id),
-                file_name,
-                &TriggerSpecificationDefinition::AllTablesWalWrite.string_rep(),
-                TriggerSettings::default(),
-                &None,
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Verify trigger is created but disabled
-        let schema = pem.catalog.db_schema("foo").unwrap();
-        let trigger = schema
-            .processing_engine_triggers
-            .get_by_name("test_trigger")
-            .unwrap();
-        assert!(trigger.disabled);
-
-        // Verify trigger is not in active triggers list
-        assert!(pem.catalog.active_triggers().is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_enable_nonexistent_trigger() -> influxdb3_write::write_buffer::Result<()> {
-        let start_time = Time::from_rfc3339("2024-11-14T11:00:00+00:00").unwrap();
-        let test_store = Arc::new(InMemory::new());
-        let wal_config = WalConfig {
-            gen1_duration: Gen1Duration::new_1m(),
-            max_write_buffer_size: 100,
-            flush_interval: Duration::from_millis(10),
-            snapshot_size: 1,
-            ..Default::default()
-        };
-        let (pem, _file_name) = setup(start_time, test_store, wal_config).await;
-
-        let write_buffer: Arc<dyn WriteBuffer> = Arc::clone(&pem.write_buffer);
-
-        // Create the DB by inserting a line.
-        write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu,warehouse=us-east,room=01a,device=10001 reading=37\n",
-                start_time,
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await?;
-
-        let Err(CatalogError::NotFound) = pem
-            .catalog
-            .enable_processing_engine_trigger("foo", "nonexistent_trigger")
-            .await
-        else {
-            panic!("should receive not found error for non existent trigger on enable");
-        };
-
-        Ok(())
-    }
-
-    async fn setup(
-        start: Time,
-        object_store: Arc<dyn ObjectStore>,
-        wal_config: WalConfig,
-    ) -> (Arc<ProcessingEngineManagerImpl>, NamedTempFile) {
-        let time_provider: Arc<dyn TimeProvider> = Arc::new(MockProvider::new(start));
-        let metric_registry = Arc::new(Registry::new());
-        let persister = Arc::new(Persister::new(
-            Arc::clone(&object_store),
-            "test_host",
-            Arc::clone(&time_provider) as _,
-        ));
-        let catalog = Arc::new(
-            Catalog::new(
-                "test_host",
-                Arc::clone(&object_store),
-                Arc::clone(&time_provider),
-                Default::default(),
-            )
-            .await
-            .unwrap(),
-        );
-        let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog) as _)
-            .await
-            .unwrap();
-        let distinct_cache = DistinctCacheProvider::new_from_catalog(
-            Arc::clone(&time_provider),
-            Arc::clone(&catalog),
-        )
-        .await
-        .unwrap();
-        let shutdown = ShutdownManager::new_testing();
-        let wbuf = WriteBufferImpl::new(WriteBufferImplArgs {
-            persister,
-            catalog: Arc::clone(&catalog),
-            last_cache,
-            distinct_cache,
-            time_provider: Arc::clone(&time_provider),
-            executor: make_exec(),
-            wal_config,
-            parquet_cache: None,
-            metric_registry: Arc::clone(&metric_registry),
-            snapshotted_wal_files_to_keep: 10,
-            query_file_limit: None,
-            shutdown: shutdown.register(),
-            n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
-            wal_replay_concurrency_limit: Some(1),
-        })
-        .await
-        .unwrap();
-        let ctx = IOxSessionContext::with_testing();
-        let runtime_env = ctx.inner().runtime_env();
-        register_iox_object_store(runtime_env, "influxdb3", Arc::clone(&object_store));
-
-        let qe = Arc::new(UnimplementedQueryExecutor);
-
-        let mut file = NamedTempFile::new().unwrap();
-        let code = r#"
-def process_writes(influxdb3_local, table_batches, args=None):
-    influxdb3_local.info("done")
-"#;
-        writeln!(file, "{code}").unwrap();
-        let environment_manager = ProcessingEngineEnvironmentManager {
-            plugin_dir: Some(file.path().parent().unwrap().to_path_buf()),
-            virtual_env_location: None,
-            package_manager: Arc::new(DisabledManager),
-        };
-
-        let sys_event_store = Arc::new(SysEventStore::new(Arc::clone(&time_provider)));
-
-        (
-            ProcessingEngineManagerImpl::new(
-                environment_manager,
-                catalog,
-                "test_node",
-                wbuf,
-                qe,
-                time_provider,
-                sys_event_store,
-            )
-            .await,
-            file,
-        )
-    }
-
-    pub(crate) fn make_exec() -> Arc<Executor> {
-        let metrics = Arc::new(metric::Registry::default());
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-
-        let parquet_store = ParquetStorage::new(
-            Arc::clone(&object_store),
-            StorageId::from("test_exec_storage"),
-        );
-        Arc::new(Executor::new_with_config_and_executor(
-            ExecutorConfig {
-                target_query_partitions: NonZeroUsize::new(1).unwrap(),
-                object_stores: [&parquet_store]
-                    .into_iter()
-                    .map(|store| (store.id(), Arc::clone(store.object_store())))
-                    .collect(),
-                metric_registry: Arc::clone(&metrics),
-                // Default to 1gb
-                mem_pool_size: 1024 * 1024 * 1024, // 1024 (b/kb) * 1024 (kb/mb) * 1024 (mb/gb)
-                heap_memory_limit: None,
-                per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
-            },
-            DedicatedExecutor::new_testing(),
-        ))
-    }
-}
+mod tests;

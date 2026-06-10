@@ -70,6 +70,55 @@ impl FromStr for MemorySize {
     }
 }
 
+/// Similar to [`MemorySize`] but allows specifying absolute sizes in megabytes (MB) instead of
+/// bytes (B)
+#[derive(Debug, Clone, Copy)]
+pub struct MemorySizeMb(usize);
+
+impl MemorySizeMb {
+    /// Express this cache size in terms of bytes (B)
+    pub fn as_num_bytes(&self) -> usize {
+        self.0
+    }
+}
+
+impl FromStr for MemorySizeMb {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::prelude::v1::Result<Self, Self::Err> {
+        let s_lower = s.to_lowercase();
+        let num_bytes = if s_lower.contains('%') {
+            let mem_size = MemorySize::from_str(s).map_err(|e| {
+                format!(
+                    "failed to parse '{}' as a percentage of available memory: {}",
+                    s, e
+                )
+            })?;
+            mem_size.bytes()
+        } else if let Some(num_str) = s_lower.strip_suffix("gb") {
+            let num = usize::from_str(num_str.trim())
+                .map_err(|e| format!("failed to parse '{}' as a memory size in GB: {}", s, e))?;
+            num * 1024 * 1024 * 1024
+        } else if let Some(num_str) = s_lower.strip_suffix("mb") {
+            let num = usize::from_str(num_str.trim())
+                .map_err(|e| format!("failed to parse '{}' as a memory size in MB: {}", s, e))?;
+            num * 1024 * 1024
+        } else if let Some(num_str) = s_lower.strip_suffix("kb") {
+            let num = usize::from_str(num_str.trim())
+                .map_err(|e| format!("failed to parse '{}' as a memory size in KB: {}", s, e))?;
+            num * 1024
+        } else if let Some(num_str) = s_lower.strip_suffix('b') {
+            usize::from_str(num_str.trim())
+                .map_err(|e| format!("failed to parse '{}' as a memory size in bytes: {}", s, e))?
+        } else {
+            let num_mb = usize::from_str(s.trim())
+                .map_err(|e| format!("failed to parse '{}' as a memory size in MB: {}", s, e))?;
+            num_mb * 1024 * 1024
+        };
+        Ok(Self(num_bytes))
+    }
+}
+
 /// Totally available memory size in bytes.
 pub fn total_mem_bytes() -> usize {
     // Keep this in a global state so that we only need to inspect the system once during IOx startup.
@@ -97,42 +146,4 @@ fn get_memory_limit() -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse() {
-        assert_ok("0", 0);
-        assert_ok("1", 1);
-        assert_ok("1024", 1024);
-        assert_ok("0%", 0);
-
-        assert_gt_zero("50%");
-
-        assert_err("-1", "invalid digit found in string");
-        assert_err("foo", "invalid digit found in string");
-        assert_err("-1%", "invalid digit found in string");
-        assert_err(
-            "101%",
-            "relative memory size must be in [0, 100] but is 101",
-        );
-    }
-
-    #[track_caller]
-    fn assert_ok(s: &'static str, expected: usize) {
-        let parsed: MemorySize = s.parse().unwrap();
-        assert_eq!(parsed.bytes(), expected);
-    }
-
-    #[track_caller]
-    fn assert_gt_zero(s: &'static str) {
-        let parsed: MemorySize = s.parse().unwrap();
-        assert!(parsed.bytes() > 0);
-    }
-
-    #[track_caller]
-    fn assert_err(s: &'static str, expected: &'static str) {
-        let err = MemorySize::from_str(s).unwrap_err();
-        assert_eq!(err, expected);
-    }
-}
+mod tests;

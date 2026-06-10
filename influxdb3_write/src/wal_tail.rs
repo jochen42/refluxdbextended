@@ -15,9 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use data_types::{
-    ChunkId, ChunkOrder, PartitionHashId, PartitionId, PartitionKey, TransitionPartitionId,
-};
+use data_types::{ChunkId, ChunkOrder, PartitionHashId, PartitionKey};
 use datafusion::common::DataFusionError;
 use influxdb3_catalog::catalog::{Catalog, DatabaseSchema, TableDefinition};
 use influxdb3_shutdown::ShutdownToken;
@@ -259,12 +257,9 @@ impl WalTailBuffer {
                         batches,
                         schema: influx_schema.clone(),
                         stats: Arc::new(stats),
-                        partition_id: TransitionPartitionId::from_parts(
-                            PartitionId::new(0),
-                            Some(PartitionHashId::new(
-                                data_types::TableId::new(0),
-                                &PartitionKey::from("wal-tail".to_string()),
-                            )),
+                        partition_id: PartitionHashId::new(
+                            data_types::TableId::new(0),
+                            &PartitionKey::from("wal-tail".to_string()),
                         ),
                         sort_key: None,
                         id: ChunkId::new(),

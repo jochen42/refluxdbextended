@@ -43,15 +43,24 @@ pub(super) enum SubCommand {
 }
 
 pub(super) async fn command(config: SystemConfig) -> Result<()> {
-    let mut client = Client::new(
-        config.core_config.host_url.clone(),
-        match config.subcommand {
-            SubCommand::TableList(TableListConfig { ref ca_cert, .. }) => ca_cert,
-            SubCommand::Table(TableConfig { ref ca_cert, .. }) => ca_cert,
-            SubCommand::Summary(SummaryConfig { ref ca_cert, .. }) => ca_cert,
-        }
-        .clone(),
-    )?;
+    let (ca_cert, tls_no_verify) = match &config.subcommand {
+        SubCommand::TableList(TableListConfig {
+            ca_cert,
+            tls_no_verify,
+            ..
+        }) => (ca_cert.clone(), *tls_no_verify),
+        SubCommand::Table(TableConfig {
+            ca_cert,
+            tls_no_verify,
+            ..
+        }) => (ca_cert.clone(), *tls_no_verify),
+        SubCommand::Summary(SummaryConfig {
+            ca_cert,
+            tls_no_verify,
+            ..
+        }) => (ca_cert.clone(), *tls_no_verify),
+    };
+    let mut client = Client::new(config.core_config.host_url.clone(), ca_cert, tls_no_verify)?;
     if let Some(token) = config
         .core_config
         .auth_token
@@ -91,6 +100,10 @@ pub(super) struct TableListConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
 }
 
 const SYS_TABLES_QUERY: &str = "WITH cols (table_name, column_name) AS (SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'system' ORDER BY (table_name, column_name)) SELECT table_name, array_agg(column_name) AS column_names FROM cols GROUP BY table_name ORDER BY table_name";
@@ -152,6 +165,10 @@ pub(super) struct TableConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
 }
 
 impl SystemCommandRunner {
@@ -185,7 +202,7 @@ impl SystemCommandRunner {
         };
 
         let mut clauses = vec![format!(
-            "SELECT {select_expr} FROM system.{system_table_name}"
+            "SELECT {select_expr} FROM system.\"{system_table_name}\""
         )];
 
         if let Some(default_filter) = default_filter(&system_table_name) {
@@ -244,6 +261,10 @@ pub(super) struct SummaryConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
 }
 
 impl SystemCommandRunner {
@@ -264,7 +285,7 @@ impl SystemCommandRunner {
 
     async fn summarize_table(&self, table_name: &str, limit: u16, format: Format) -> Result<()> {
         let Self { db, client } = self;
-        let mut clauses = vec![format!("SELECT * FROM system.{table_name}")];
+        let mut clauses = vec![format!("SELECT * FROM system.\"{table_name}\"")];
 
         if let Some(default_filter) = default_filter(table_name) {
             clauses.push(format!("WHERE {default_filter}"));

@@ -1,12 +1,13 @@
 use std::{
+    env,
     future::Future,
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
+    sync::{Arc, Mutex, Once},
     time::{Duration, SystemTime},
 };
 
 use arrow::record_batch::RecordBatch;
-use arrow_flight::{FlightClient, decode::FlightRecordBatchStream};
-use assert_cmd::cargo::CommandCargoExt;
+use arrow_flight::decode::FlightRecordBatchStream;
 use futures::TryStreamExt;
 use influxdb_iox_client::flightsql::FlightSqlClient;
 use influxdb3_client::Precision;
@@ -15,15 +16,27 @@ use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Certificate, Response, tls::Version};
 use tempfile::TempDir;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tonic::transport::ClientTlsConfig;
+
+// Initialize rustls CryptoProvider once for all tests
+static INIT: Once = Once::new();
+
+fn init_rustls() {
+    INIT.call_once(|| {
+        // Install the default rustls crypto provider (ring)
+        // This is required for rustls 0.23+ used by tonic 0.12
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 mod auth;
 mod client;
 mod configure;
 mod flight;
+mod gen1_lookback_guard;
 mod limits;
-
+mod logs;
 mod packages;
 mod ping;
 mod query;
@@ -48,6 +61,12 @@ pub trait ConfigProvider: Send + Sync + 'static {
 
     /// Get if admin token needs to be generated
     fn should_generate_admin_token(&self) -> bool;
+
+    /// Get if logs should be captured
+    fn capture_logs(&self) -> bool;
+
+    /// Get if recovery endpoint should be enabled
+    fn recovery_endpoint_enabled(&self) -> bool;
 
     /// Spawn a new [`TestServer`] with this configuration
     ///
@@ -77,6 +96,14 @@ pub struct TestConfig {
     object_store_dir: Option<String>,
     disable_authz: Vec<String>,
     gen1_duration: Option<String>,
+    gen1_lookback_duration: Option<String>,
+    snapshotted_wal_files_to_keep: Option<String>,
+    capture_logs: bool,
+    enable_recovery_endpoint: bool,
+    admin_token_file: Option<String>,
+    permission_tokens_file: Option<String>,
+    object_store_tls_allow_insecure: bool,
+    object_store_tls_ca_path: Option<String>,
 }
 
 impl TestConfig {
@@ -99,6 +126,12 @@ impl TestConfig {
     /// Set the auth token for this [`TestServer`]
     pub fn with_no_admin_token(mut self) -> Self {
         self.without_admin_token = true;
+        self
+    }
+
+    /// Enable the admin token recovery endpoint
+    pub fn with_recovery_endpoint(mut self) -> Self {
+        self.enable_recovery_endpoint = true;
         self
     }
 
@@ -152,6 +185,46 @@ impl TestConfig {
         self.gen1_duration = Some(gen1_duration.into());
         self
     }
+
+    pub fn with_gen1_lookback_duration(mut self, duration: impl Into<String>) -> Self {
+        self.gen1_lookback_duration = Some(duration.into());
+        self
+    }
+
+    pub fn with_snapshotted_wal_files_to_keep(mut self, count: impl Into<String>) -> Self {
+        self.snapshotted_wal_files_to_keep = Some(count.into());
+        self
+    }
+
+    /// Enable capturing of stdout/stderr logs for this [`TestServer`]
+    pub fn with_capture_logs(mut self) -> Self {
+        self.capture_logs = true;
+        self
+    }
+
+    /// Set the admin token file path for this [`TestServer`]
+    pub fn with_admin_token_file<S: Into<String>>(mut self, path: S) -> Self {
+        self.admin_token_file = Some(path.into());
+        self
+    }
+
+    /// Set the permission tokens file path for this [`TestServer`]
+    pub fn with_permission_tokens_file<S: Into<String>>(mut self, path: S) -> Self {
+        self.permission_tokens_file = Some(path.into());
+        self
+    }
+
+    /// Allow insecure TLS connections for object store
+    pub fn with_object_store_tls_allow_insecure(mut self) -> Self {
+        self.object_store_tls_allow_insecure = true;
+        self
+    }
+
+    /// Set custom CA certificate path for object store TLS
+    pub fn with_object_store_tls_ca_path<S: Into<String>>(mut self, path: S) -> Self {
+        self.object_store_tls_ca_path = Some(path.into());
+        self
+    }
 }
 
 impl ConfigProvider for TestConfig {
@@ -196,6 +269,17 @@ impl ConfigProvider for TestConfig {
             ]);
         }
 
+        // Add TLS configuration for object store
+        if self.object_store_tls_allow_insecure {
+            args.push("--object-store-tls-allow-insecure".to_string());
+        }
+        if let Some(ca_path) = &self.object_store_tls_ca_path {
+            args.append(&mut vec![
+                "--object-store-tls-ca".to_string(),
+                ca_path.to_owned(),
+            ]);
+        }
+
         if !self.disable_authz.is_empty() {
             args.append(&mut vec![
                 "--disable-authz".to_owned(),
@@ -207,6 +291,39 @@ impl ConfigProvider for TestConfig {
             args.append(&mut vec![
                 "--gen1-duration".to_string(),
                 gen1_duration.to_owned(),
+            ])
+        }
+
+        if let Some(gen1_lookback_duration) = &self.gen1_lookback_duration {
+            args.append(&mut vec![
+                "--gen1-lookback-duration".to_string(),
+                gen1_lookback_duration.to_owned(),
+            ])
+        }
+
+        args.append(&mut vec![
+            "--wal-snapshot-size".to_string(),
+            "1".to_string(),
+        ]);
+
+        if let Some(count) = &self.snapshotted_wal_files_to_keep {
+            args.append(&mut vec![
+                "--snapshotted-wal-files-to-keep".to_string(),
+                count.to_owned(),
+            ])
+        }
+
+        if let Some(admin_token_file) = &self.admin_token_file {
+            args.append(&mut vec![
+                "--admin-token-file".to_string(),
+                admin_token_file.to_owned(),
+            ])
+        }
+
+        if let Some(permission_tokens_file) = &self.permission_tokens_file {
+            args.append(&mut vec![
+                "--permission-tokens-file".to_string(),
+                permission_tokens_file.to_owned(),
             ])
         }
 
@@ -232,6 +349,14 @@ impl ConfigProvider for TestConfig {
     fn should_generate_admin_token(&self) -> bool {
         self.without_admin_token
     }
+
+    fn capture_logs(&self) -> bool {
+        self.capture_logs
+    }
+
+    fn recovery_endpoint_enabled(&self) -> bool {
+        self.enable_recovery_endpoint
+    }
 }
 
 /// A running instance of the `influxdb3 serve` process
@@ -245,14 +370,17 @@ impl ConfigProvider for TestConfig {
 /// log filter for tracing/tests.
 ///
 /// - `TEST_LOG=` (empty) will result in `INFO` logs being emitted
-/// - `TEST_LOG=<filter>` will result in the provided `<filter>` being used as the `LOG_FILTER`
+/// - `TEST_LOG=<filter>` will result in the provided `<filter>` being used as the `INFLUXDB3_LOG_FILTER`
 /// - if both `TEST_LOG` and `RUST_LOG` are set, the value provided in `RUST_LOG` will be used
-///   as the `LOG_FILTER`
+///   as the `INFLUXDB3_LOG_FILTER`
 pub struct TestServer {
     auth_token: Option<String>,
     bind_addr: String,
+    admin_token_recovery_bind_addr: Option<String>,
     server_process: Child,
     http_client: reqwest::Client,
+    stdout: Option<Arc<Mutex<String>>>,
+    stderr: Option<Arc<Mutex<String>>>,
 }
 
 impl std::fmt::Debug for TestServer {
@@ -289,6 +417,7 @@ impl TestServer {
     }
 
     async fn spawn_inner(config: &impl ConfigProvider) -> Self {
+        init_rustls();
         create_certs().await;
         // Create a temporary file for storing the TCP Listener address. We start the server with
         // a bind address of 0.0.0.0:0, which will have the OS assign a randomly available port.
@@ -301,19 +430,37 @@ impl TestServer {
         let tmp_dir = TempDir::new().unwrap();
         let tmp_dir_path = tmp_dir.keep();
         let tcp_addr_file = tmp_dir_path.join("tcp-listener");
-        let mut command = Command::cargo_bin("influxdb3").expect("create the influxdb3 command");
-        let command = command
+
+        let admin_token_recover_tmp_dir = TempDir::new().unwrap();
+        let admin_token_recover_tmp_dir_path = admin_token_recover_tmp_dir.keep();
+        let tcp_addr_file_2 = admin_token_recover_tmp_dir_path.join("tcp-listener");
+
+        let mut command = Command::new(assert_cmd::cargo_bin!("influxdb3"));
+        let mut command = command
             .arg("serve")
             .arg("--disable-telemetry-upload")
             .args(["--http-bind", "0.0.0.0:0"])
             .args(["--wal-flush-interval", "10ms"])
-            .args(["--wal-snapshot-size", "1"])
             .args([
                 "--tcp-listener-file-path",
                 tcp_addr_file
                     .to_str()
                     .expect("valid tcp listener file path"),
-            ])
+            ]);
+
+        // Only add recovery endpoint args if explicitly enabled
+        if config.recovery_endpoint_enabled() {
+            command = command
+                .args(["--admin-token-recovery-http-bind", "0.0.0.0:0"])
+                .args([
+                    "--admin-token-recovery-tcp-listener-file-path",
+                    tcp_addr_file_2
+                        .to_str()
+                        .expect("valid tcp listener file path"),
+                ]);
+        }
+
+        let command = command
             .args([
                 "--tls-cert",
                 if config.bad_tls() {
@@ -340,61 +487,113 @@ impl TestServer {
             ])
             .args(config.as_args());
 
-        // Determine the LOG_FILTER that is passed down to the process, if necessary
-        match (std::env::var("TEST_LOG"), std::env::var("RUST_LOG")) {
+        // Determine the INFLUXDB3_LOG_FILTER that is passed down to the process, if necessary
+        match (env::var("TEST_LOG"), env::var("RUST_LOG")) {
             (Ok(t), Ok(r)) if t.is_empty() && r.is_empty() => {
-                command.env("LOG_FILTER", "info");
+                command.env("INFLUXDB3_LOG_FILTER", "info");
             }
             (Ok(t), Err(_)) if t.is_empty() => {
-                command.env("LOG_FILTER", "info");
+                command.env("INFLUXDB3_LOG_FILTER", "info");
             }
             (Ok(filter), Err(_)) | (Ok(_), Ok(filter)) => {
-                command.env("LOG_FILTER", filter);
+                command.env("INFLUXDB3_LOG_FILTER", filter);
             }
             (Err(_), _) => (),
         }
 
-        let server_process = command.spawn().expect("spawn the influxdb3 server process");
-
-        let bind_addr = loop {
-            match tokio::fs::File::open(&tcp_addr_file).await {
-                Ok(mut file) => {
-                    let mut buf = String::new();
-                    file.read_to_string(&mut buf)
-                        .await
-                        .expect("read from tcp listener file");
-                    if buf.is_empty() {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        continue;
-                    } else {
-                        break buf;
-                    }
+        // Set up stdout/stderr capture if enabled
+        let (stdout_handle, stderr_handle) = if config.capture_logs() {
+            // set INFLUXDB3_LOG_FILTER to debug if configured to capture logs, regardless of what might
+            // have been set in the execution environment since some tests rely on detecting
+            // logs that are only emitted at the "debug" level
+            let mut envs = command.get_envs();
+            if let Some(filter) = envs.find_map(|(name, value)| {
+                if name == "INFLUXDB3_LOG_FILTER"
+                    && let Some(value) = value
+                {
+                    Some(value.to_str().unwrap().to_string())
+                } else {
+                    None
                 }
-                Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(error) => {
-                    panic!("unexpected error while checking for tcp listener file: {error:?}")
-                }
+            }) {
+                let new_filter = filter.replacen("info", "debug", 1);
+                command.env("INFLUXDB3_LOG_FILTER", new_filter);
             }
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            (
+                Some(Arc::new(Mutex::new(String::new()))),
+                Some(Arc::new(Mutex::new(String::new()))),
+            )
+        } else {
+            (None, None)
         };
 
-        let http_client = reqwest::ClientBuilder::new()
+        let mut server_process = command.spawn().expect("spawn the influxdb3 server process");
+
+        // If log capture is enabled, spawn tasks to read from stdout/stderr
+        if config.capture_logs()
+            && let (Some(stdout), Some(stderr)) =
+                (server_process.stdout.take(), server_process.stderr.take())
+        {
+            let stdout_buffer = stdout_handle.clone().unwrap();
+            let stderr_buffer = stderr_handle.clone().unwrap();
+
+            // Spawn task to read stdout
+            tokio::spawn(async move {
+                let reader = BufReader::new(tokio::process::ChildStdout::from_std(stdout).unwrap());
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let mut buffer = stdout_buffer.lock().unwrap();
+                    buffer.push_str(&line);
+                    buffer.push('\n');
+                }
+            });
+
+            // Spawn task to read stderr
+            tokio::spawn(async move {
+                let reader = BufReader::new(tokio::process::ChildStderr::from_std(stderr).unwrap());
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let mut buffer = stderr_buffer.lock().unwrap();
+                    buffer.push_str(&line);
+                    buffer.push('\n');
+                }
+            });
+        }
+
+        let bind_addr = find_bind_addr(tcp_addr_file).await;
+
+        let admin_token_recovery_bind_addr = if config.recovery_endpoint_enabled() {
+            Some(find_bind_addr(tcp_addr_file_2).await)
+        } else {
+            None
+        };
+
+        let mut http_client_builder = reqwest::ClientBuilder::new()
             .min_tls_version(Version::TLS_1_3)
             .timeout(Duration::from_secs(60))
             .use_rustls_tls()
             .add_root_certificate(
                 Certificate::from_pem(&std::fs::read("../testing-certs/rootCA.pem").unwrap())
                     .unwrap(),
-            )
-            .build()
-            .unwrap();
+            );
+
+        // When using bad TLS certs, we need to accept invalid certs for the test
+        // infrastructure to be able to communicate with the server
+        if config.bad_tls() {
+            http_client_builder = http_client_builder.danger_accept_invalid_certs(true);
+        }
+
+        let http_client = http_client_builder.build().unwrap();
 
         let server = Self {
             auth_token: config.auth_token().map(|s| s.to_owned()),
             bind_addr,
+            admin_token_recovery_bind_addr,
             server_process,
             http_client,
+            stdout: stdout_handle,
+            stderr: stderr_handle,
         };
 
         server.wait_until_ready().await;
@@ -426,14 +625,30 @@ impl TestServer {
         )
     }
 
+    /// Get the URL of admin token recovery service for use with an HTTP client
+    pub fn admin_token_recovery_client_addr(&self) -> String {
+        match &self.admin_token_recovery_bind_addr {
+            Some(addr) => format!("https://localhost:{}", addr.split(':').nth(1).unwrap()),
+            None => panic!(
+                "admin_token_recovery_client_addr called on TestServer without recovery endpoint enabled. Use .with_recovery_endpoint() when configuring the test server."
+            ),
+        }
+    }
+
+    /// Check if the recovery endpoint is enabled
+    pub fn has_recovery_endpoint(&self) -> bool {
+        self.admin_token_recovery_bind_addr.is_some()
+    }
+
     /// Get the token for the server
     pub fn token(&self) -> Option<&String> {
         self.auth_token.as_ref()
     }
 
     /// Set the token for the server
-    pub fn set_token(&mut self, token: Option<String>) {
+    pub fn set_token(&mut self, token: Option<String>) -> &mut Self {
         self.auth_token = token;
+        self
     }
 
     /// Get a [`FlightSqlClient`] for making requests to the running service over gRPC
@@ -453,19 +668,14 @@ impl TestServer {
         client
     }
 
-    /// Get a raw [`FlightClient`] for performing Flight actions directly
-    pub async fn flight_client(&self) -> FlightClient {
-        let cert = tonic::transport::Certificate::from_pem(
-            std::fs::read("../testing-certs/rootCA.pem").unwrap(),
-        );
-        let channel = tonic::transport::Channel::from_shared(self.client_addr())
-            .expect("create tonic channel")
-            .tls_config(ClientTlsConfig::new().ca_certificate(cert))
-            .unwrap()
-            .connect()
+    /// Get an [`influxdb_iox_client::flight::Client`] for InfluxQL queries
+    pub async fn flight_client(&self) -> influxdb_iox_client::flight::Client {
+        let connection = influxdb_iox_client::connection::Builder::new()
+            .ca_certificate_pem(std::fs::read("../testing-certs/rootCA.pem").unwrap())
+            .build(&self.client_addr())
             .await
-            .expect("connect to gRPC client");
-        FlightClient::new(channel)
+            .expect("connect to flight client");
+        influxdb_iox_client::flight::Client::new(connection)
     }
 
     pub fn http_client(&self) -> &reqwest::Client {
@@ -482,6 +692,70 @@ impl TestServer {
             .inspect_err(|error| println!("error when checking for stopped: {error:?}"))
             .expect("check process status")
             .is_some()
+    }
+
+    /// Get captured stdout as a string, if log capture was enabled
+    pub fn get_stdout(&self) -> Option<String> {
+        self.stdout.as_ref().map(|s| s.lock().unwrap().clone())
+    }
+
+    /// Get captured stderr as a string, if log capture was enabled
+    pub fn get_stderr(&self) -> Option<String> {
+        self.stderr.as_ref().map(|s| s.lock().unwrap().clone())
+    }
+
+    /// Get all captured logs (stdout and stderr combined), if log capture was enabled
+    pub fn get_logs(&self, last_n_lines: Option<usize>) -> Option<String> {
+        match (&self.stdout, &self.stderr) {
+            (Some(stdout), Some(stderr)) => {
+                let stdout_str = stdout.lock().unwrap();
+                let stderr_str = stderr.lock().unwrap();
+                let full_logs = format!("{stdout_str}{stderr_str}");
+
+                match last_n_lines {
+                    Some(n) => {
+                        let lines: Vec<&str> = full_logs.lines().collect();
+                        if lines.is_empty() {
+                            return Some(String::new());
+                        }
+                        let start = lines.len().saturating_sub(n);
+                        let result = lines[start..].join("\n");
+                        // If the original logs ended with a newline, preserve it
+                        if full_logs.ends_with('\n') && !result.is_empty() {
+                            Some(result + "\n")
+                        } else {
+                            Some(result)
+                        }
+                    }
+                    None => Some(full_logs),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Assert that the captured logs contain a specific string
+    pub fn assert_log_contains(&self, pattern: &str) {
+        if let Some(logs) = self.get_logs(None) {
+            assert!(
+                logs.contains(pattern),
+                "Expected logs to match pattern '{pattern}', but got:\n{logs}",
+            );
+        } else {
+            panic!("Log capture was not enabled for this TestServer");
+        }
+    }
+
+    /// Assert that the captured logs match a regex pattern
+    pub fn assert_log_matches(&self, pattern: &Regex) {
+        if let Some(logs) = self.get_logs(None) {
+            assert!(
+                pattern.is_match(&logs),
+                "Expected logs to match pattern '{pattern}', but got:\n{logs}",
+            );
+        } else {
+            panic!("Log capture was not enabled for this TestServer");
+        }
     }
 
     async fn wait_until_ready(&self) {
@@ -503,6 +777,31 @@ impl TestServer {
     }
 }
 
+async fn find_bind_addr(tcp_addr_file_2: std::path::PathBuf) -> String {
+    loop {
+        match tokio::fs::File::open(&tcp_addr_file_2).await {
+            Ok(mut file) => {
+                let mut buf = String::new();
+                file.read_to_string(&mut buf)
+                    .await
+                    .expect("read from tcp listener file");
+                if buf.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                } else {
+                    break buf;
+                }
+            }
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => {
+                panic!("unexpected error while checking for tcp listener file: {error:?}")
+            }
+        }
+    }
+}
+
 impl Drop for TestServer {
     fn drop(&mut self) {
         self.kill();
@@ -510,6 +809,19 @@ impl Drop for TestServer {
 }
 
 impl TestServer {
+    fn maybe_authorized_client(&self) -> influxdb3_client::Client {
+        let mut client = influxdb3_client::Client::new(
+            self.client_addr(),
+            Some("../testing-certs/rootCA.pem".into()),
+            false,
+        )
+        .unwrap();
+        if let Some(token) = &self.auth_token {
+            client = client.with_auth_token(token);
+        }
+        client
+    }
+
     /// Write some line protocol to the server
     pub async fn write_lp_to_db(
         &self,
@@ -517,19 +829,23 @@ impl TestServer {
         lp: impl ToString,
         precision: Precision,
     ) -> Result<(), influxdb3_client::Error> {
-        let mut client = influxdb3_client::Client::new(
-            self.client_addr(),
-            Some("../testing-certs/rootCA.pem".into()),
-        )
-        .unwrap();
-        if let Some(token) = &self.auth_token {
-            client = client.with_auth_token(token);
-        }
+        let client = self.maybe_authorized_client();
         client
             .api_v3_write_lp(database)
             .body(lp.to_string())
             .precision(precision)
             .send()
+            .await
+    }
+
+    pub async fn api_v3_create_database(
+        &self,
+        database: &str,
+        retention_period: Option<Duration>,
+    ) -> Result<(), influxdb3_client::Error> {
+        let client = self.maybe_authorized_client();
+        client
+            .api_v3_configure_db_create(database, retention_period)
             .await
     }
 
@@ -540,14 +856,7 @@ impl TestServer {
         tags: Vec<String>,
         fields: Vec<(String, FieldType)>,
     ) -> Result<(), influxdb3_client::Error> {
-        let mut client = influxdb3_client::Client::new(
-            self.client_addr(),
-            Some("../testing-certs/rootCA.pem".into()),
-        )
-        .unwrap();
-        if let Some(token) = &self.auth_token {
-            client = client.with_auth_token(token);
-        }
+        let client = self.maybe_authorized_client();
 
         client
             .api_v3_configure_table_create(database, table, tags, fields)
@@ -775,6 +1084,7 @@ pub async fn write_lp_to_db(
     let client = influxdb3_client::Client::new(
         server.client_addr(),
         Some("../testing-certs/rootCA.pem".into()),
+        false,
     )
     .unwrap();
     client
@@ -813,12 +1123,13 @@ pub async fn collect_stream(stream: FlightRecordBatchStream) -> Vec<RecordBatch>
 }
 
 #[tokio::test]
-#[should_panic]
-async fn fail_with_invalid_certs() {
-    // This will fail in the startup of TestServer as the connection should
-    // fail when testing that the server is up. Note that this only holds true
-    // if other tests pass.
-    let _ = TestServer::spawn_bad_tls().await;
+async fn spawn_with_bad_tls_certs() {
+    // TestServer should be able to spawn with bad TLS certs because the test
+    // infrastructure's HTTP client uses danger_accept_invalid_certs(true) when
+    // bad_tls is enabled. This allows testing CLI commands with --tls-no-verify.
+    let server = TestServer::spawn_bad_tls().await;
+    // Verify the server is actually running by checking we can get its address
+    assert!(!server.client_addr().is_empty());
 }
 
 #[tokio::test]

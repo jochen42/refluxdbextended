@@ -1,11 +1,15 @@
 mod admin_token;
 mod api;
 mod db_retention;
+mod offline_tokens;
+mod system_tables;
+mod tls_no_verify;
 
 use crate::server::{ConfigProvider, TestServer};
-use assert_cmd::Command as AssertCmd;
+use assert_cmd::cargo::cargo_bin_cmd;
 use observability_deps::tracing::debug;
 use pretty_assertions::assert_eq;
+use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::fs::File;
 use std::path::PathBuf;
@@ -69,8 +73,7 @@ fn test_telemetry_disabled_with_debug_msg() {
     let expected_disabled: &str = "Initializing TelemetryStore with upload disabled.";
 
     // validate we get a debug message indicating upload disabled
-    let output = AssertCmd::cargo_bin("influxdb3")
-        .unwrap()
+    let output = cargo_bin_cmd!("influxdb3")
         .args(serve_args)
         .arg("-vv")
         .arg("--disable-telemetry-upload")
@@ -98,8 +101,7 @@ fn test_telemetry_disabled() {
 
     let expected_disabled: &str = "Initializing TelemetryStore with upload disabled.";
     // validate no message when debug output disabled
-    let output = AssertCmd::cargo_bin("influxdb3")
-        .unwrap()
+    let output = cargo_bin_cmd!("influxdb3")
         .args(serve_args)
         .arg("-v")
         .arg("--disable-telemetry-upload")
@@ -129,8 +131,7 @@ fn test_telemetry_enabled_with_debug_msg() {
         "Initializing TelemetryStore with upload enabled for http://localhost:9999.";
 
     // validate debug output shows which endpoint we are hitting when telemetry enabled
-    let output = AssertCmd::cargo_bin("influxdb3")
-        .unwrap()
+    let output = cargo_bin_cmd!("influxdb3")
         .args(serve_args)
         .arg("-vv")
         .arg("--telemetry-endpoint")
@@ -161,8 +162,7 @@ fn test_telementry_enabled() {
         "Initializing TelemetryStore with upload enabled for http://localhost:9999.";
 
     // validate no telemetry endpoint reported when debug output not enabled
-    let output = AssertCmd::cargo_bin("influxdb3")
-        .unwrap()
+    let output = cargo_bin_cmd!("influxdb3")
         .args(serve_args)
         .arg("-v")
         .arg("--telemetry-endpoint")
@@ -457,7 +457,7 @@ async fn test_delete_database_with_hard_delete_timestamp() {
         .expect("create database");
 
     // Delete with a specific timestamp
-    let timestamp = "2025-12-31T23:59:59Z";
+    let timestamp = "2125-12-31T23:59:59Z";
     let result = server
         .delete_database(db_name)
         .with_hard_delete(timestamp)
@@ -833,6 +833,97 @@ async fn test_delete_missing_table() {
 }
 
 #[test_log::test(tokio::test)]
+async fn test_delete_database_with_yes_flag() {
+    let server = TestServer::spawn().await;
+    let db_name = "test_delete_db_yes";
+    server.create_database(db_name).run().unwrap();
+    let result = server.delete_database(db_name).with_yes().run().unwrap();
+    assert!(
+        result.contains("deleted successfully"),
+        "Expected success message, got: {result}"
+    );
+}
+
+#[test_log::test(tokio::test)]
+async fn test_delete_table_with_yes_flag() {
+    let server = TestServer::spawn().await;
+    let db_name = "test_delete_tbl_yes";
+    server.create_database(db_name).run().unwrap();
+    server
+        .write_lp_to_db(
+            db_name,
+            "cpu,host=a val=1",
+            influxdb3_client::Precision::Second,
+        )
+        .await
+        .expect("write to db");
+    let result = server
+        .delete_table(db_name, "cpu")
+        .with_yes()
+        .run()
+        .unwrap();
+    assert!(
+        result.contains("deleted successfully"),
+        "Expected success message, got: {result}"
+    );
+}
+
+#[test_log::test(tokio::test)]
+async fn test_delete_table_when_database_deleted() {
+    // Testing deleting a table from a database that has already been deleted
+    // should not succeed.
+
+    let server = TestServer::spawn().await;
+    let db_name = "db_delete_reject_cli";
+    let table_name = "tbl";
+
+    // Write data to create the database and table
+    server
+        .write_lp_to_db(
+            db_name,
+            format!("{table_name},t1=a,t2=b,t3=c f1=true,f2=\"hello\",f3=4i,f4=4u,f5=5 1000"),
+            influxdb3_client::Precision::Second,
+        )
+        .await
+        .expect("write to db");
+
+    // Delete the database
+    let delete_db_output = server
+        .delete_database(db_name)
+        .run()
+        .expect("delete database");
+    assert_contains!(
+        &delete_db_output,
+        format!("Database \"{db_name}\" deleted successfully")
+    );
+
+    // Get the deleted database name from show databases
+    let dbs_json = server
+        .show_databases()
+        .with_format("json")
+        .show_deleted(true)
+        .run()
+        .expect("list databases including deleted");
+    let dbs: Value = serde_json::from_str(&dbs_json).expect("parse show databases json output");
+    let deleted_db_name = dbs
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .filter_map(|db| db.get("iox::database").and_then(Value::as_str))
+                .find(|name| name.starts_with(db_name) && *name != db_name)
+        })
+        .expect("deleted database entry");
+
+    // Delete the table from the deleted database
+    let result = server.delete_table(deleted_db_name, table_name).run();
+
+    assert_contains!(
+        result.unwrap_err().to_string(),
+        "Delete command failed: server responded with error [409 Conflict]: attempted to modify resource that was already deleted"
+    );
+}
+
+#[test_log::test(tokio::test)]
 async fn test_delete_table_with_hard_delete_now() {
     let server = TestServer::spawn().await;
     let db_name = "test_hard_delete_table_now";
@@ -984,7 +1075,7 @@ async fn test_delete_table_with_hard_delete_timestamp() {
     let server = TestServer::spawn().await;
     let db_name = "test_hard_delete_table_timestamp";
     let table_name = "network";
-    let timestamp = "2025-12-31T23:59:59Z";
+    let timestamp = "2125-12-31T23:59:59Z";
 
     // Create database and write data to create table
     server
@@ -1296,6 +1387,421 @@ async fn test_triggers_are_started() {
         };
     }
 }
+
+#[test_log::test(tokio::test)]
+async fn test_create_trigger_with_upload() {
+    // Plugin file is in a different temp directory than server's plugin-dir
+    let (_temp_dir, plugin_path) = create_plugin_in_temp_dir(WRITE_REPORTS_PLUGIN_CODE);
+    let server_plugin_dir = TempDir::new().unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(server_plugin_dir.path().to_str().unwrap())
+        .spawn()
+        .await;
+    let db_name = "foo";
+    let trigger_name = "test_upload_trigger";
+
+    server.create_database(db_name).run().unwrap();
+
+    let result = server
+        .create_trigger(
+            db_name,
+            trigger_name,
+            plugin_path.to_str().unwrap(),
+            "all_tables",
+        )
+        .upload(true)
+        .add_trigger_argument("double_count_table=cpu")
+        .run()
+        .unwrap();
+
+    debug!(result = ?result, "create trigger with upload");
+    assert_contains!(&result, "Trigger test_upload_trigger created successfully");
+
+    // Write data to verify the trigger is working
+    server
+        .write_lp_to_db(
+            db_name,
+            "cpu,host=a f1=1.0\ncpu,host=b f1=2.0\nmem,host=a usage=234",
+            influxdb3_client::Precision::Second,
+        )
+        .await
+        .expect("write to db");
+
+    let expected = json!(
+        [
+            {"table_name": "cpu", "row_count": 4},
+            {"table_name": "mem", "row_count": 1}
+        ]
+    );
+
+    // Query to verify the processed data is there
+    let mut check_count = 0;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        match server
+            .query_sql(db_name)
+            .with_sql("SELECT table_name, row_count FROM write_reports")
+            .run()
+        {
+            Ok(result) => {
+                if result == expected {
+                    break;
+                }
+            }
+            Err(e) => {
+                check_count += 1;
+                if check_count > 30 {
+                    panic!("Failed to query processed data: {e}");
+                }
+            }
+        };
+    }
+}
+
+#[test_log::test(tokio::test)]
+async fn test_upload_plugin_file_not_found() {
+    let server_plugin_dir = TempDir::new().unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(server_plugin_dir.path().to_str().unwrap())
+        .spawn()
+        .await;
+    let db_name = "foo";
+    let trigger_name = "test_trigger";
+
+    server.create_database(db_name).run().unwrap();
+
+    // Try to upload a file that doesn't exist
+    let non_existent_path = "/tmp/this_file_does_not_exist_12345.py";
+    let result = server
+        .create_trigger(db_name, trigger_name, non_existent_path, "all_tables")
+        .upload(true)
+        .run();
+
+    assert!(
+        result.is_err(),
+        "Expected error when uploading non-existent file"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("File not found") || err.contains("not found"),
+        "Expected 'File not found' error, got: {err}"
+    );
+}
+
+#[test_log::test(tokio::test)]
+async fn test_upload_plugin_file_collision() {
+    let server_plugin_dir = TempDir::new().unwrap();
+    let local_dir = TempDir::new().unwrap();
+
+    // Create a file that already exists in the server's plugin directory
+    let existing_file = server_plugin_dir.path().join("existing_plugin.py");
+    fs::write(&existing_file, "def old_version(): pass").unwrap();
+
+    // Create a new version of the file locally
+    let local_file = local_dir.path().join("existing_plugin.py");
+    let new_content = "def new_version(): pass";
+    fs::write(&local_file, new_content).unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(server_plugin_dir.path().to_str().unwrap())
+        .spawn()
+        .await;
+    let db_name = "foo";
+    let trigger_name = "test_trigger";
+
+    server.create_database(db_name).run().unwrap();
+
+    // Upload with the same filename as the existing file
+    assert!(
+        server
+            .create_trigger(
+                db_name,
+                trigger_name,
+                local_file.to_str().unwrap(),
+                "all_tables",
+            )
+            .upload(true)
+            .run()
+            .is_ok()
+    );
+
+    // Verify the file was overwritten by checking content
+    // (using the trigger name as the filename since that's how it's stored)
+    let content = fs::read_to_string(&existing_file).unwrap();
+    assert_eq!(
+        content, new_content,
+        "File should be overwritten with new content"
+    );
+}
+
+#[test_log::test(tokio::test)]
+async fn test_upload_plugin_invalid_filename_path_traversal() {
+    let server_plugin_dir = TempDir::new().unwrap();
+    let local_dir = TempDir::new().unwrap();
+
+    // Create a local file with a path that includes ../ traversal
+    let traversal_subdir = local_dir.path().join("subdir");
+    fs::create_dir(&traversal_subdir).unwrap();
+    let local_file = traversal_subdir.join("..").join("escape_test.py");
+    fs::write(&local_file, "def test(): pass").unwrap();
+
+    // Verify the local file path contains path traversal
+    let local_path_str = local_file.to_str().unwrap();
+    assert!(
+        local_path_str.contains(".."),
+        "Test setup: local path should contain .."
+    );
+
+    let server = TestServer::configure()
+        .with_plugin_dir(server_plugin_dir.path().to_str().unwrap())
+        .spawn()
+        .await;
+    let db_name = "foo";
+    let trigger_name = "test_trigger";
+
+    server.create_database(db_name).run().unwrap();
+
+    // Count files in plugin dir before upload
+    let files_before: Vec<_> = fs::read_dir(server_plugin_dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+
+    // Try to upload with path traversal in filename
+    let result = server
+        .create_trigger(db_name, trigger_name, local_path_str, "all_tables")
+        .upload(true)
+        .run();
+
+    // The system should handle this safely by extracting just the filename
+    assert!(
+        result.is_ok(),
+        "System should handle path traversal safely by extracting filename"
+    );
+
+    // Verify file was created with just the filename in the plugin directory
+    let uploaded_file = server_plugin_dir.path().join("escape_test.py");
+    assert!(
+        uploaded_file.exists(),
+        "File should be created with normalized filename in plugin dir"
+    );
+
+    // Verify only one new file was added to plugin directory
+    let files_after: Vec<_> = fs::read_dir(server_plugin_dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        files_after.len(),
+        files_before.len() + 1,
+        "Exactly one file should be added to plugin directory"
+    );
+}
+
+#[test_log::test(tokio::test)]
+async fn test_upload_plugin_no_plugin_dir_configured() {
+    let local_dir = TempDir::new().unwrap();
+    let local_file = local_dir.path().join("plugin.py");
+    std::fs::write(&local_file, "def test(): pass").unwrap();
+
+    // Start server WITHOUT plugin directory configured
+    let server = TestServer::configure().spawn().await;
+    let db_name = "foo";
+    let trigger_name = "test_trigger";
+
+    server.create_database(db_name).run().unwrap();
+
+    let result = server
+        .create_trigger(
+            db_name,
+            trigger_name,
+            local_file.to_str().unwrap(),
+            "all_tables",
+        )
+        .upload(true)
+        .run();
+
+    assert!(
+        result.is_err(),
+        "Expected error when no plugin directory is configured"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("No plugin directory") || err.contains("not configured"),
+        "Expected 'No plugin directory' error, got: {err}"
+    );
+}
+
+#[test_log::test(tokio::test)]
+async fn test_upload_multifile_plugin_on_create() {
+    let local_plugin_dir = TempDir::new().unwrap();
+    let server_plugin_dir = TempDir::new().unwrap();
+
+    // Create a multi-file plugin locally
+    let plugin_path = local_plugin_dir.path().join("my_multifile_plugin");
+    fs::create_dir(&plugin_path).unwrap();
+
+    let init_code = r#"
+from .utils import process_table
+
+def process_writes(influxdb3_local, table_batches, args=None):
+    for table_batch in table_batches:
+        count = process_table(table_batch)
+        influxdb3_local.info(f"Processed {count} rows")
+"#;
+    fs::write(plugin_path.join("__init__.py"), init_code).unwrap();
+
+    let utils_code = r#"
+def process_table(table_batch):
+    return len(table_batch["rows"])
+"#;
+    fs::write(plugin_path.join("utils.py"), utils_code).unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(server_plugin_dir.path().to_str().unwrap())
+        .spawn()
+        .await;
+
+    let db_name = "test_db";
+    server.create_database(db_name).run().unwrap();
+
+    let result = server
+        .create_trigger(
+            db_name,
+            "multifile_trigger",
+            plugin_path.to_str().unwrap(),
+            "all_tables",
+        )
+        .upload(true)
+        .run()
+        .unwrap();
+
+    assert_contains!(&result, "Trigger multifile_trigger created successfully");
+
+    // Verify files were uploaded
+    let result = server
+        .query_sql("_internal")
+        .with_sql("SELECT file_name FROM system.plugin_files WHERE plugin_name = 'multifile_trigger' ORDER BY file_name")
+        .run()
+        .unwrap();
+
+    let parsed = result.as_array().expect("Expected array result");
+    assert_eq!(parsed.len(), 2);
+
+    let file_names: Vec<&str> = parsed
+        .iter()
+        .map(|f| f["file_name"].as_str().unwrap())
+        .collect();
+
+    assert!(file_names.contains(&"__init__.py"));
+    assert!(file_names.contains(&"utils.py"));
+}
+
+#[test_log::test(tokio::test)]
+async fn test_upload_multifile_plugin_nested() {
+    let local_plugin_dir = TempDir::new().unwrap();
+    let server_plugin_dir = TempDir::new().unwrap();
+
+    // Create a nested multi-file plugin
+    let plugin_path = local_plugin_dir.path().join("nested_plugin");
+    fs::create_dir(&plugin_path).unwrap();
+
+    let models_dir = plugin_path.join("models");
+    fs::create_dir(&models_dir).unwrap();
+
+    let init_code = r#"
+from .models.processor import process_data
+
+def process_writes(influxdb3_local, table_batches, args=None):
+    result = process_data(table_batches)
+    influxdb3_local.info(f"Processed {result} batches")
+"#;
+    fs::write(plugin_path.join("__init__.py"), init_code).unwrap();
+
+    fs::write(models_dir.join("__init__.py"), "").unwrap();
+
+    let processor_code = r#"
+def process_data(batches):
+    return len(batches)
+"#;
+    fs::write(models_dir.join("processor.py"), processor_code).unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(server_plugin_dir.path().to_str().unwrap())
+        .spawn()
+        .await;
+
+    let db_name = "test_db";
+    server.create_database(db_name).run().unwrap();
+
+    let result = server
+        .create_trigger(
+            db_name,
+            "nested_trigger",
+            plugin_path.to_str().unwrap(),
+            "all_tables",
+        )
+        .upload(true)
+        .run()
+        .unwrap();
+
+    assert_contains!(&result, "Trigger nested_trigger created successfully");
+
+    // Verify nested structure was uploaded
+    let result = server
+        .query_sql("_internal")
+        .with_sql("SELECT file_name FROM system.plugin_files WHERE plugin_name = 'nested_trigger' ORDER BY file_name")
+        .run()
+        .unwrap();
+
+    let parsed = result.as_array().expect("Expected array result");
+    assert_eq!(parsed.len(), 3);
+
+    let file_names: Vec<&str> = parsed
+        .iter()
+        .map(|f| f["file_name"].as_str().unwrap())
+        .collect();
+
+    assert!(file_names.contains(&"__init__.py"));
+    assert!(file_names.contains(&"models/__init__.py"));
+    assert!(file_names.contains(&"models/processor.py"));
+}
+
+#[test_log::test(tokio::test)]
+async fn test_upload_multifile_missing_init_fails() {
+    let local_plugin_dir = TempDir::new().unwrap();
+    let server_plugin_dir = TempDir::new().unwrap();
+
+    // Create a directory without __init__.py
+    let plugin_path = local_plugin_dir.path().join("bad_plugin");
+    fs::create_dir(&plugin_path).unwrap();
+    fs::write(plugin_path.join("utils.py"), "def helper(): pass").unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(server_plugin_dir.path().to_str().unwrap())
+        .spawn()
+        .await;
+
+    let db_name = "test_db";
+    server.create_database(db_name).run().unwrap();
+
+    let result = server
+        .create_trigger(
+            db_name,
+            "bad_trigger",
+            plugin_path.to_str().unwrap(),
+            "all_tables",
+        )
+        .upload(true)
+        .run();
+
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("__init__.py"));
+}
+
 #[test_log::test(tokio::test)]
 async fn test_database_create_persists() {
     // create tmp dir for object store
@@ -1670,29 +2176,35 @@ def process_writes(influxdb3_local, table_batches, args=None):
         .run()
         .expect("Failed to run wal plugin test");
 
-    let expected_result = serde_json::json!({
-        "log_lines": [
-            "INFO: All LineBuilder tests completed"
-        ],
-        "database_writes": {
-            "test_db": [
-                "metrics,host=server01,region=us-west cpu=42i,memory_bytes=8589934592u,load=86.5,status=\"online\",healthy=t 1609459200000000000",
-                "system_metrics,server=app\\ server\\ 1,datacenter=us\\ west count=1i",
-                "network,servers=web\\,app\\,db,location=floor1\\,rack3 connections=256i",
-                "formulas,equation=y\\=mx+b,result=a\\=b\\=c value=3.14159",
-                "paths,windows_path=C:\\\\Program\\ Files\\\\App,regex=\\\\d+\\\\w+ description=\"Windows\\\\Unix paths\",count=42i",
-                "messages,type=notification content=\"User said \\\"Hello World\\\"\",json=\"{\\\"key\\\": \\\"value\\\"}\",priority=1i",
-                "complex\\,measurement,location=New\\ York\\,\\ USA,details=floor\\=5\\,\\ room\\=3,path=C:\\\\Users\\\\Admin\\\\Documents message=\"Error in line: \\\"x = y + z\\\"\",query=\"SELECT * FROM table WHERE id=\\\"abc\\\"\",value=123.456 1609459200000000000",
-                "sensor_data,device=thermostat,room=living\\ room,floor=1 temperature=72.5,humidity=45i,mode=\"auto\""
-            ],
-            "metrics_db": [
-                "memory_stats,host=server1 usage=75i"
-            ]
-        },
-        "errors": []
-    });
+    // Filter out framework start/finish messages (timing varies per run)
+    let log_lines: Vec<_> = result["log_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| {
+            !s.starts_with("INFO: starting execution") && !s.starts_with("INFO: finished execution")
+        })
+        .collect();
+    assert_eq!(log_lines, vec!["INFO: All LineBuilder tests completed"]);
 
-    assert_eq!(result, expected_result);
+    let expected_writes = serde_json::json!({
+        "test_db": [
+            "metrics,host=server01,region=us-west cpu=42i,memory_bytes=8589934592u,load=86.5,status=\"online\",healthy=t 1609459200000000000",
+            "system_metrics,server=app\\ server\\ 1,datacenter=us\\ west count=1i",
+            "network,servers=web\\,app\\,db,location=floor1\\,rack3 connections=256i",
+            "formulas,equation=y\\=mx+b,result=a\\=b\\=c value=3.14159",
+            "paths,windows_path=C:\\\\Program\\ Files\\\\App,regex=\\\\d+\\\\w+ description=\"Windows\\\\Unix paths\",count=42i",
+            "messages,type=notification content=\"User said \\\"Hello World\\\"\",json=\"{\\\"key\\\": \\\"value\\\"}\",priority=1i",
+            "complex\\,measurement,location=New\\ York\\,\\ USA,details=floor\\=5\\,\\ room\\=3,path=C:\\\\Users\\\\Admin\\\\Documents message=\"Error in line: \\\"x = y + z\\\"\",query=\"SELECT * FROM table WHERE id=\\\"abc\\\"\",value=123.456 1609459200000000000",
+            "sensor_data,device=thermostat,room=living\\ room,floor=1 temperature=72.5,humidity=45i,mode=\"auto\""
+        ],
+        "metrics_db": [
+            "memory_stats,host=server1 usage=75i"
+        ]
+    });
+    assert_eq!(result["database_writes"], expected_writes);
+    assert_eq!(result["errors"], serde_json::json!([]));
 }
 #[test_log::test(tokio::test)]
 async fn test_wal_plugin_test() {
@@ -1766,29 +2278,35 @@ def process_writes(influxdb3_local, table_batches, args=None):
 
     debug!(result = ?result, "test wal plugin");
 
-    let expected_result = r#"{
-  "log_lines": [
-    "INFO: arg1: arg1_value",
-    "INFO: query result: [{'host': 's2', 'region': 'us-east', 'usage': 0.89}]",
-    "INFO: i [{'host': 's2', 'region': 'us-east', 'usage': 0.89}] s2",
-    "WARN: w: [{'host': 's2', 'region': 'us-east', 'usage': 0.89}]",
-    "ERROR: err [{'host': 's2', 'region': 'us-east', 'usage': 0.89}]",
-    "INFO: table: test_input",
-    "INFO: row: {'tag1': 'tag1_value', 'tag2': 'tag2_value', 'field1': 1, 'time': 500}",
-    "INFO: done"
-  ],
-  "database_writes": {
-    "mytestdb": [
-      "other_table other_field=1i,other_field2=3.14 1302"
-    ],
-    "foo": [
-      "some_table,tag1=tag1_value,tag2=tag2_value field1=1i,field2=2.0,field3=\"number three\""
-    ]
-  },
-  "errors": []
-}"#;
-    let expected_result = serde_json::from_str::<serde_json::Value>(expected_result).unwrap();
-    assert_eq!(result, expected_result);
+    // Filter out framework start/finish messages (timing varies per run)
+    let log_lines: Vec<_> = result["log_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| {
+            !s.starts_with("INFO: starting execution") && !s.starts_with("INFO: finished execution")
+        })
+        .collect();
+    let expected_log_lines = vec![
+        "INFO: arg1: arg1_value",
+        "INFO: query result: [{'host': 's2', 'region': 'us-east', 'usage': 0.89}]",
+        "INFO: i [{'host': 's2', 'region': 'us-east', 'usage': 0.89}] s2",
+        "WARN: w: [{'host': 's2', 'region': 'us-east', 'usage': 0.89}]",
+        "ERROR: err [{'host': 's2', 'region': 'us-east', 'usage': 0.89}]",
+        "INFO: table: test_input",
+        "INFO: row: {'tag1': 'tag1_value', 'tag2': 'tag2_value', 'field1': 1, 'time': 500}",
+        "INFO: done",
+    ];
+    assert_eq!(log_lines, expected_log_lines);
+
+    // Verify the rest of the response
+    let expected_writes = serde_json::json!({
+        "mytestdb": ["other_table other_field=1i,other_field2=3.14 1302"],
+        "foo": ["some_table,tag1=tag1_value,tag2=tag2_value field1=1i,field2=2.0,field3=\"number three\""]
+    });
+    assert_eq!(result["database_writes"], expected_writes);
+    assert_eq!(result["errors"], serde_json::json!([]));
 }
 #[test_log::test(tokio::test)]
 async fn test_schedule_plugin_test() {
@@ -1838,22 +2356,25 @@ def process_scheduled_call(influxdb3_local, schedule_time, args=None):
     let trigger_time = result["trigger_time"].as_str().unwrap();
     assert!(trigger_time.contains('T')); // Basic RFC3339 format check
 
-    // Check the rest of the response structure
-    let expected_result = serde_json::json!({
-        "log_lines": [
+    // Filter out framework start/finish messages (timing varies per run)
+    let log_lines: Vec<_> = result["log_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| {
+            !s.starts_with("INFO: starting execution") && !s.starts_with("INFO: finished execution")
+        })
+        .collect();
+    assert_eq!(
+        log_lines,
+        vec![
             "INFO: args are {'region': 'us-east'}",
             "INFO: Successfully called"
-        ],
-        "database_writes": {
-        },
-        "errors": []
-    });
-    assert_eq!(result["log_lines"], expected_result["log_lines"]);
-    assert_eq!(
-        result["database_writes"],
-        expected_result["database_writes"]
+        ]
     );
-    assert_eq!(result["errors"], expected_result["errors"]);
+    assert_eq!(result["database_writes"], serde_json::json!({}));
+    assert_eq!(result["errors"], serde_json::json!([]));
 }
 
 #[test_log::test(tokio::test)]
@@ -1900,8 +2421,19 @@ foo,tag1=bar,tag2=mloem val1=5,val2=199"#,
         .expect("Failed to run schedule plugin test");
 
     debug!(result = ?result, "test schedule plugin");
+
+    // Filter out framework start/finish messages (timing varies per run)
+    let log_lines: Vec<_> = result["log_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| {
+            !s.starts_with("INFO: starting execution") && !s.starts_with("INFO: finished execution")
+        })
+        .collect();
     assert_eq!(result["errors"], json!([]));
-    assert_eq!(result["log_lines"], json!(["INFO: successfully queried"]));
+    assert_eq!(log_lines, vec!["INFO: successfully queried"]);
 }
 
 #[test_log::test(tokio::test)]
@@ -1954,21 +2486,20 @@ def process_scheduled_call(influxdb3_local, schedule_time, args=None):
     let trigger_time = result["trigger_time"].as_str().unwrap();
     assert!(trigger_time.contains('T')); // Basic RFC3339 format check
 
-    // Check the rest of the response structure
-    // Modified expectations to include the timestamp message
-    let log_lines = &result["log_lines"];
-    assert_eq!(log_lines.as_array().unwrap().len(), 3);
-    assert!(
-        log_lines[0]
-            .as_str()
-            .unwrap()
-            .starts_with("INFO: Current timestamp:")
-    );
-    assert_eq!(
-        log_lines[1].as_str().unwrap(),
-        "INFO: args are {'region': 'us-east'}"
-    );
-    assert_eq!(log_lines[2].as_str().unwrap(), "INFO: Successfully called");
+    // Filter out framework start/finish messages (timing varies per run)
+    let log_lines: Vec<_> = result["log_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| {
+            !s.starts_with("INFO: starting execution") && !s.starts_with("INFO: finished execution")
+        })
+        .collect();
+    assert_eq!(log_lines.len(), 3);
+    assert!(log_lines[0].starts_with("INFO: Current timestamp:"));
+    assert_eq!(log_lines[1], "INFO: args are {'region': 'us-east'}");
+    assert_eq!(log_lines[2], "INFO: Successfully called");
 
     assert_eq!(result["database_writes"], serde_json::json!({}));
     assert_eq!(result["errors"], serde_json::json!([]));
@@ -2130,19 +2661,23 @@ async fn test_load_wal_plugin_from_gh() {
 
     debug!(result = ?result, "test wal plugin");
 
-    let expected_result = r#"{
-  "log_lines": [
-    "INFO: wal_plugin.py done"
-  ],
-  "database_writes": {
-    "foo": [
-      "write_reports,table_name=test_input row_count=1i"
-    ]
-  },
-  "errors": []
-}"#;
-    let expected_result = serde_json::from_str::<serde_json::Value>(expected_result).unwrap();
-    assert_eq!(result, expected_result);
+    // Filter out framework start/finish messages (timing varies per run)
+    let log_lines: Vec<_> = result["log_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| {
+            !s.starts_with("INFO: starting execution") && !s.starts_with("INFO: finished execution")
+        })
+        .collect();
+    assert_eq!(log_lines, vec!["INFO: wal_plugin.py done"]);
+
+    let expected_writes = serde_json::json!({
+        "foo": ["write_reports,table_name=test_input row_count=1i"]
+    });
+    assert_eq!(result["database_writes"], expected_writes);
+    assert_eq!(result["errors"], serde_json::json!([]));
 }
 #[test_log::test(tokio::test)]
 async fn test_request_plugin_and_trigger() {
@@ -2204,7 +2739,7 @@ def process_request(influxdb3_local, query_parameters, request_headers, request_
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await.unwrap();
     let body = serde_json::from_str::<serde_json::Value>(&body).unwrap();
 
@@ -2291,10 +2826,57 @@ def process_request(influxdb3_local, query_parameters, request_headers, request_
         .await
         .unwrap();
 
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
     let body = response.text().await.unwrap();
     assert_eq!(body, "Hello, World!");
+}
+
+#[test_log::test(tokio::test)]
+async fn test_request_plugin_and_trigger_no_auth_header() {
+    let plugin_code = r#"
+def process_request(influxdb3_local, query_parameters, request_headers, request_body, args=None):
+    # Check if authorization header is present (case-insensitive)
+    if "authorization" in {k.lower() for k in request_headers.keys()}:
+        raise Exception("Authorization header should not be passed to plugins")
+    return {"status": "ok"}
+"#;
+
+    let (temp_dir, plugin_path) = create_plugin_in_temp_dir(plugin_code);
+
+    let plugin_dir = temp_dir.path().to_str().unwrap();
+    let plugin_filename = plugin_path.file_name().unwrap().to_str().unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(plugin_dir)
+        .spawn()
+        .await;
+    let db_name = "foo";
+
+    server.create_database(db_name).run().unwrap();
+
+    let trigger_path = "foo";
+    let result = server
+        .create_trigger(db_name, trigger_path, plugin_filename, "request:bar")
+        .run()
+        .unwrap();
+
+    debug!(result = ?result, "create trigger");
+    assert_contains!(&result, "Trigger foo created successfully");
+
+    // send an HTTP request to the server WITH an Authorization header
+    let client = server.http_client();
+    let response = client
+        .post(format!("{}/api/v3/engine/bar", server.client_addr()))
+        .header("Authorization", "Bearer super-secret-token")
+        .send()
+        .await
+        .unwrap();
+    // If the plugin received the Authorization header, it would raise an exception
+    // and return 500. A 200 response means the header was filtered out.
+    assert_eq!(response.status(), 200);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body, json!({"status": "ok"}));
 }
 
 #[test_log::test(tokio::test)]
@@ -2335,7 +2917,7 @@ def process_request(influxdb3_local, query_parameters, request_headers, request_
         .await
         .unwrap();
 
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get("content-type").unwrap(),
         "application/json"
@@ -2385,7 +2967,7 @@ def process_request(influxdb3_local, query_parameters, request_headers, request_
         .await
         .unwrap();
 
-    assert_eq!(response.status(), 201);
+    assert_eq!(response.status(), StatusCode::CREATED);
     assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
     let body = response.text().await.unwrap();
     assert_eq!(body, "Created successfully");
@@ -2429,7 +3011,7 @@ def process_request(influxdb3_local, query_parameters, request_headers, request_
         .await
         .unwrap();
 
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get("content-type").unwrap(),
         "text/plain"
@@ -2480,7 +3062,7 @@ def process_request(influxdb3_local, query_parameters, request_headers, request_
         .await
         .unwrap();
 
-    assert_eq!(response.status(), 404);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         response.headers().get("content-type").unwrap(),
         "text/plain"
@@ -2528,7 +3110,7 @@ def process_request(influxdb3_local, query_parameters, request_headers, request_
         .await
         .unwrap();
 
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get("content-type").unwrap(),
         "application/json"
@@ -2580,7 +3162,7 @@ def process_request(influxdb3_local, query_parameters, request_headers, request_
         .await
         .unwrap();
 
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
     let body = response.text().await.unwrap();
     assert_eq!(body, "Line 1\nLine 2\nLine 3\n");
@@ -2638,7 +3220,7 @@ def process_request(influxdb3_local, query_parameters, request_headers, request_
         .await
         .unwrap();
 
-    assert_eq!(response.status(), 202);
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(
         response.headers().get("content-type").unwrap(),
         "text/custom"
@@ -2686,7 +3268,7 @@ def process_request(influxdb3_local, query_parameters, request_headers, request_
         .await
         .unwrap();
 
-    assert_eq!(response.status(), 404);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         response.headers().get("content-type").unwrap(),
         "application/json"
@@ -2717,7 +3299,7 @@ async fn test_trigger_create_validates_file_present() {
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("error reading file from Github: 404 Not Found"));
+    assert!(err.contains("error fetching plugin from repository: 404 Not Found"));
 }
 
 fn check_logs(response: &Value, expected_logs: &[&str]) {
@@ -2726,11 +3308,31 @@ fn check_logs(response: &Value, expected_logs: &[&str]) {
         "Unexpected errors in response {response:#?}, expected logs {expected_logs:#?}"
     );
     let logs = response["log_lines"].as_array().unwrap();
+    // Filter out framework start/finish messages (timing varies per run)
+    let logs: Vec<_> = logs
+        .iter()
+        .filter(|l| {
+            let s = l.as_str().unwrap_or("");
+            !s.starts_with("INFO: starting execution") && !s.starts_with("INFO: finished execution")
+        })
+        .collect();
     assert_eq!(
-        expected_logs, logs,
-        "mismatched log lines, expected {:#?}, got {:#?}, errors are {:#?}",
-        expected_logs, logs, response["errors"]
+        expected_logs.len(),
+        logs.len(),
+        "mismatched log line count, expected {:#?}, got {:#?}, errors are {:#?}",
+        expected_logs,
+        logs,
+        response["errors"]
     );
+    for (expected, actual) in expected_logs.iter().zip(logs.iter()) {
+        assert_eq!(
+            *expected,
+            actual.as_str().unwrap(),
+            "mismatched log line, expected {:#?}, got {:#?}",
+            expected,
+            actual
+        );
+    }
 }
 #[test_log::test(tokio::test)]
 async fn test_basic_cache_functionality() {
@@ -3552,28 +4154,322 @@ async fn test_db_name_cannot_start_with_underscore_on_create_table() {
     );
 }
 
-#[test_log::test(tokio::test)]
-async fn test_serve_command_error_msg() {
-    let output = assert_cmd::Command::cargo_bin("influxdb3")
-        .unwrap()
-        .args(["serve", "--node-id", "node-1"])
+#[test_log::test]
+fn test_create_token_requires_subcommand() {
+    // Test that 'create token' command shows help instead of panicking when no subcommand is provided
+    let output = cargo_bin_cmd!("influxdb3")
+        .args(["create", "token"])
         .output()
-        .unwrap()
-        .stderr
-        .clone();
+        .unwrap();
 
-    let full_cmd =
-        "influxdb3 serve --object-store <object-store> --node-id <NODE_IDENTIFIER_PREFIX>";
-    assert_object_store_error_msg(output, full_cmd);
-}
+    let stderr = String::from_utf8(output.stderr).unwrap();
 
-fn assert_object_store_error_msg(error_output: Vec<u8>, full_command: &str) {
-    let str_msg = String::from_utf8(error_output).unwrap();
-    assert_contains!(&str_msg, full_command);
+    // Should show our custom error message
+    assert_contains!(&stderr, "Missing required subcommand");
+    assert_contains!(&stderr, "Use: influxdb3 create token --admin");
+
+    // Should not have panic messages in stderr
+    assert_not_contains!(&stderr, "panic");
+    assert_not_contains!(&stderr, "thread 'main' panicked");
+
+    // Test that --name alone also shows the error
+    let output_name_only = cargo_bin_cmd!("influxdb3")
+        .args(["create", "token", "--name", "test"])
+        .output()
+        .unwrap();
+
+    let stderr_name_only = String::from_utf8(output_name_only.stderr).unwrap();
 
     assert_contains!(
-        &str_msg,
-        "error: the following required arguments were not provided:
-  --object-store <object-store>"
+        &stderr_name_only,
+        "error: unexpected argument '--name' found"
     );
+
+    // Test that --help works properly (help goes to stdout when explicitly requested)
+    let output_help = cargo_bin_cmd!("influxdb3")
+        .args(["create", "token", "--help"])
+        .output()
+        .unwrap();
+
+    let stdout_help = String::from_utf8(output_help.stdout).unwrap();
+
+    // Should show the help information
+    assert_contains!(&stdout_help, "Create a new auth token");
+    assert_contains!(&stdout_help, "Usage: influxdb3 create token");
+    assert_contains!(&stdout_help, "--admin");
+}
+
+#[test_log::test(tokio::test)]
+async fn test_update_trigger() {
+    let plugin_dir = TempDir::new().unwrap();
+    let external_dir = TempDir::new().unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(plugin_dir.path().to_str().unwrap())
+        .spawn()
+        .await;
+
+    let db_name = "test_db";
+
+    server.create_database(db_name).run().unwrap();
+
+    // Create initial plugin file in plugin_dir
+    let plugin_file = plugin_dir.path().join("test_plugin.py");
+    let initial_content = "def handle_wal(wal_data): pass";
+    fs::write(&plugin_file, initial_content).unwrap();
+
+    server
+        .create_trigger(db_name, "test_trigger", "test_plugin.py", "all_tables")
+        .run()
+        .unwrap();
+
+    // Create updated plugin file that is located elsewhere that we will upload
+    let external_file = external_dir.path().join("updated_plugin.py");
+    let updated_content = "def handle_wal(wal_data): print('updated')";
+    fs::write(&external_file, updated_content).unwrap();
+
+    // Upload from external file
+    let output = server
+        .run(
+            vec![
+                "update",
+                "trigger",
+                "--tls-ca",
+                "../testing-certs/rootCA.pem",
+            ],
+            &[
+                "--database",
+                db_name,
+                "--trigger-name",
+                "test_trigger",
+                "--path",
+                external_file.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+
+    assert!(output.contains("updated successfully"));
+
+    // Verify that the file in plugin_dir has the updated content
+    let actual_content = fs::read_to_string(&plugin_file).unwrap();
+    assert_eq!(actual_content, updated_content);
+}
+
+#[test_log::test(tokio::test)]
+async fn test_update_multifile_plugin_single_file() {
+    let plugin_dir = TempDir::new().unwrap();
+    let external_dir = TempDir::new().unwrap();
+
+    // Create initial multi-file plugin in plugin_dir
+    let plugin_path = plugin_dir.path().join("my_plugin");
+    fs::create_dir(&plugin_path).unwrap();
+
+    let init_code = r#"
+from .utils import helper
+
+def process_writes(influxdb3_local, table_batches, args=None):
+    helper()
+"#;
+    fs::write(plugin_path.join("__init__.py"), init_code).unwrap();
+    fs::write(plugin_path.join("utils.py"), "def helper(): pass").unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(plugin_dir.path().to_str().unwrap())
+        .spawn()
+        .await;
+
+    let db_name = "test_db";
+    server.create_database(db_name).run().unwrap();
+
+    server
+        .create_trigger(db_name, "test_trigger", "my_plugin", "all_tables")
+        .run()
+        .unwrap();
+
+    // Update __init__.py file
+    let external_file = external_dir.path().join("new_init.py");
+    let updated_content = r#"
+from .utils import helper
+
+def process_writes(influxdb3_local, table_batches, args=None):
+    influxdb3_local.info("Updated!")
+    helper()
+"#;
+    fs::write(&external_file, updated_content).unwrap();
+
+    let output = server
+        .run(
+            vec![
+                "update",
+                "trigger",
+                "--tls-ca",
+                "../testing-certs/rootCA.pem",
+            ],
+            &[
+                "--database",
+                db_name,
+                "--trigger-name",
+                "test_trigger",
+                "--path",
+                external_file.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+
+    assert!(output.contains("updated successfully"));
+
+    // Verify __init__.py was updated
+    let actual_content = fs::read_to_string(plugin_path.join("__init__.py")).unwrap();
+    assert_eq!(actual_content, updated_content);
+
+    // Verify utils.py is unchanged
+    let utils_content = fs::read_to_string(plugin_path.join("utils.py")).unwrap();
+    assert_eq!(utils_content, "def helper(): pass");
+}
+
+#[test_log::test(tokio::test)]
+async fn test_update_single_file_plugin_still_works() {
+    let plugin_dir = TempDir::new().unwrap();
+    let external_dir = TempDir::new().unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(plugin_dir.path().to_str().unwrap())
+        .spawn()
+        .await;
+
+    let db_name = "test_db";
+    server.create_database(db_name).run().unwrap();
+
+    // Create initial single-file plugin
+    let plugin_file = plugin_dir.path().join("single_plugin.py");
+    fs::write(
+        &plugin_file,
+        "def process_writes(influxdb3_local, table_batches, args=None): pass",
+    )
+    .unwrap();
+
+    server
+        .create_trigger(db_name, "single_trigger", "single_plugin.py", "all_tables")
+        .run()
+        .unwrap();
+
+    // Update the single file
+    let external_file = external_dir.path().join("updated.py");
+    let updated_content = "def process_writes(influxdb3_local, table_batches, args=None): influxdb3_local.info('updated')";
+    fs::write(&external_file, updated_content).unwrap();
+
+    let output = server
+        .run(
+            vec![
+                "update",
+                "trigger",
+                "--tls-ca",
+                "../testing-certs/rootCA.pem",
+            ],
+            &[
+                "--database",
+                db_name,
+                "--trigger-name",
+                "single_trigger",
+                "--path",
+                external_file.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+
+    assert!(output.contains("updated successfully"));
+
+    // Verify the file was updated
+    let actual_content = fs::read_to_string(&plugin_file).unwrap();
+    assert_eq!(actual_content, updated_content);
+}
+
+/// Test that queries returning sparse field values handle nulls correctly.
+/// Fields that don't exist for certain rows should return None, not default values like 0 or "".
+#[test_log::test(tokio::test)]
+async fn test_query_with_sparse_fields() {
+    use influxdb3_client::Precision;
+
+    let (temp_dir, plugin_path) = create_plugin_in_temp_dir(
+        r#"
+def process_writes(influxdb3_local, table_batches, args=None):
+    query_result = influxdb3_local.query("SELECT * FROM m0 ORDER BY time")
+    influxdb3_local.info("query result: " + str(query_result))
+
+    # Check each row for proper null handling
+    for row in query_result:
+        # Log the sparse fields - they should be None when missing, not 0 or ""
+        influxdb3_local.info(
+            "i64_sparse=" + str(row.get('i64_sparse')) +
+            " f64_sparse=" + str(row.get('f64_sparse')) +
+            " str_sparse=" + str(row.get('str_sparse')) +
+            " bool_sparse=" + str(row.get('bool_sparse'))
+        )"#,
+    );
+
+    let plugin_dir = temp_dir.path().to_str().unwrap();
+    let plugin_filename = plugin_path.file_name().unwrap().to_str().unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(plugin_dir)
+        .spawn()
+        .await;
+
+    let lp = [
+        // Row 1: has all the sparse fields
+        r#"m0 i64_common=1i,i64_sparse=100i,f64_sparse=1.5,str_sparse="hello",bool_sparse=true 1000"#,
+        // Row 2: missing all sparse fields - should show None, not 0/""/false
+        r#"m0 i64_common=2i 2000"#,
+    ]
+        .join("\n");
+
+    server
+        .write_lp_to_db("testdb", &lp, Precision::Nanosecond)
+        .await
+        .unwrap();
+
+    let result = server
+        .test_wal_plugin("testdb", plugin_filename)
+        .with_line_protocol("dummy,t=v f=1i 100")
+        .run()
+        .expect("Plugin should not panic when handling null field values");
+
+    let log_lines = result["log_lines"]
+        .as_array()
+        .expect("log_lines should be array");
+
+    // Find the log line for row 2 (the one without sparse fields)
+    // It should show None for all sparse fields, not default values
+    let row2_line = log_lines
+        .iter()
+        .filter_map(|l| l.as_str())
+        .find(|s| s.contains("i64_sparse=None"))
+        .expect("Expected row with i64_sparse=None (null handling)");
+
+    // Verify all field types get None treatment
+    assert!(
+        row2_line.contains("f64_sparse=None"),
+        "Expected f64_sparse=None, got: {row2_line}"
+    );
+    assert!(
+        row2_line.contains("str_sparse=None"),
+        "Expected str_sparse=None, got: {row2_line}"
+    );
+    assert!(
+        row2_line.contains("bool_sparse=None"),
+        "Expected bool_sparse=None, got: {row2_line}"
+    );
+
+    // Verify the row with values still works
+    let row1_line = log_lines
+        .iter()
+        .filter_map(|l| l.as_str())
+        .find(|s| s.contains("i64_sparse=100"));
+    assert!(
+        row1_line.is_some(),
+        "Expected row with i64_sparse=100, log lines: {:?}",
+        log_lines
+    );
+
+    assert_eq!(result["errors"], serde_json::json!([]));
 }

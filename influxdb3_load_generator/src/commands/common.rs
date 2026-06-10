@@ -33,7 +33,7 @@ pub(crate) struct InfluxDb3Config {
     pub(crate) database_name: String,
 
     /// The token for authentication with the InfluxDB 3 Core server
-    #[clap(long = "token", env = "INFLUXDB3_AUTH_TOKEN")]
+    #[clap(long = "token", env = "INFLUXDB3_AUTH_TOKEN", hide_env_values = true)]
     pub(crate) auth_token: Option<Secret<String>>,
 
     /// The name of the builtin spec to run. Use this instead of spec_path if you want to run
@@ -453,7 +453,7 @@ pub(crate) fn create_client(
     host_url: Url,
     auth_token: Option<Secret<String>>,
 ) -> Result<Client, influxdb3_client::Error> {
-    let mut client = Client::new(host_url, None)?;
+    let mut client = Client::new(host_url, None, false)?;
     if let Some(t) = auth_token {
         client = client.with_auth_token(t.expose_secret());
     }

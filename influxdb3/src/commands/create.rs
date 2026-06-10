@@ -15,11 +15,13 @@ use secrecy::Secret;
 use serde_json::json;
 use std::error::Error;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str;
 use token::CreateTokenConfig;
 use token::handle_token_creation_with_config;
+use tokio::fs;
 use url::Url;
+use walkdir::WalkDir;
 
 #[derive(Debug, clap::Parser)]
 pub struct Config {
@@ -29,15 +31,17 @@ pub struct Config {
 
 impl Config {
     fn get_client(&self) -> Result<Client, Box<dyn Error>> {
-        let (host_url, auth_token, ca_cert) = match &self.cmd {
+        let (host_url, auth_token, ca_cert, tls_no_verify) = match &self.cmd {
             SubCommand::Database(DatabaseConfig {
                 host_url,
                 auth_token,
                 ca_cert,
+                tls_no_verify,
                 ..
             })
             | SubCommand::LastCache(LastCacheConfig {
                 ca_cert,
+                tls_no_verify,
                 influxdb3_config:
                     InfluxDb3Config {
                         host_url,
@@ -48,6 +52,7 @@ impl Config {
             })
             | SubCommand::DistinctCache(DistinctCacheConfig {
                 ca_cert,
+                tls_no_verify,
                 influxdb3_config:
                     InfluxDb3Config {
                         host_url,
@@ -58,6 +63,7 @@ impl Config {
             })
             | SubCommand::Table(TableConfig {
                 ca_cert,
+                tls_no_verify,
                 influxdb3_config:
                     InfluxDb3Config {
                         host_url,
@@ -68,6 +74,7 @@ impl Config {
             })
             | SubCommand::Trigger(TriggerConfig {
                 ca_cert,
+                tls_no_verify,
                 influxdb3_config:
                     InfluxDb3Config {
                         host_url,
@@ -75,18 +82,25 @@ impl Config {
                         ..
                     },
                 ..
-            }) => (host_url, auth_token, ca_cert),
+            }) => (host_url, auth_token, ca_cert, tls_no_verify),
             SubCommand::Token(create_token_config) => {
                 let host_settings = create_token_config.get_connection_settings()?;
-                (
-                    &host_settings.host_url,
-                    &host_settings.auth_token,
-                    &host_settings.ca_cert,
-                )
+                // We need to return references, so we'll handle this differently
+                return Ok({
+                    let mut client = Client::new(
+                        host_settings.host_url.clone(),
+                        host_settings.ca_cert.clone(),
+                        host_settings.tls_no_verify,
+                    )?;
+                    if let Some(token) = &host_settings.auth_token {
+                        client = client.with_auth_token(token.expose_secret());
+                    }
+                    client
+                });
             }
         };
 
-        let mut client = Client::new(host_url.clone(), ca_cert.clone())?;
+        let mut client = Client::new(host_url.clone(), ca_cert.clone(), *tls_no_verify)?;
         if let Some(token) = &auth_token {
             client = client.with_auth_token(token.expose_secret());
         }
@@ -124,7 +138,7 @@ pub struct DatabaseConfig {
     pub host_url: Url,
 
     /// The token for authentication with the InfluxDB 3 Core server
-    #[clap(long = "token", env = "INFLUXDB3_AUTH_TOKEN")]
+    #[clap(long = "token", env = "INFLUXDB3_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<Secret<String>>,
 
     /// The name of the database to create. Valid database names are
@@ -139,6 +153,10 @@ pub struct DatabaseConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -182,6 +200,10 @@ pub struct LastCacheConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -219,6 +241,10 @@ pub struct DistinctCacheConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -242,17 +268,25 @@ pub struct TableConfig {
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
 }
 
 #[derive(Debug, clap::Parser)]
 pub struct TriggerConfig {
     #[clap(flatten)]
     influxdb3_config: InfluxDb3Config,
-    /// Python file name of the file on the server's plugin-dir containing the plugin code. Or
-    /// on the [influxdb3_plugins](https://github.com/influxdata/influxdb3_plugins) repo if `gh:` is specified as
-    /// the prefix.
-    #[clap(long = "plugin-filename")]
-    plugin_filename: String,
+    /// Path to plugin file or directory. For single-file plugins, provide the .py file path.
+    /// For multi-file plugins, provide the directory path (must contain __init__.py).
+    /// When not using --upload, this should be the filename/path on the server's plugin-dir.
+    /// Supports gh: prefix for [influxdb3_plugins](https://github.com/influxdata/influxdb3_plugins) repo.
+    #[clap(long = "path")]
+    path: Option<PathBuf>,
+    /// Deprecated: Use --path instead. Python file name of the file on the server's plugin-dir.
+    #[clap(long = "plugin-filename", conflicts_with = "path")]
+    plugin_filename: Option<String>,
     /// When the trigger should fire
     #[clap(long = "trigger-spec",
           value_parser = TriggerSpecificationDefinition::from_string_rep,
@@ -270,12 +304,19 @@ pub struct TriggerConfig {
     /// How you wish the system to respond in the event of an error from the plugin
     #[clap(long, value_enum, default_value_t = ErrorBehavior::Log)]
     error_behavior: ErrorBehavior,
+    /// Upload plugin file from local filesystem instead of using server's plugin-dir
+    #[clap(long)]
+    upload: bool,
     /// Name for the new trigger
     trigger_name: String,
 
     /// An optional arg to use a custom ca for useful for testing with self signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
+
+    /// Disable TLS certificate verification
+    #[clap(long = "tls-no-verify", env = "INFLUXDB3_TLS_NO_VERIFY")]
+    tls_no_verify: bool,
 }
 
 pub async fn command(config: Config) -> Result<(), Box<dyn Error>> {
@@ -426,14 +467,114 @@ pub async fn command(config: Config) -> Result<(), Box<dyn Error>> {
         SubCommand::Trigger(TriggerConfig {
             influxdb3_config: InfluxDb3Config { database_name, .. },
             trigger_name,
+            path,
             plugin_filename,
             trigger_specification,
             trigger_arguments,
             disabled,
             run_asynchronous,
             error_behavior,
+            upload,
             ..
         }) => {
+            // Determine which path/filename to use: --path supersedes --plugin-filename
+            let plugin_path_source = match (path, plugin_filename) {
+                (Some(p), _) => p,
+                (None, Some(f)) => PathBuf::from(f),
+                (None, None) => {
+                    return Err("Either --path or --plugin-filename must be provided".into());
+                }
+            };
+
+            let final_plugin_filename = if upload {
+                let path = plugin_path_source;
+
+                if !path.exists() {
+                    return Err(format!("File not found: {}", path.display()).into());
+                }
+
+                if path.is_file() {
+                    // Single file upload (existing behavior)
+                    let content = fs::read_to_string(&path).await?;
+
+                    let filename = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or("Invalid filename")?
+                        .to_string();
+
+                    client
+                        .api_v3_create_plugin_file(&database_name, &filename, &content)
+                        .await?;
+
+                    filename
+                } else if path.is_dir() {
+                    // Multi-file plugin upload (new behavior)
+                    let plugin_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or("Invalid directory name")?
+                        .to_string();
+
+                    // Validate __init__.py exists
+                    let init_file = path.join("__init__.py");
+                    if !init_file.exists() {
+                        return Err(format!(
+                            "Multi-file plugin directory must contain __init__.py: {}",
+                            path.display()
+                        )
+                        .into());
+                    }
+
+                    // Recursively collect all .py files
+                    for entry in WalkDir::new(&path)
+                        .follow_links(false)
+                        .into_iter()
+                        .filter_entry(|e| {
+                            // Skip __pycache__ directories
+                            e.file_name()
+                                .to_str()
+                                .map(|s| s != "__pycache__")
+                                .unwrap_or(true)
+                        })
+                        .filter_map(Result::ok)
+                    {
+                        if entry.file_type().is_file()
+                            && entry.path().extension().and_then(|s| s.to_str()) == Some("py")
+                        {
+                            let content = fs::read_to_string(entry.path()).await?;
+
+                            // Get relative path from plugin directory
+                            let relative_path = entry
+                                .path()
+                                .strip_prefix(&path)
+                                .map_err(|e| format!("Failed to get relative path: {}", e))?;
+
+                            // Combine plugin name with relative path
+                            let file_path = Path::new(&plugin_name)
+                                .join(relative_path)
+                                .to_str()
+                                .ok_or("Invalid file path")?
+                                .to_string();
+
+                            client
+                                .api_v3_create_plugin_file(&database_name, &file_path, &content)
+                                .await?;
+                        }
+                    }
+
+                    plugin_name
+                } else {
+                    return Err(format!("Invalid path: {}", path.display()).into());
+                }
+            } else {
+                // When not uploading, extract the filename/path as a string for server reference
+                plugin_path_source
+                    .to_str()
+                    .ok_or("Invalid path encoding")?
+                    .to_string()
+            };
+
             let trigger_arguments: Option<HashMap<String, String>> = trigger_arguments.map(|a| {
                 a.into_iter()
                     .map(|SeparatedKeyValue((k, v))| (k, v))
@@ -449,7 +590,7 @@ pub async fn command(config: Config) -> Result<(), Box<dyn Error>> {
                 .api_v3_configure_processing_engine_trigger_create(
                     database_name,
                     &trigger_name,
-                    plugin_filename,
+                    final_plugin_filename,
                     trigger_specification.string_rep(),
                     trigger_arguments,
                     disabled,
@@ -469,105 +610,4 @@ pub async fn command(config: Config) -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(test)]
-mod tests {
-
-    use std::time::Duration;
-
-    use clap::Parser;
-    use influxdb3_catalog::log::{ErrorBehavior, TriggerSpecificationDefinition};
-
-    #[test]
-    fn parse_args_create_last_cache() {
-        let args = super::Config::parse_from([
-            "create",
-            "last_cache",
-            "--database",
-            "bar",
-            "--table",
-            "foo",
-            "--key-columns",
-            "tag1,tag2,tag3",
-            "--value-columns",
-            "field1,field2,field3",
-            "--ttl",
-            "1 hour",
-            "--count",
-            "15",
-            "bar",
-        ]);
-        let super::SubCommand::LastCache(super::LastCacheConfig {
-            table,
-            cache_name,
-            key_columns,
-            value_columns,
-            count,
-            ttl,
-            influxdb3_config: crate::commands::common::InfluxDb3Config { database_name, .. },
-            ..
-        }) = args.cmd
-        else {
-            panic!("Did not parse args correctly: {args:#?}")
-        };
-        assert_eq!("bar", database_name);
-        assert_eq!("foo", table);
-        assert!(cache_name.is_some_and(|n| n == "bar"));
-        assert!(key_columns.is_some_and(|keys| keys == ["tag1", "tag2", "tag3"]));
-        assert!(value_columns.is_some_and(|vals| vals == ["field1", "field2", "field3"]));
-        assert!(count.is_some_and(|c| c == 15));
-        assert!(ttl.is_some_and(|t| t.as_secs() == 3600));
-    }
-
-    #[test]
-    fn parse_args_create_trigger_arguments() {
-        let args = super::Config::parse_from([
-            "create",
-            "trigger",
-            "--trigger-spec",
-            "every:10s",
-            "--plugin-filename",
-            "plugin.py",
-            "--database",
-            "test",
-            "--trigger-arguments",
-            "query_path=/metrics?format=json,whatever=hello",
-            "test-trigger",
-        ]);
-        let super::SubCommand::Trigger(super::TriggerConfig {
-            trigger_name,
-            trigger_arguments,
-            trigger_specification,
-            plugin_filename,
-            disabled,
-            run_asynchronous,
-            error_behavior,
-            influxdb3_config: crate::commands::common::InfluxDb3Config { database_name, .. },
-            ..
-        }) = args.cmd
-        else {
-            panic!("Did not parse args correctly: {args:#?}")
-        };
-        assert_eq!("test", database_name);
-        assert_eq!("test-trigger", trigger_name);
-        assert_eq!("plugin.py", plugin_filename);
-        assert_eq!(
-            TriggerSpecificationDefinition::Every {
-                duration: Duration::from_secs(10)
-            },
-            trigger_specification
-        );
-        assert!(!disabled);
-        assert!(!run_asynchronous);
-        assert_eq!(ErrorBehavior::Log, error_behavior);
-
-        let trigger_arguments = trigger_arguments.expect("args must include trigger arguments");
-
-        assert_eq!(2, trigger_arguments.len());
-
-        let query_path = trigger_arguments
-            .into_iter()
-            .find(|v| v.0.0 == "query_path")
-            .expect("must include query_path trigger argument");
-
-        assert_eq!("/metrics?format=json", query_path.0.1);
-    }
-}
+mod tests;

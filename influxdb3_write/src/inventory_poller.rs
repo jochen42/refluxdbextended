@@ -206,7 +206,7 @@ mod tests {
     async fn tick_picks_up_new_wal_snapshots() {
         let object_store = Arc::new(InMemory::new());
         let inv = SharedInventory::new(object_store.clone());
-        let persisted = Arc::new(PersistedFiles::new());
+        let persisted = Arc::new(PersistedFiles::new(None));
         let catalog = Arc::new(
             Catalog::new_in_memory("test").await.unwrap(),
         );
@@ -251,7 +251,7 @@ mod tests {
     async fn spawn_runs_until_shutdown() {
         let object_store = Arc::new(InMemory::new());
         let inv = SharedInventory::new(object_store.clone());
-        let persisted = Arc::new(PersistedFiles::new());
+        let persisted = Arc::new(PersistedFiles::new(None));
         let catalog = Arc::new(
             Catalog::new_in_memory("test").await.unwrap(),
         );

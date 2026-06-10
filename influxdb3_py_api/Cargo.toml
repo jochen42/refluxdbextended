@@ -8,27 +8,31 @@ license.workspace = true
 [features]
 
 [dependencies]
+# core deps
+data_types = { path = "../core/data_types" }
+iox_query_params = { path = "../core/iox_query_params" }
+iox_time = { path = "../core/iox_time" }
+observability_deps = { path = "../core/observability_deps" }
+# local deps
+influxdb3_catalog = { path = "../influxdb3_catalog" }
+influxdb3_id = { path = "../influxdb3_id" }
+influxdb3_internal_api = { path = "../influxdb3_internal_api" }
+influxdb3_sys_events = { path = "../influxdb3_sys_events" }
+influxdb3_wal = { path = "../influxdb3_wal" }
+influxdb3_write = { path = "../influxdb3_write" }
+# crates.io deps
 anyhow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+futures.workspace = true
 hashbrown.workspace = true
 humantime.workspace = true
-iox_time.workspace = true
-influxdb3_id = { path = "../influxdb3_id" }
-influxdb3_wal = { path = "../influxdb3_wal" }
-influxdb3_catalog = {path = "../influxdb3_catalog"}
-influxdb3_internal_api = { path = "../influxdb3_internal_api" }
-influxdb3_sys_events = { path = "../influxdb3_sys_events" }
-iox_query_params.workspace = true
-observability_deps.workspace = true
 parking_lot.workspace = true
 pyo3.workspace = true
-futures.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-lazy_static = "1.5.0"
 
 [lints]
 workspace = true

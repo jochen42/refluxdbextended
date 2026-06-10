@@ -2,7 +2,7 @@
 /// to `v3`s `db:*:write,create[,read]` permission. There are no structural changes in the catalog
 /// log files.
 use crate::catalog::CatalogSequenceNumber;
-use crate::log::{
+use crate::log::versions::v3::{
     MaxAge, MaxCardinality, NodeMode, TriggerSettings, TriggerSpecificationDefinition,
 };
 use crate::serialize::VersionedFileType;
@@ -94,9 +94,6 @@ pub(crate) struct DatabaseActionsSnapshot(pub u16);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct CrudActionsSnapshot(pub u16);
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct SystemActionsSnapshot(pub u16);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct NodeSnapshot {
@@ -330,6 +327,8 @@ impl From<&ArrowDataType> for DataType {
                 Box::new(key_type.as_ref().into()),
                 Box::new(val_type.as_ref().into()),
             ),
+            ArrowDataType::Decimal32(_, _) => unimplemented!(),
+            ArrowDataType::Decimal64(_, _) => unimplemented!(),
             ArrowDataType::Decimal128(_, _) => unimplemented!(),
             ArrowDataType::Decimal256(_, _) => unimplemented!(),
             ArrowDataType::Map(_, _) => unimplemented!(),

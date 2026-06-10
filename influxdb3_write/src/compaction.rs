@@ -971,6 +971,7 @@ mod tests {
             Arc::clone(&store),
             "test-host",
             Arc::clone(&time_provider),
+            None,
         ));
         // We need a WriteBuffer; reuse the catalog/persister with a no-op
         // write buffer.  The test doesn't call methods that touch it.
@@ -999,9 +1000,10 @@ mod tests {
                 metric_registry: Arc::new(metric::Registry::default()),
                 snapshotted_wal_files_to_keep: 10,
                 query_file_limit: None,
-                n_snapshots_to_load_on_start: 1,
+                n_snapshots_to_load_on_start: std::num::NonZeroU64::new(1).unwrap(),
                 shutdown: ShutdownManager::new_testing().register(),
-                wal_replay_concurrency_limit: None,
+                wal_replay_concurrency_limit: 1,
+                parquet_snapshot_concurrency_limit: std::num::NonZeroUsize::new(1).unwrap(),
                 shared_inventory: None,
             }),
         )

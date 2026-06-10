@@ -18,34 +18,36 @@ workspace = true
 
 [dependencies]
 # Core Crates
-authz.workspace = true
-datafusion_util.workspace = true
-iox_query.workspace = true
-iox_time.workspace = true
-metric.workspace = true
-object_store.workspace = true
-object_store_metrics.workspace = true
-object_store_size_hinting.workspace = true
-observability_deps.workspace = true
-panic_logging.workspace = true
-parquet_file.workspace = true
-tokio_metrics_bridge.workspace = true
-trace.workspace = true
-trace_http.workspace = true
-trace_exporters.workspace = true
-trogging.workspace = true
+authz = { path = "../core/authz" }
+datafusion_util = { path = "../core/datafusion_util" }
+iox_query = { path = "../core/iox_query" }
+iox_time = { path = "../core/iox_time" }
+metric = { path = "../core/metric" }
+object_store_metrics = { path = "../core/object_store_metrics" }
+observability_deps = { path = "../core/observability_deps" }
+panic_logging = { path = "../core/panic_logging" }
+parquet_file = { path = "../core/parquet_file" }
+tokio_metrics_bridge = { path = "../core/tokio_metrics_bridge" }
+trace = { path = "../core/trace" }
+trace_exporters = { path = "../core/trace_exporters" }
+trace_http = { path = "../core/trace_http" }
+trogging = { path = "../core/trogging", features = ["clap"] }
 
 # Local Crates
 influxdb3_authz = { path = "../influxdb3_authz" }
 influxdb3_cache = { path = "../influxdb3_cache" }
 influxdb3_catalog = { path = "../influxdb3_catalog" }
-influxdb3_client = { path = "../influxdb3_client" }
 influxdb3_clap_blocks = { path = "../influxdb3_clap_blocks" }
+influxdb3_client = { path = "../influxdb3_client" }
+influxdb3_commands = { path = "../influxdb3_commands" }
 influxdb3_process = { path = "../influxdb3_process", default-features = false }
 influxdb3_processing_engine = {path = "../influxdb3_processing_engine"}
+influxdb3_query_executor = { path = "../influxdb3_query_executor" }
 influxdb3_server = { path = "../influxdb3_server" }
 influxdb3_shutdown = { path = "../influxdb3_shutdown" }
+influxdb3_startup = { path = "../influxdb3_startup" }
 influxdb3_sys_events = { path = "../influxdb3_sys_events" }
+influxdb3_system_tables = { path = "../influxdb3_system_tables" }
 influxdb3_telemetry = { path = "../influxdb3_telemetry" }
 influxdb3_types = { path = "../influxdb3_types" }
 influxdb3_wal = { path = "../influxdb3_wal" }
@@ -55,16 +57,20 @@ influxdb3_write = { path = "../influxdb3_write" }
 anyhow.workspace = true
 backtrace.workspace = true
 base64.workspace = true
+chrono.workspace = true
 clap.workspace = true
+clap_builder.workspace = true
 owo-colors.workspace = true
 dotenvy.workspace = true
 futures.workspace = true
 hashbrown.workspace = true
 hex.workspace = true
+hostname.workspace = true
 humantime.workspace = true
 itertools.workspace = true
 libc.workspace = true
 num_cpus.workspace = true
+object_store.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true
@@ -75,9 +81,11 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 uuid.workspace = true
+walkdir = "2"
 
 # Optional Dependencies
 console-subscriber = { version = "0.1.10", optional = true, features = ["parking_lot"] }
@@ -88,7 +96,9 @@ tikv-jemalloc-ctl = { version = "0.5.4", optional = true }
 tikv-jemallocator = { version = "0.5", optional = true, features = ["unprefixed_malloc_on_supported_platforms"] }
 
 [features]
-default = ["jemalloc_replacing_malloc", "azure", "gcp", "aws"]
+default = ["jemalloc_replacing_malloc", "azure", "gcp", "aws", "large-strings"]
+
+large-strings = ["influxdb3_server/large-strings", "influxdb3_write/large-strings", "influxdb3_wal/large-strings"]
 
 azure = ["influxdb3_clap_blocks/azure"] # Optional Azure Object store support
 gcp = ["influxdb3_clap_blocks/gcp"] # Optional GCP object store support
@@ -108,8 +118,9 @@ disable_custom_global_allocator = []
 
 [dev-dependencies]
 # Core Crates
-arrow_util.workspace = true
-influxdb_iox_client.workspace = true
+arrow_util = { path = "../core/arrow_util" }
+influxdb_iox_client = { path = "../core/influxdb_iox_client" }
+test_helpers = { path = "../core/test_helpers" }
 
 # Crates.io dependencies in alphabetical order:
 arrow.workspace = true
@@ -127,7 +138,6 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded.workspace = true
-test_helpers.workspace = true
 tonic.workspace = true
 tower.workspace = true
 test-log.workspace = true

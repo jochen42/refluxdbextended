@@ -7,24 +7,26 @@ license.workspace = true
 
 [dependencies]
 # Core Crates
-iox_http.workspace = true
-iox_query_params.workspace = true
+iox_http = { path = "../core/iox_http" }
+iox_query_params = { path = "../core/iox_query_params" }
 
 # Local deps
 influxdb3_authz = { path = "../influxdb3_authz" }
-influxdb3_cache = { path = "../influxdb3_cache" }
 influxdb3_catalog = { path = "../influxdb3_catalog" }
 
 # crates.io dependencies
 anyhow.workspace = true
 chrono.workspace = true
-serde.workspace = true
 hashbrown.workspace = true
 hex.workspace = true
 humantime-serde.workspace = true
 hyper.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -17,12 +17,17 @@ pub enum PluginEnvironmentError {
 
     #[error("Virtual environment error: {0}")]
     VenvError(#[from] VenvError),
+
+    #[error(
+        "Package installation has been disabled. Contact your administrator for more information."
+    )]
+    PackageInstallationDisabled,
 }
 
 pub trait PythonEnvironmentManager: Debug + Send + Sync + 'static {
     fn init_pyenv(
         &self,
-        plugin_dir: &Path,
+        plugin_dir: Option<&Path>,
         virtual_env_location: Option<&PathBuf>,
     ) -> Result<(), PluginEnvironmentError>;
     fn install_packages(&self, packages: Vec<String>) -> Result<(), PluginEnvironmentError>;
@@ -50,9 +55,10 @@ fn is_valid_venv(venv_path: &Path) -> bool {
 impl PythonEnvironmentManager for UVManager {
     fn init_pyenv(
         &self,
-        plugin_dir: &Path,
+        plugin_dir: Option<&Path>,
         virtual_env_location: Option<&PathBuf>,
     ) -> Result<(), PluginEnvironmentError> {
+        let plugin_dir = plugin_dir.expect("plugin dir is set if using uv");
         let venv_path = match virtual_env_location {
             Some(path) => path,
             None => &plugin_dir.join(".venv"),
@@ -88,9 +94,10 @@ impl PythonEnvironmentManager for UVManager {
 impl PythonEnvironmentManager for PipManager {
     fn init_pyenv(
         &self,
-        plugin_dir: &Path,
+        plugin_dir: Option<&Path>,
         virtual_env_location: Option<&PathBuf>,
     ) -> Result<(), PluginEnvironmentError> {
+        let plugin_dir = plugin_dir.expect("plugin dir is set if using pip");
         let venv_path = match virtual_env_location {
             Some(path) => path,
             None => &plugin_dir.join(".venv"),
@@ -137,10 +144,22 @@ impl PythonEnvironmentManager for PipManager {
 impl PythonEnvironmentManager for DisabledManager {
     fn init_pyenv(
         &self,
-        _plugin_dir: &Path,
+        plugin_dir: Option<&Path>,
         _virtual_env_location: Option<&PathBuf>,
     ) -> Result<(), PluginEnvironmentError> {
-        Ok(())
+        // DisabledManager means no package manager (pip/uv) is available or
+        // we do not want to turn the processing engine on.
+        //
+        // If we're trying to initialize a Python environment, we should fail
+        // only if the plugin_dir is set
+
+        if plugin_dir.is_some() {
+            Err(PluginEnvironmentError::PackageManagerNotFound(
+            "Neither pip nor uv package manager is available. Please install Python with pip or install uv".to_string()
+        ))
+        } else {
+            Ok(())
+        }
     }
 
     fn install_packages(&self, _packages: Vec<String>) -> Result<(), PluginEnvironmentError> {
@@ -152,5 +171,66 @@ impl PythonEnvironmentManager for DisabledManager {
         _requirements_path: String,
     ) -> Result<(), PluginEnvironmentError> {
         Err(PluginEnvironmentDisabled)
+    }
+}
+
+/// A package manager that disables package installation while allowing
+/// the processing engine to function normally for triggers and plugins.
+/// Used when --package-manager disabled is set.
+#[derive(Debug, Copy, Clone)]
+pub struct DisabledPackageManager;
+
+impl PythonEnvironmentManager for DisabledPackageManager {
+    fn init_pyenv(
+        &self,
+        _plugin_dir: Option<&Path>,
+        _virtual_env_location: Option<&PathBuf>,
+    ) -> Result<(), PluginEnvironmentError> {
+        // Allow normal initialization - the processing engine should still work
+        // We assume the virtual environment is already set up
+        Ok(())
+    }
+
+    fn install_packages(&self, _packages: Vec<String>) -> Result<(), PluginEnvironmentError> {
+        Err(PluginEnvironmentError::PackageInstallationDisabled)
+    }
+
+    fn install_requirements(
+        &self,
+        _requirements_path: String,
+    ) -> Result<(), PluginEnvironmentError> {
+        Err(PluginEnvironmentError::PackageInstallationDisabled)
+    }
+}
+
+/// A test-only package manager that always succeeds without doing anything.
+/// This is used for tests that need to validate plugin filenames and create triggers
+/// but don't actually need Python or package management functionality.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub struct TestManager;
+
+#[cfg(test)]
+impl PythonEnvironmentManager for TestManager {
+    fn init_pyenv(
+        &self,
+        _plugin_dir: Option<&Path>,
+        _virtual_env_location: Option<&PathBuf>,
+    ) -> Result<(), PluginEnvironmentError> {
+        // Always succeed for tests
+        Ok(())
+    }
+
+    fn install_packages(&self, _packages: Vec<String>) -> Result<(), PluginEnvironmentError> {
+        // Always succeed for tests
+        Ok(())
+    }
+
+    fn install_requirements(
+        &self,
+        _requirements_path: String,
+    ) -> Result<(), PluginEnvironmentError> {
+        // Always succeed for tests
+        Ok(())
     }
 }

@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 
-use datafusion::config::ConfigExtension;
-use iox_query::config::IoxConfigExt;
+use iox_query::config::IOX_CONFIG_PREFIX;
 
 /// Extends the standard [`HashMap`] based DataFusion config option in the CLI with specific
 /// options (along with defaults) for InfluxDB 3 Core/Enterprise. This is intended for customization of
-/// options that are defined in the `iox_query` crate, e.g., those defined in [`IoxConfigExt`]
+/// options that are defined in the `iox_query` crate, e.g., those defined in `IoxConfigExt`
 /// that are relevant to the monolithinc versions of InfluxDB 3.
 #[derive(Debug, clap::Parser, Clone)]
 pub struct IoxQueryDatafusionConfig {
@@ -75,13 +74,13 @@ impl IoxQueryDatafusionConfig {
     /// with the value provided for the `--datafusion-max-parquet-fanout` argument.
     pub fn build(mut self) -> HashMap<String, String> {
         self.datafusion_config.insert(
-            format!("{prefix}.max_parquet_fanout", prefix = IoxConfigExt::PREFIX),
+            format!("{prefix}.max_parquet_fanout", prefix = IOX_CONFIG_PREFIX),
             self.max_parquet_fanout.to_string(),
         );
         self.datafusion_config.insert(
             format!(
                 "{prefix}.use_cached_parquet_loader",
-                prefix = IoxConfigExt::PREFIX
+                prefix = IOX_CONFIG_PREFIX
             ),
             self.use_cached_parquet_loader.to_string(),
         );
@@ -91,7 +90,7 @@ impl IoxQueryDatafusionConfig {
         self.datafusion_config.insert(
             format!(
                 "{prefix}.hint_known_object_size_to_object_store",
-                prefix = IoxConfigExt::PREFIX
+                prefix = IOX_CONFIG_PREFIX
             ),
             false.to_string(),
         );
@@ -131,26 +130,4 @@ fn parse_datafusion_config(
 }
 
 #[cfg(test)]
-mod tests {
-    use clap::Parser;
-    use iox_query::{config::IoxConfigExt, exec::Executor};
-
-    use super::IoxQueryDatafusionConfig;
-
-    #[test_log::test]
-    fn max_parquet_fanout() {
-        let datafusion_config =
-            IoxQueryDatafusionConfig::parse_from(["", "--datafusion-max-parquet-fanout", "5"])
-                .build();
-        let exec = Executor::new_testing();
-        let mut session_config = exec.new_session_config();
-        for (k, v) in &datafusion_config {
-            session_config = session_config.with_config_option(k, v);
-        }
-        let ctx = session_config.build();
-        let inner_ctx = ctx.inner().state();
-        let config = inner_ctx.config();
-        let iox_config_ext = config.options().extensions.get::<IoxConfigExt>().unwrap();
-        assert_eq!(5, iox_config_ext.max_parquet_fanout);
-    }
-}
+mod tests;

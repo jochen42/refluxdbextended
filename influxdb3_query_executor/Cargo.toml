@@ -1,0 +1,65 @@
+[package]
+name = "influxdb3_query_executor"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Local crates
+influxdb3_cache = { path = "../influxdb3_cache" }
+influxdb3_catalog = { path = "../influxdb3_catalog" }
+influxdb3_id = { path = "../influxdb3_id" }
+influxdb3_internal_api = { path = "../influxdb3_internal_api" }
+influxdb3_processing_engine = { path = "../influxdb3_processing_engine" }
+influxdb3_sys_events = { path = "../influxdb3_sys_events" }
+influxdb3_system_tables = { path = "../influxdb3_system_tables" }
+influxdb3_telemetry = { path = "../influxdb3_telemetry" }
+influxdb3_write = { path = "../influxdb3_write" }
+
+# Core crates
+datafusion_util = { path = "../core/datafusion_util" }
+data_types = { path = "../core/data_types" }
+influxdb_influxql_parser = { path = "../core/influxdb_influxql_parser" }
+iox_query = { path = "../core/iox_query" }
+iox_query_influxql = { path = "../core/iox_query_influxql" }
+iox_query_params = { path = "../core/iox_query_params" }
+iox_time = { path = "../core/iox_time" }
+metric = { path = "../core/metric" }
+observability_deps = { path = "../core/observability_deps" }
+schema = { path = "../core/schema" }
+trace = { path = "../core/trace" }
+trace_http = { path = "../core/trace_http" }
+tracker = { path = "../core/tracker" }
+
+# Crates.io crates
+anyhow.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+itertools.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# core deps
+iox_query_influxql_rewrite = { path = "../core/iox_query_influxql_rewrite" }
+parquet_file = { path = "../core/parquet_file" }
+test_helpers = { path = "../core/test_helpers" }
+# local deps
+influxdb3_authz = { path = "../influxdb3_authz" }
+influxdb3_shutdown = { path = "../influxdb3_shutdown" }
+influxdb3_types = { path = "../influxdb3_types"}
+influxdb3_wal = { path = "../influxdb3_wal"}
+# crates.io deps
+insta.workspace = true
+object_store.workspace = true
+pretty_assertions.workspace = true
+rstest.workspace = true
+test-log.workspace = true
+
+[lints]
+workspace = true

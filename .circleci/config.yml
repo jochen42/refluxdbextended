@@ -91,10 +91,13 @@ any_filter: &any_filter
 # will generate snapshat versions. For easier maintenance, this regex is more
 # open than ci-support/ci-packager-next (which enforces a number of
 # constraints). See .circleci/packages/config.yaml for details.
+release_tag_filter: &release_tag_filter
+  tags:
+    only: /^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+(\.(alpha|beta|rc)\.[0-9]+(\.[0-9]+)?)?)?$/
+
 release_filter: &release_filter
   filters:
-    tags:
-      only: /^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+(\.(alpha|beta|rc)\.[0-9]+(\.[0-9]+)?)?)?$/
+    <<: *release_tag_filter
     branches:
       ignore: /.*/
 
@@ -110,6 +113,7 @@ nofork_filter: &nofork_filter
 
 docker_filter: &docker_filter
   filters:
+    <<: *release_tag_filter
     branches:
       only:
         - main
@@ -121,17 +125,31 @@ docker_filter: &docker_filter
 # 2. Click "Trigger Pipeline" in the top-right
 # 3. Adjust the "persist_debug" boolean parameter to true
 # 4. Click "Run Pipeline"
+#
+# You can conditionally persist tarballs and packages for your PR (so they show
+# up in the 'Artifacts' tab of the build-for-prs (tarballs) and
+# build-linux-packages-for-prs (packages) jobs) by:
+# 1. Go to https://app.circleci.com/pipelines/github/influxdata/influxdb?branch=<branch-name> (<- change this!)
+# 2. Click "Trigger Pipeline" in the top-right
+# 3. Adjust the "build_and_persist_packages" boolean parameter to true
+# 4. Click "Run Pipeline"
 parameters:
   persist_debug:
     type: boolean
     default: false
+  build_and_persist_packages:
+    type: boolean
+    default: false
+  pr_build_profile:
+    type: string
+    default: "quick-release"
   # Consistent environment setup for Python Build Standalone
   PBS_DATE:
     type: string
-    default: "20250612"
+    default: "20260211"
   PBS_VERSION:
     type: string
-    default: "3.13.5"
+    default: "3.13.12"
 
 # Consistent Cargo environment configuration
 cargo_env: &cargo_env
@@ -231,7 +249,7 @@ jobs:
 
   inclusivity:
     docker:
-      - image: cimg/go:1.23
+      - image: cimg/go:1.25
     steps:
       - checkout
       - run:
@@ -314,19 +332,25 @@ jobs:
       - checkout
       - restore_cache:
           name: Restore Python Build Standalone from cache
-          key: python-artifacts-<< pipeline.parameters.PBS_DATE >>-<< pipeline.parameters.PBS_VERSION >>
+          key: python-artifacts-<< pipeline.parameters.PBS_VERSION >>-<< pipeline.parameters.PBS_DATE >>
       - run:
           name: Pull Python Build Standalone
           command: |
-            if [ -d "python-artifacts" ]; then
+            cache_path="/tmp/python-artifacts/${PBS_VERSION}-${PBS_DATE}"
+            if [ -d ${cache_path} ]; then
               echo "Using cached python-artifacts"
+              mkdir -p python-artifacts
+              flock ${cache_path} cp ${cache_path}/* ./python-artifacts/
             else
               echo "PBS_DATE=$PBS_DATE"
               .circleci/scripts/fetch-python-standalone.bash \
                 "python-artifacts" \
                 "$PBS_DATE" \
                 "$PBS_VERSION"
+              mkdir -p ${cache_path}
+              flock ${cache_path} cp ./python-artifacts/* ${cache_path}/
             fi
+            chown -R circleci:circleci ./python-artifacts
       - store_artifacts:
           path: python-artifacts
       - persist_to_workspace:
@@ -335,9 +359,9 @@ jobs:
             - python-artifacts
       - save_cache:
           name: Save python-build-standalone to cache
-          key: python-artifacts-<< pipeline.parameters.PBS_DATE >>-<< pipeline.parameters.PBS_VERSION >>
+          key: python-artifacts-<< pipeline.parameters.PBS_VERSION >>-<< pipeline.parameters.PBS_DATE >>
           paths:
-            - python-artifacts
+            - /tmp/python-artifacts/<< pipeline.parameters.PBS_VERSION >>-<< pipeline.parameters.PBS_DATE >>
 
   # Build a dev binary with the default cargo profile
   build-dev:
@@ -399,7 +423,7 @@ jobs:
             - run:
                 name: Check extra features (like prod image)
                 command: |
-                  target-env cargo check --target=<< parameters.target >> --no-default-features --features="aws,gcp,azure,jemalloc_replacing_malloc,tokio_console"
+                  target-env cargo check --target=<< parameters.target >> --no-default-features --features="aws,gcp,azure,jemalloc_replacing_malloc,tokio_console,large-strings"
       - when:
           condition:
             equal: [ << parameters.target >>, x86_64-pc-windows-gnu ]
@@ -407,7 +431,7 @@ jobs:
             - run:
                 name: Check extra features (like prod image)
                 command: |
-                  target-env cargo check --target=<< parameters.target >> --no-default-features --features="aws,gcp,azure,jemalloc_replacing_malloc,tokio_console"
+                  target-env cargo check --target=<< parameters.target >> --no-default-features --features="aws,gcp,azure,jemalloc_replacing_malloc,tokio_console,large-strings"
 
   # Compile cargo "release" profile binaries for influxdb3 edge releases
   build-release:
@@ -457,11 +481,10 @@ jobs:
           steps:
             - run:
                 # XXX: better to use 'cargo:rustc-link-arg=-Wl,-rpath,@executable_path/python/lib'
-                name: adjust LC_LOAD_DYLIB path for darwin
+                name: adjust LC_RPATH path for darwin
                 command: |
-                  export PBS_LIBPYTHON=$(grep '^lib_name=' /tmp/workspace/python-artifacts/<< parameters.target >>/pyo3_config_file.txt | cut -d = -f 2)
-                  echo "Running: /osxcross/bin/aarch64-apple-darwin22.2-install_name_tool -change '/install/lib/lib${PBS_LIBPYTHON}.dylib' '@executable_path/python/lib/lib${PBS_LIBPYTHON}.dylib' '${PWD}/target/<< parameters.target >>/<< parameters.profile >>/influxdb3'"
-                  /osxcross/bin/aarch64-apple-darwin22.2-install_name_tool -change "/install/lib/lib${PBS_LIBPYTHON}.dylib" "@executable_path/python/lib/lib${PBS_LIBPYTHON}.dylib" "${PWD}/target/<< parameters.target >>/<< parameters.profile >>/influxdb3"
+                  echo "Running: /osxcross/bin/aarch64-apple-darwin22.2-install_name_tool -add_rpath '@executable_path/python/lib' '${PWD}/target/<< parameters.target >>/<< parameters.profile >>/influxdb3'"
+                  /osxcross/bin/aarch64-apple-darwin22.2-install_name_tool -add_rpath '@executable_path/python/lib' "${PWD}/target/<< parameters.target >>/<< parameters.profile >>/influxdb3"
                   # re-sign after install_name_tool since osxcross won't do it
                   echo "Running: /usr/local/bin/rcodesign sign '${PWD}/target/<< parameters.target >>/<< parameters.profile >>/influxdb3'"
                   /usr/local/bin/rcodesign sign "${PWD}/target/<< parameters.target >>/<< parameters.profile >>/influxdb3"
@@ -506,7 +529,7 @@ jobs:
 
   build-packages:
     docker:
-      - image: us-east1-docker.pkg.dev/influxdata-team-edge/ci-support/ci-packager-next@sha256:8223348466129205be30413c597e573114949be4190e66e45eb3e2ff8af4cc25
+      - image: us-east1-docker.pkg.dev/influxdata-team-edge/ci-support/ci-packager-next@sha256:5b461463f21a3647a7260ad5b0d8398e657106f1cfa44eb8f21e95257a14eb7f
         auth:
           username: _json_key
           password: $CISUPPORT_GCS_AUTHORIZATION
@@ -660,7 +683,7 @@ jobs:
       - run:
           name: "Set Cargo profile based on branch"
           command: |
-            if [ "$CIRCLE_BRANCH" = "main" ]; then
+            if [ "$CIRCLE_BRANCH" = "main" ] || [ -z "${CIRCLE_TAG+x}" ]; then
               echo "export DOCKER_PROFILE=release" >> "$BASH_ENV"
             else
               echo "export DOCKER_PROFILE=quick-release" >> "$BASH_ENV"
@@ -670,7 +693,7 @@ jobs:
           command: |
             .circleci/scripts/docker_build_release.bash \
               "influxdb3" \
-              "aws,gcp,azure,jemalloc_replacing_malloc,tokio_console" \
+              "aws,gcp,azure,jemalloc_replacing_malloc,tokio_console,large-strings" \
               "<< parameters.image_name >>:latest-<< parameters.platform >>" \
               "$PBS_DATE" \
               "$PBS_VERSION" \
@@ -681,9 +704,10 @@ jobs:
       - attach_workspace:
           at: /tmp/workspace/<< pipeline.id >>
       - run: |
-          docker save << parameters.image_name >>:latest-<< parameters.platform >> > /tmp/workspace/<< pipeline.id >>/<< parameters.image_name >>-<< parameters.platform >>.tar
+          mkdir -p /tmp/docker/<< pipeline.id >>
+          docker save << parameters.image_name >>:latest-<< parameters.platform >> > /tmp/docker/<< pipeline.id >>/<< parameters.image_name >>-<< parameters.platform >>.tar
       - persist_to_workspace:
-          root: /tmp/workspace/<< pipeline.id >>
+          root: /tmp/docker/<< pipeline.id >>
           paths:
             - << parameters.image_name >>-<< parameters.platform >>.tar
 
@@ -713,6 +737,27 @@ jobs:
     steps:
       - run: |
           echo build executed successfully
+
+  test-launcher:
+    executor: self-hosted-amd
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp/workspace/<< pipeline.id >>
+      - run:
+          name: Extract python for launcher tests
+          command: |
+            tar -C /tmp/workspace/$CIRCLE_PIPELINE_ID/python-artifacts -zxvf /tmp/workspace/$CIRCLE_PIPELINE_ID/python-artifacts/all.tar.gz ./x86_64-unknown-linux-gnu
+      - run:
+          name: Test influxdb3-launcher
+          command: |
+            /tmp/workspace/$CIRCLE_PIPELINE_ID/python-artifacts/x86_64-unknown-linux-gnu/python/bin/python3 \
+              .circleci/packages/test_influxdb3-launcher.py \
+              .circleci/packages/influxdb3/fs/usr/lib/influxdb3/influxdb3-launcher
+      - run:
+          name: Cleanup extracted python for launcher tests
+          command: rm -rf /tmp/workspace/$CIRCLE_PIPELINE_ID/python-artifacts/x86_64-unknown-linux-gnu
+          when: always
 
 workflows:
   version: 2
@@ -780,6 +825,10 @@ workflows:
                 - aarch64-unknown-linux-gnu
                 - x86_64-pc-windows-gnu
                 - x86_64-unknown-linux-gnu
+          requires:
+            - fetch-python
+      - test-launcher:
+          <<: *nofork_filter
           requires:
             - fetch-python
       - doc:
@@ -857,3 +906,80 @@ workflows:
           requires:
             - build-docker-amd64
             - build-docker-arm64
+
+  # Conditional package building for PRs (when build_and_persist_packages parameter is true)
+  ci-build-packages-for-prs:
+    when: << pipeline.parameters.build_and_persist_packages >>
+    jobs:
+      - fetch-python:
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              ignore: /.*/
+      - build-release:
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              ignore: /.*/
+          name: build-for-prs-<< matrix.target >>
+          matrix:
+            parameters:
+              profile:
+                - << pipeline.parameters.pr_build_profile >>
+              target:
+                - aarch64-apple-darwin
+                - aarch64-unknown-linux-gnu
+                - x86_64-pc-windows-gnu
+                - x86_64-unknown-linux-gnu
+          requires:
+            - fetch-python
+      - build-packages:
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              ignore: /.*/
+          name: build-linux-packages-for-prs
+          requires:
+            - build-for-prs-aarch64-apple-darwin
+            - build-for-prs-aarch64-unknown-linux-gnu
+            - build-for-prs-x86_64-pc-windows-gnu
+            - build-for-prs-x86_64-unknown-linux-gnu
+      - check_package_deb_amd64:
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              ignore: /.*/
+          name: check-linux-packages-for-prs-deb-amd64
+          requires:
+            - build-linux-packages-for-prs
+      - check_package_deb_arm64:
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              ignore: /.*/
+          name: check-linux-packages-for-prs-deb-arm64
+          requires:
+            - build-linux-packages-for-prs
+      - check_package_rpm_amd64:
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              ignore: /.*/
+          name: check-linux-packages-for-prs-rpm-amd64
+          requires:
+            - build-linux-packages-for-prs
+      - check_package_rpm_arm64:
+          filters:
+            branches:
+              only: /.*/
+            tags:
+              ignore: /.*/
+          name: check-linux-packages-for-prs-rpm-arm64
+          requires:
+            - build-linux-packages-for-prs

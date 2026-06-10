@@ -7,20 +7,24 @@ use iox_time::{SystemProvider, TimeProvider};
 use non_empty_string::NonEmptyString;
 use object_store::{
     CredentialProvider, DynObjectStore, GetOptions, GetResult, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     aws::AwsCredential,
     local::LocalFileSystem,
     memory::InMemory,
     path::Path,
     throttle::{ThrottleConfig, ThrottledStore},
 };
-use observability_deps::tracing::{info, warn};
+use observability_deps::tracing::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
+use std::ffi::OsString;
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+use std::io::Read;
 use std::{
     cmp::Ordering, convert::Infallible, fs, num::NonZeroUsize, ops::Range, path::PathBuf,
     sync::Arc, time::Duration,
 };
+use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -40,7 +44,7 @@ pub enum ParseError {
     },
 
     #[snafu(display(
-        "Specified {:?} for the object store, required configuration missing for {}",
+        "Specified '{:?}' for the object store; required configuration missing for {}",
         object_store,
         missing
     ))]
@@ -66,16 +70,36 @@ pub enum ParseError {
 
     #[snafu(display("Error deserializing AWS file credentials: {}", source))]
     DeserializingAwsFileCredentials { source: serde_json::Error },
+
+    #[snafu(display("Failed to read CA certificate file at {path:?}: {source}"))]
+    ReadingCaCertificateFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to parse CA certificate from {path:?}: {source}"))]
+    ParsingCaCertificate {
+        path: PathBuf,
+        source: object_store::Error,
+    },
 }
 
 /// The AWS region to use for Amazon S3 based object storage if none is
 /// specified.
 pub const FALLBACK_AWS_REGION: &str = "us-east-1";
+pub const DEFAULT_DATA_DIRECTORY_NAME: &str = ".influxdb";
 
 /// A `clap` `value_parser` which returns `None` when given an empty string and
 /// `Some(NonEmptyString)` otherwise.
 fn parse_optional_string(s: &str) -> Result<Option<NonEmptyString>, Infallible> {
     Ok(NonEmptyString::new(s.to_string()).ok())
+}
+
+fn default_data_dir() -> OsString {
+    home::home_dir()
+        .expect("Could not find user's home directory")
+        .join(DEFAULT_DATA_DIRECTORY_NAME)
+        .into_os_string()
 }
 
 /// Endpoint for S3 & Co.
@@ -161,7 +185,7 @@ impl ObjectStore for LocalFileSystemWithSortedListOp {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -178,14 +202,14 @@ impl ObjectStore for LocalFileSystemWithSortedListOp {
         self.inner.get_opts(location, options).await
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> object_store::Result<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> object_store::Result<Bytes> {
         self.inner.get_range(location, range).await
     }
 
     async fn get_ranges(
         &self,
         location: &Path,
-        ranges: &[Range<usize>],
+        ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
         self.inner.get_ranges(location, ranges).await
     }
@@ -207,7 +231,7 @@ impl ObjectStore for LocalFileSystemWithSortedListOp {
 
     /// Collect results from inner object store into a vec, sort them, then return a new boxed
     /// stream that iterates over the new vec.
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         if tokio::runtime::Handle::try_current().is_err() {
             // We should never reach this branch, but if we do then warn and return let the
             // inner implementation deal with it.
@@ -215,11 +239,13 @@ impl ObjectStore for LocalFileSystemWithSortedListOp {
             return self.inner.list(prefix);
         }
 
-        let mut items: Vec<Result<ObjectMeta, _>> = futures::executor::block_on(async {
-            // we could use TryStreamExt.collect() here to drop all collected results and
-            // return the first error we encounter, but users of the ObjectStore API will
-            // probably expect to have to deal with errors one element at a time anyway
-            self.inner.list(prefix).collect().await
+        let mut items: Vec<Result<ObjectMeta, _>> = tokio::task::block_in_place(|| {
+            Handle::current().block_on(async move {
+                // we could use TryStreamExt.collect() here to drop all collected results and
+                // return the first error we encounter, but users of the ObjectStore API will
+                // probably expect to have to deal with errors one element at a time anyway
+                self.inner.list(prefix).collect().await
+            })
         });
 
         items.sort_unstable_by(|left, right| match (left, right) {
@@ -239,7 +265,7 @@ impl ObjectStore for LocalFileSystemWithSortedListOp {
         &self,
         prefix: Option<&Path>,
         offset: &Path,
-    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         if tokio::runtime::Handle::try_current().is_err() {
             // We should never reach this branch, but if we do then warn and return let the
             // inner implementation deal with it.
@@ -247,11 +273,13 @@ impl ObjectStore for LocalFileSystemWithSortedListOp {
             return self.inner.list_with_offset(prefix, offset);
         }
 
-        let mut items: Vec<Result<ObjectMeta, _>> = futures::executor::block_on(async {
-            // we could use TryStreamExt.collect() here to drop all collected results and
-            // return the first error we encounter, but users of the ObjectStore API will
-            // probably expect to have to deal with errors one element at a time anyway
-            self.inner.list_with_offset(prefix, offset).collect().await
+        let mut items: Vec<Result<ObjectMeta, _>> = tokio::task::block_in_place(|| {
+            Handle::current().block_on(async move {
+                // we could use TryStreamExt.collect() here to drop all collected results and
+                // return the first error we encounter, but users of the ObjectStore API will
+                // probably expect to have to deal with errors one element at a time anyway
+                self.inner.list_with_offset(prefix, offset).collect().await
+            })
         });
 
         items.sort_unstable_by(|left, right| match (left, right) {
@@ -364,7 +392,7 @@ macro_rules! object_store_config_inner {
                     env = gen_env!($prefix, "INFLUXDB3_OBJECT_STORE"),
                     ignore_case = true,
                     action,
-                    required = true,
+                    default_value = "file",
                     verbatim_doc_comment
                 )]
                 pub object_store: ObjectStoreType,
@@ -398,6 +426,9 @@ macro_rules! object_store_config_inner {
                     env = gen_env!($prefix, "INFLUXDB3_DB_DIR"),
                     action
                 )]
+                // default_value_if makes the default value conditional on the object-store type being "file"
+                #[arg(default_value_if(gen_name!($prefix, "object-store"),
+                clap_builder::builder::ArgPredicate::Equals("file".into()), default_data_dir()))]
                 pub database_directory: Option<PathBuf>,
 
                 /// When using Amazon S3 as the object store, set this to an access key that
@@ -418,6 +449,7 @@ macro_rules! object_store_config_inner {
                     env = gen_env!($prefix, "AWS_ACCESS_KEY_ID"),
                     value_parser = parse_optional_string,
                     default_value = "",
+                    hide_env_values = true,
                     action
                 )]
                 pub aws_access_key_id: std::option::Option<NonEmptyString>,
@@ -439,6 +471,7 @@ macro_rules! object_store_config_inner {
                     env = gen_env!($prefix, "AWS_SECRET_ACCESS_KEY"),
                     value_parser = parse_optional_string,
                     default_value = "",
+                    hide_env_values = true,
                     action
                 )]
                 pub aws_secret_access_key: std::option::Option<NonEmptyString>,
@@ -485,6 +518,7 @@ macro_rules! object_store_config_inner {
                     id = gen_name!($prefix, "aws-session-token"),
                     long = gen_name!($prefix, "aws-session-token"),
                     env = gen_env!($prefix, "AWS_SESSION_TOKEN"),
+                    hide_env_values = true,
                     action
                 )]
                 pub aws_session_token: Option<String>,
@@ -514,7 +548,7 @@ macro_rules! object_store_config_inner {
                 /// `--aws-secret-access-key`,  and `--aws-session-token`. This is a file path
                 /// argument where the format of the file is as follows:
                 ///
-                /// ```
+                /// ```ignore
                 /// {
                 ///     "aws_access_key_id": "<key>",
                 ///     "aws_secret_access_key": "<secret>",
@@ -528,7 +562,7 @@ macro_rules! object_store_config_inner {
                 #[clap(
                     id = gen_name!($prefix, "aws-credentials-file"),
                     long = gen_name!($prefix, "aws-credentials-file"),
-                    env = gen_name!($prefix, "AWS_CREDENTIALS_FILE"),
+                    env = gen_env!($prefix, "AWS_CREDENTIALS_FILE"),
                     action
                 )]
                 pub aws_credentials_file: Option<String>,
@@ -541,6 +575,7 @@ macro_rules! object_store_config_inner {
                     id = gen_name!($prefix, "google-service-account"),
                     long = gen_name!($prefix, "google-service-account"),
                     env = gen_env!($prefix, "GOOGLE_SERVICE_ACCOUNT"),
+                    hide_env_values = true,
                     action
                 )]
                 pub google_service_account: Option<String>,
@@ -570,16 +605,45 @@ macro_rules! object_store_config_inner {
                     id = gen_name!($prefix, "azure-storage-access-key"),
                     long = gen_name!($prefix, "azure-storage-access-key"),
                     env = gen_env!($prefix, "AZURE_STORAGE_ACCESS_KEY"),
+                    hide_env_values = true,
                     action
                 )]
                 pub azure_storage_access_key: Option<String>,
 
-                /// When using a network-based object store, limit the number of connection to this value.
+                /// When using Microsoft Azure blob storage, you can set a custom endpoint.
+                ///
+                /// Useful for local development with Azure storage emulators like Azurite.
+                ///
+                /// Must also set `--object-store=azure`, `--bucket`, `--azure-storage-account`,
+                /// and `--azure-storage-access-key`.
+                #[clap(
+                    id = gen_name!($prefix, "azure-endpoint"),
+                    long = gen_name!($prefix, "azure-endpoint"),
+                    env = gen_env!($prefix, "AZURE_ENDPOINT"),
+                    action
+                )]
+                pub azure_endpoint: Option<Endpoint>,
+
+                /// Allow unencrypted HTTP connection to Azure.
+                #[clap(
+                    id = gen_name!($prefix, "azure-allow-http"),
+                    long = gen_name!($prefix, "azure-allow-http"),
+                    env = gen_env!($prefix, "AZURE_ALLOW_HTTP"),
+                    action
+                )]
+                pub azure_allow_http: bool,
+
+                /// When using a network-based object store, limit the number of concurrent
+                /// object store operations to this value.
+                ///
+                /// This is a semaphore shared by all subsystems. Setting this too
+                /// low can cause performance degradation due to contention between
+                /// unrelated operations.
                 #[clap(
                     id = gen_name!($prefix, "object-store-connection-limit"),
                     long = gen_name!($prefix, "object-store-connection-limit"),
-                    env = gen_env!($prefix, "OBJECT_STORE_CONNECTION_LIMIT"),
-                    default_value = "16",
+                    env = gen_env!($prefix, "INFLUXDB3_OBJECT_STORE_CONNECTION_LIMIT"),
+                    default_value = "64",
                     action
                 )]
                 pub object_store_connection_limit: NonZeroUsize,
@@ -590,7 +654,7 @@ macro_rules! object_store_config_inner {
                 #[clap(
                     id = gen_name!($prefix, "object-store-http2-only"),
                     long = gen_name!($prefix, "object-store-http2-only"),
-                    env = gen_env!($prefix, "OBJECT_STORE_HTTP2_ONLY"),
+                    env = gen_env!($prefix, "INFLUXDB3_OBJECT_STORE_HTTP2_ONLY"),
                     action
                 )]
                 pub http2_only: bool,
@@ -605,10 +669,21 @@ macro_rules! object_store_config_inner {
                 #[clap(
                     id = gen_name!($prefix, "object-store-http2-max-frame-size"),
                     long = gen_name!($prefix, "object-store-http2-max-frame-size"),
-                    env = gen_env!($prefix, "OBJECT_STORE_HTTP2_MAX_FRAME_SIZE"),
+                    env = gen_env!($prefix, "INFLUXDB3_OBJECT_STORE_HTTP2_MAX_FRAME_SIZE"),
                     action
                 )]
                 pub http2_max_frame_size: Option<u32>,
+
+                /// Set HTTP request timeout for object store.
+                #[clap(
+                    id = gen_name!($prefix, "object-store-request-timeout"),
+                    long = gen_name!($prefix, "object-store-request-timeout"),
+                    env = gen_env!($prefix, "INFLUXDB3_OBJECT_STORE_REQUEST_TIMEOUT"),
+                    value_parser = humantime::parse_duration,
+                    default_value = "30s",
+                    action
+                )]
+                pub request_timeout: Duration,
 
                 /// The maximum number of times to retry a request
                 ///
@@ -616,7 +691,7 @@ macro_rules! object_store_config_inner {
                 #[clap(
                     id = gen_name!($prefix, "object-store-max-retries"),
                     long = gen_name!($prefix, "object-store-max-retries"),
-                    env = gen_env!($prefix, "OBJECT_STORE_MAX_RETRIES"),
+                    env = gen_env!($prefix, "INFLUXDB3_OBJECT_STORE_MAX_RETRIES"),
                     action
                 )]
                 pub max_retries: Option<usize>,
@@ -635,7 +710,7 @@ macro_rules! object_store_config_inner {
                 #[clap(
                     id = gen_name!($prefix, "object-store-retry-timeout"),
                     long = gen_name!($prefix, "object-store-retry-timeout"),
-                    env = gen_env!($prefix, "OBJECT_STORE_RETRY_TIMEOUT"),
+                    env = gen_env!($prefix, "INFLUXDB3_OBJECT_STORE_RETRY_TIMEOUT"),
                     value_parser = humantime::parse_duration,
                     action
                 )]
@@ -646,10 +721,30 @@ macro_rules! object_store_config_inner {
                 #[clap(
                     id = gen_name!($prefix, "object-store-cache-endpoint"),
                     long = gen_name!($prefix, "object-store-cache-endpoint"),
-                    env = gen_env!($prefix, "OBJECT_STORE_CACHE_ENDPOINT"),
+                    env = gen_env!($prefix, "INFLUXDB3_OBJECT_STORE_CACHE_ENDPOINT"),
                     action
                 )]
                 pub cache_endpoint: Option<Endpoint>,
+
+                /// Allow invalid TLS certificates when connecting to object storage.
+                /// WARNING: This disables TLS certificate verification and should only be used for testing.
+                #[clap(
+                    id = gen_name!($prefix, "object-store-tls-allow-insecure"),
+                    long = gen_name!($prefix, "object-store-tls-allow-insecure"),
+                    env = gen_env!($prefix, "INFLUXDB3_OBJECT_STORE_TLS_ALLOW_INSECURE"),
+                    action
+                )]
+                pub tls_allow_insecure: bool,
+
+                /// Path to a custom CA certificate file (PEM format) for verifying object store connections.
+                /// Use this when your object store uses a certificate signed by a private CA.
+                #[clap(
+                    id = gen_name!($prefix, "object-store-tls-ca"),
+                    long = gen_name!($prefix, "object-store-tls-ca"),
+                    env = gen_env!($prefix, "INFLUXDB3_OBJECT_STORE_TLS_CA"),
+                    action
+                )]
+                pub tls_ca_path: Option<PathBuf>,
             }
 
             impl [<$prefix:camel ObjectStoreConfig>] {
@@ -678,22 +773,29 @@ macro_rules! object_store_config_inner {
                         aws_credentials_file: Default::default(),
                         azure_storage_access_key: Default::default(),
                         azure_storage_account: Default::default(),
+                        azure_endpoint: Default::default(),
+                        azure_allow_http: Default::default(),
                         bucket: Default::default(),
                         database_directory,
                         google_service_account: Default::default(),
                         object_store,
-                        object_store_connection_limit: NonZeroUsize::new(16).unwrap(),
+                        object_store_connection_limit: NonZeroUsize::new(64).unwrap(),
+                        request_timeout: Duration::from_secs(30),
                         http2_only: Default::default(),
                         http2_max_frame_size: Default::default(),
                         max_retries: Default::default(),
                         retry_timeout: Default::default(),
                         cache_endpoint: Default::default(),
+                        tls_allow_insecure: Default::default(),
+                        tls_ca_path: Default::default(),
                     }
                 }
 
                 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-                fn client_options(&self) -> object_store::ClientOptions {
+                fn client_options(&self) -> Result<object_store::ClientOptions, ParseError> {
                     let mut options = object_store::ClientOptions::new();
+
+                    options = options.with_timeout(self.request_timeout);
 
                     if self.http2_only {
                         options = options.with_http2_only();
@@ -702,17 +804,41 @@ macro_rules! object_store_config_inner {
                         options = options.with_http2_max_frame_size(sz);
                     }
 
-                    options
+                    // Apply TLS configuration
+                    if self.tls_allow_insecure {
+                        warn!("TLS certificate verification is disabled for object store connections. This is insecure and should only be used for testing.");
+                        options = options.with_allow_invalid_certificates(true);
+                    }
+
+                    if let Some(ca_path) = &self.tls_ca_path {
+                        info!("Using custom CA certificate from {ca_path:?} for object store connections");
+                        let mut ca_contents = Vec::new();
+                        fs::File::open(ca_path)
+                            .context(ReadingCaCertificateFileSnafu { path: ca_path.clone() })?
+                            .read_to_end(&mut ca_contents)
+                            .context(ReadingCaCertificateFileSnafu { path: ca_path.clone() })?;
+
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            let cert = object_store::Certificate::from_pem(&ca_contents)
+                                .context(ParsingCaCertificateSnafu { path: ca_path.clone() })?;
+                            options = options.with_root_certificate(cert);
+                        }
+                    }
+
+                    Ok(options)
                 }
 
                 #[cfg(feature = "gcp")]
-                fn new_gcs(&self) -> Result<Arc<DynObjectStore>, ParseError> {
+                fn new_gcs(
+                    &self,
+                    semaphore_metrics: &Arc<tracker::AsyncSemaphoreMetrics>,
+                ) -> Result<object_store_limit::LimitObjectStore, ParseError> {
                     use object_store::gcp::GoogleCloudStorageBuilder;
-                    use object_store::limit::LimitStore;
 
                     info!(bucket=?self.bucket, object_store_type="GCS", "Object Store");
 
-                    let mut builder = GoogleCloudStorageBuilder::new().with_client_options(self.client_options()).with_retry(self.retry_config());
+                    let mut builder = GoogleCloudStorageBuilder::new().with_client_options(self.client_options()?).with_retry(self.retry_config());
 
                     if let Some(bucket) = &self.bucket {
                         builder = builder.with_bucket_name(bucket);
@@ -721,21 +847,26 @@ macro_rules! object_store_config_inner {
                         builder = builder.with_service_account_path(account);
                     }
 
-                    Ok(Arc::new(LimitStore::new(
-                        builder.build().context(InvalidGCSConfigSnafu)?,
+                    Ok(object_store_limit::LimitObjectStore::new(
+                        Arc::new(builder.build().context(InvalidGCSConfigSnafu)?),
                         self.object_store_connection_limit.get(),
-                    )))
+                        semaphore_metrics,
+                    ))
                 }
 
                 #[cfg(not(feature = "gcp"))]
-                fn new_gcs(&self) -> Result<Arc<DynObjectStore>, ParseError> {
+                fn new_gcs(
+                    &self,
+                    _semaphore_metrics: &Arc<tracker::AsyncSemaphoreMetrics>,
+                ) -> Result<object_store_limit::LimitObjectStore, ParseError> {
                     panic!("GCS support not enabled, recompile with the gcp feature enabled")
                 }
 
                 #[cfg(feature = "aws")]
-                fn new_s3(&self) -> Result<Arc<DynObjectStore>, ParseError> {
-                    use object_store::limit::LimitStore;
-
+                fn new_s3(
+                    &self,
+                    semaphore_metrics: &Arc<tracker::AsyncSemaphoreMetrics>,
+                ) -> Result<object_store_limit::LimitObjectStore, ParseError> {
                     info!(
                         bucket=?self.bucket,
                         endpoint=?self.aws_endpoint,
@@ -743,10 +874,11 @@ macro_rules! object_store_config_inner {
                         "Object Store"
                     );
 
-                    Ok(Arc::new(LimitStore::new(
-                        self.build_s3()?,
+                    Ok(object_store_limit::LimitObjectStore::new(
+                        Arc::new(self.build_s3()?),
                         self.object_store_connection_limit.get(),
-                    )))
+                        semaphore_metrics,
+                    ))
                 }
 
                 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -773,7 +905,7 @@ macro_rules! object_store_config_inner {
                     use object_store::aws::S3ConditionalPut;
 
                     let mut builder = AmazonS3Builder::from_env()
-                        .with_client_options(self.client_options())
+                        .with_client_options(self.client_options()?)
                         .with_allow_http(self.aws_allow_http)
                         .with_region(&self.aws_default_region)
                         .with_retry(self.retry_config())
@@ -833,38 +965,53 @@ macro_rules! object_store_config_inner {
                 }
 
                 #[cfg(not(feature = "aws"))]
-                fn new_s3(&self) -> Result<Arc<DynObjectStore>, ParseError> {
+                fn new_s3(
+                    &self,
+                    _semaphore_metrics: &Arc<tracker::AsyncSemaphoreMetrics>,
+                ) -> Result<object_store_limit::LimitObjectStore, ParseError> {
                     panic!("S3 support not enabled, recompile with the aws feature enabled")
                 }
 
                 #[cfg(feature = "azure")]
-                fn new_azure(&self) -> Result<Arc<DynObjectStore>, ParseError> {
+                fn new_azure(
+                    &self,
+                    semaphore_metrics: &Arc<tracker::AsyncSemaphoreMetrics>,
+                ) -> Result<object_store_limit::LimitObjectStore, ParseError> {
                     use object_store::azure::MicrosoftAzureBuilder;
-                    use object_store::limit::LimitStore;
 
                     info!(bucket=?self.bucket, account=?self.azure_storage_account,
-                          object_store_type="Azure", "Object Store");
+                          endpoint=?self.azure_endpoint, object_store_type="Azure", "Object Store");
 
-                    let mut builder = MicrosoftAzureBuilder::new().with_client_options(self.client_options());
+                    let mut builder = MicrosoftAzureBuilder::new().with_client_options(self.client_options()?);
 
                     if let Some(bucket) = &self.bucket {
                         builder = builder.with_container_name(bucket);
                     }
                     if let Some(account) = &self.azure_storage_account {
-                        builder = builder.with_account(account)
+                        builder = builder.with_account(account);
                     }
                     if let Some(key) = &self.azure_storage_access_key {
-                        builder = builder.with_access_key(key)
+                        builder = builder.with_access_key(key);
                     }
 
-                    Ok(Arc::new(LimitStore::new(
-                        builder.build().context(InvalidAzureConfigSnafu)?,
+                    builder = builder.with_allow_http(self.azure_allow_http);
+
+                    if let Some(endpoint) = &self.azure_endpoint {
+                        builder = builder.with_endpoint(endpoint.to_string());
+                    }
+
+                    Ok(object_store_limit::LimitObjectStore::new(
+                        Arc::new(builder.build().context(InvalidAzureConfigSnafu)?),
                         self.object_store_connection_limit.get(),
-                    )))
+                        semaphore_metrics,
+                    ))
                 }
 
                 #[cfg(not(feature = "azure"))]
-                fn new_azure(&self) -> Result<Arc<DynObjectStore>, ParseError> {
+                fn new_azure(
+                    &self,
+                    _semaphore_metrics: &Arc<tracker::AsyncSemaphoreMetrics>,
+                ) -> Result<object_store_limit::LimitObjectStore, ParseError> {
                     panic!("Azure blob storage support not enabled, recompile with the azure feature enabled")
                 }
 
@@ -912,7 +1059,32 @@ macro_rules! object_store_config_inner {
                 }
 
                 /// Create config-dependant object store.
+                ///
+                /// Semaphore metrics are not registered with any metric registry.
+                /// Use [`Self::make_object_store_with_metrics`] to register them.
                 pub fn make_object_store(&self) -> Result<Arc<DynObjectStore>, ParseError> {
+                    let metrics = Arc::new(tracker::AsyncSemaphoreMetrics::new_unregistered());
+                    self.make_object_store_inner(&metrics)
+                }
+
+                /// Create the object store with semaphore metrics registered in the
+                /// provided [`metric::Registry`] under the `"object_store_limit"`
+                /// semaphore attribute.
+                pub fn make_object_store_with_metrics(
+                    &self,
+                    registry: &metric::Registry,
+                ) -> Result<Arc<DynObjectStore>, ParseError> {
+                    let metrics = Arc::new(tracker::AsyncSemaphoreMetrics::new(
+                        registry,
+                        &[("semaphore", "object_store_limit")],
+                    ));
+                    self.make_object_store_inner(&metrics)
+                }
+
+                fn make_object_store_inner(
+                    &self,
+                    semaphore_metrics: &Arc<tracker::AsyncSemaphoreMetrics>,
+                ) -> Result<Arc<DynObjectStore>, ParseError> {
                     if let Some(data_dir) = &self.database_directory {
                         if !matches!(&self.object_store, ObjectStoreType::File) {
                             warn!(?data_dir, object_store_type=?self.object_store,
@@ -920,7 +1092,7 @@ macro_rules! object_store_config_inner {
                         }
                     }
 
-                    let object_store: Arc<DynObjectStore> = match &self.object_store {
+                    let store: Arc<DynObjectStore> = match &self.object_store {
                         ObjectStoreType::Memory => {
                             info!(object_store_type = "Memory", "Object Store");
                             Arc::new(InMemory::new())
@@ -945,14 +1117,19 @@ macro_rules! object_store_config_inner {
                             info!(?config, object_store_type = "Memory", "Object Store");
                             Arc::new(ThrottledStore::new(InMemory::new(), config))
                         }
-
-                        ObjectStoreType::Google => self.new_gcs()?,
-                        ObjectStoreType::S3 => self.new_s3()?,
-                        ObjectStoreType::Azure => self.new_azure()?,
+                        ObjectStoreType::Google => {
+                            Arc::new(self.new_gcs(semaphore_metrics)?)
+                        }
+                        ObjectStoreType::S3 => {
+                            Arc::new(self.new_s3(semaphore_metrics)?)
+                        }
+                        ObjectStoreType::Azure => {
+                            Arc::new(self.new_azure(semaphore_metrics)?)
+                        }
                         ObjectStoreType::File => self.new_local_file_system()?,
                     };
 
-                    Ok(object_store)
+                    Ok(store)
                 }
 
                 fn new_local_file_system(&self) -> Result<Arc<LocalFileSystemWithSortedListOp>, ParseError> {
@@ -1111,7 +1288,7 @@ impl AwsCredentialReloader {
         let cloned = self.clone();
         tokio::spawn(async move {
             loop {
-                let next_check_in = cloned
+                let mut next_check_in = cloned
                     .check_and_update()
                     .await
                     .and_then(|next_check_ts| {
@@ -1119,11 +1296,17 @@ impl AwsCredentialReloader {
                         if next_check_ts < now {
                             None
                         } else {
-                            Some(Duration::from_secs(now - next_check_ts))
+                            Some(Duration::from_secs(next_check_ts - now))
                         }
                     })
                     .unwrap_or_else(default_check_in);
 
+                // avoid a tight loop when sleeping under a second
+                // this might happen if the expiry time wasn't updated or
+                // the process started up right on the expiry time
+                if next_check_in.as_secs() < 1 {
+                    next_check_in = Duration::from_secs(1);
+                }
                 cloned.time_provider.sleep(next_check_in).await;
             }
         });
@@ -1156,7 +1339,7 @@ impl AwsCredentialReloader {
         let file_credentials = match Self::get_file_credentials(&self.path).await {
             Ok(c) => c,
             Err(e) => {
-                info!(error = ?e, path = ?self.path, "could not read aws credentials file");
+                error!(error = ?e, path = ?self.path, "could not read aws credentials file");
                 return None;
             }
         };
@@ -1171,11 +1354,9 @@ impl AwsCredentialReloader {
         if do_update {
             let mut guard = self.current.write().await;
             *guard = Arc::new(credentials);
-
-            next_expiry
-        } else {
-            None
         }
+        // we assume the creds file is accurate even if we didn't update the creds themselves
+        next_expiry
     }
 }
 
@@ -1189,12 +1370,14 @@ impl CredentialProvider for AwsCredentialReloader {
     }
 }
 
+#[cfg(any(test, feature = "aws"))]
 #[derive(Debug, Clone)]
 struct ReauthingObjectStore {
     inner: Arc<dyn ObjectStore>,
     credential_reloader: Arc<AwsCredentialReloader>,
 }
 
+#[cfg(any(test, feature = "aws"))]
 impl ReauthingObjectStore {
     fn new_arc(
         inner: Arc<dyn ObjectStore>,
@@ -1207,12 +1390,14 @@ impl ReauthingObjectStore {
     }
 }
 
+#[cfg(any(test, feature = "aws"))]
 impl std::fmt::Display for ReauthingObjectStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.inner)
     }
 }
 
+#[cfg(any(test, feature = "aws"))]
 macro_rules! retry_if_unauthenticated {
     ($self:ident, $expression:expr) => {
         match $expression {
@@ -1239,6 +1424,7 @@ macro_rules! retry_if_unauthenticated {
     }
 }
 
+#[cfg(any(test, feature = "aws"))]
 #[async_trait]
 impl object_store::ObjectStore for ReauthingObjectStore {
     async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
@@ -1268,31 +1454,45 @@ impl object_store::ObjectStore for ReauthingObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        let inner_cloned = Arc::clone(&self.inner);
-        let items: Vec<object_store::Result<ObjectMeta, _>> = futures::executor::block_on(async {
-            // we could use TryStreamExt.collect() here to drop all collected results and
-            // return the first error we encounter, but users of the ObjectStore API will
-            // probably expect to have to deal with errors one element at a time anyway
-            inner_cloned.list(prefix).collect().await
-        });
+        let inner = Arc::clone(&self.inner);
+        let credential_reloader = Arc::clone(&self.credential_reloader);
+        let prefix = prefix.cloned();
 
-        if items.is_empty() {
-            return futures::stream::iter(items).boxed();
-        }
+        futures::stream::once(async move {
+            use std::pin::Pin;
 
-        if let Err(object_store::Error::Unauthenticated { source, .. }) = &items[0] {
-            warn!(error = ?source, "authentication with object store failed, attempting to reload from disk");
-            let items: Vec<Result<ObjectMeta, _>> = futures::executor::block_on(async {
-                self.credential_reloader.check_and_update().await;
-                // we could use TryStreamExt.collect() here to drop all collected results and
-                // return the first error we encounter, but users of the ObjectStore API will
-                // probably expect to have to deal with errors one element at a time anyway
-                self.inner.as_ref().list(prefix).collect().await
-            });
-            return futures::stream::iter(items).boxed();
-        }
+            let mut stream = inner.list(prefix.as_ref()).peekable();
 
-        futures::stream::iter(items).boxed()
+            // Peek at the first item to check for authentication errors
+            let first_item = Pin::new(&mut stream).peek().await;
+
+            match first_item {
+                Some(Err(object_store::Error::Unauthenticated { source, .. })) => {
+                    let path = credential_reloader.path.display();
+                    warn!(error = ?source, "authentication with object store failed, attempting to reload credentials from {path}");
+                    credential_reloader.check_and_update().await;
+                    // Retry with fresh credentials
+                    inner.list(prefix.as_ref())
+                }
+                Some(Err(object_store::Error::Generic { source, .. })) => {
+                    let msg = format!("{source:?}");
+                    if msg.contains("ExpiredToken") {
+                        let path = credential_reloader.path.display();
+                        warn!(error = ?source, "authentication with object store failed (ExpiredToken), attempting to reload credentials from {path}");
+                        credential_reloader.check_and_update().await;
+                        // Retry with fresh credentials
+                        inner.list(prefix.as_ref())
+                    } else {
+                        // Not an auth error, return the original stream
+                        stream.boxed()
+                    }
+                }
+                _ => {
+                    // No auth error or empty stream, return the original stream
+                    stream.boxed()
+                }
+            }
+        }).flatten().boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
@@ -1302,7 +1502,7 @@ impl object_store::ObjectStore for ReauthingObjectStore {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         retry_if_unauthenticated!(
             self,
@@ -1333,7 +1533,7 @@ impl object_store::ObjectStore for ReauthingObjectStore {
 impl object_store::signer::Signer for LocalUploadSigner {
     async fn signed_url(
         &self,
-        _method: http_1::Method,
+        _method: http::Method,
         path: &Path,
         _expires_in: Duration,
     ) -> Result<Url, object_store::Error> {
@@ -1353,905 +1553,4 @@ pub enum CheckError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-    use iox_time::{MockProvider, Time};
-    use object_store::ObjectStore;
-    use std::{env, str::FromStr, sync::Mutex};
-    use tempfile::TempDir;
-
-    /// The current object store store configurations.
-    enum StoreConfigs {
-        Base(ObjectStoreConfig),
-        Source(SourceObjectStoreConfig),
-        Sink(SinkObjectStoreConfig),
-    }
-
-    impl StoreConfigs {
-        pub(crate) fn make_object_store(&self) -> Result<Arc<dyn ObjectStore>, ParseError> {
-            self.object_store_inner()
-        }
-
-        fn object_store_inner(&self) -> Result<Arc<dyn ObjectStore>, ParseError> {
-            match self {
-                Self::Base(o) => o.make_object_store(),
-                Self::Source(o) => o.make_object_store(),
-                Self::Sink(o) => o.make_object_store(),
-            }
-        }
-    }
-
-    #[test]
-    fn object_store_flag_is_required() {
-        // Since object-store is now required, parsing should fail without it
-        assert!(ObjectStoreConfig::try_parse_from(["server"]).is_err());
-        assert!(SourceObjectStoreConfig::try_parse_from(["server"]).is_err());
-        assert!(SinkObjectStoreConfig::try_parse_from(["server"]).is_err());
-    }
-
-    #[test]
-    fn explicitly_set_object_store_to_memory() {
-        let configs = vec![
-            StoreConfigs::Base(
-                ObjectStoreConfig::try_parse_from(["server", "--object-store", "memory"]).unwrap(),
-            ),
-            StoreConfigs::Source(
-                SourceObjectStoreConfig::try_parse_from([
-                    "server",
-                    "--source-object-store",
-                    "memory",
-                ])
-                .unwrap(),
-            ),
-            StoreConfigs::Sink(
-                SinkObjectStoreConfig::try_parse_from(["server", "--sink-object-store", "memory"])
-                    .unwrap(),
-            ),
-        ];
-        for config in configs {
-            let object_store = config.make_object_store().unwrap();
-            assert_eq!(&object_store.to_string(), "InMemory")
-        }
-    }
-
-    #[test]
-    fn default_url_signer_is_none() {
-        let config =
-            ObjectStoreConfig::try_parse_from(["server", "--object-store", "memory"]).unwrap();
-
-        let signer = make_presigned_url_signer(&config).unwrap();
-        assert!(signer.is_none(), "Expected None, got {signer:?}");
-    }
-
-    #[test]
-    #[cfg(feature = "aws")]
-    fn valid_s3_config() {
-        let configs = vec![
-            StoreConfigs::Base(
-                ObjectStoreConfig::try_parse_from([
-                    "server",
-                    "--object-store",
-                    "s3",
-                    "--bucket",
-                    "mybucket",
-                    "--aws-access-key-id",
-                    "NotARealAWSAccessKey",
-                    "--aws-secret-access-key",
-                    "NotARealAWSSecretAccessKey",
-                ])
-                .unwrap(),
-            ),
-            StoreConfigs::Source(
-                SourceObjectStoreConfig::try_parse_from([
-                    "server",
-                    "--source-object-store",
-                    "s3",
-                    "--source-bucket",
-                    "mybucket",
-                    "--source-aws-access-key-id",
-                    "NotARealAWSAccessKey",
-                    "--source-aws-secret-access-key",
-                    "NotARealAWSSecretAccessKey",
-                ])
-                .unwrap(),
-            ),
-            StoreConfigs::Sink(
-                SinkObjectStoreConfig::try_parse_from([
-                    "server",
-                    "--sink-object-store",
-                    "s3",
-                    "--sink-bucket",
-                    "mybucket",
-                    "--sink-aws-access-key-id",
-                    "NotARealAWSAccessKey",
-                    "--sink-aws-secret-access-key",
-                    "NotARealAWSSecretAccessKey",
-                ])
-                .unwrap(),
-            ),
-        ];
-
-        for config in configs {
-            let object_store = config.make_object_store().unwrap();
-            assert_eq!(
-                &object_store.to_string(),
-                "LimitStore(16, AmazonS3(mybucket))"
-            )
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "aws")]
-    fn valid_s3_endpoint_url() {
-        ObjectStoreConfig::try_parse_from([
-            "server",
-            "--aws-endpoint",
-            "http://whatever.com",
-            "--object-store",
-            "s3",
-        ])
-        .expect("must successfully parse config with absolute AWS endpoint URL");
-    }
-
-    #[test]
-    #[cfg(feature = "aws")]
-    fn invalid_s3_endpoint_url_fails_clap_parsing() {
-        let result =
-            ObjectStoreConfig::try_parse_from(["server", "--aws-endpoint", "whatever.com"]);
-        assert!(result.is_err(), "{result:?}");
-        let result = SourceObjectStoreConfig::try_parse_from([
-            "server",
-            "--source-aws-endpoint",
-            "whatever.com",
-        ]);
-        assert!(result.is_err(), "{result:?}");
-        let result = SinkObjectStoreConfig::try_parse_from([
-            "server",
-            "--sink-aws-endpoint",
-            "whatever.com",
-        ]);
-        assert!(result.is_err(), "{result:?}");
-    }
-
-    #[test]
-    #[cfg(feature = "aws")]
-    fn s3_config_missing_params() {
-        let mut config =
-            ObjectStoreConfig::try_parse_from(["server", "--object-store", "s3"]).unwrap();
-
-        // clean out eventual leaks via env variables
-        config.bucket = None;
-
-        let err = config.make_object_store().unwrap_err().to_string();
-
-        assert_eq!(
-            err,
-            "Error configuring Amazon S3: Generic S3 error: Missing bucket name"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "aws")]
-    fn valid_s3_url_signer() {
-        let config = ObjectStoreConfig::try_parse_from([
-            "server",
-            "--object-store",
-            "s3",
-            "--bucket",
-            "mybucket",
-            "--aws-access-key-id",
-            "NotARealAWSAccessKey",
-            "--aws-secret-access-key",
-            "NotARealAWSSecretAccessKey",
-        ])
-        .unwrap();
-
-        assert!(make_presigned_url_signer(&config).unwrap().is_some());
-
-        // Even with the aws feature on, object stores (other than local files) shouldn't create a
-        // signer.
-        let config =
-            ObjectStoreConfig::try_parse_from(["server", "--object-store", "memory"]).unwrap();
-
-        let signer = make_presigned_url_signer(&config).unwrap();
-        assert!(signer.is_none(), "Expected None, got {signer:?}");
-    }
-
-    #[test]
-    #[cfg(feature = "aws")]
-    fn s3_url_signer_config_missing_params() {
-        let mut config =
-            ObjectStoreConfig::try_parse_from(["server", "--object-store", "s3"]).unwrap();
-
-        // clean out eventual leaks via env variables
-        config.bucket = None;
-
-        let err = make_presigned_url_signer(&config).unwrap_err().to_string();
-
-        assert_eq!(
-            err,
-            "Error configuring Amazon S3: Generic S3 error: Missing bucket name"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "gcp")]
-    fn valid_google_config() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let mut file = NamedTempFile::new().expect("tempfile should be created");
-        const FAKE_KEY: &str = r#"{"private_key": "private_key", "private_key_id": "private_key_id", "client_email":"client_email", "disable_oauth":true}"#;
-        writeln!(file, "{FAKE_KEY}").unwrap();
-        let path = file.path().to_str().expect("file path should exist");
-
-        let configs = vec![
-            StoreConfigs::Base(
-                ObjectStoreConfig::try_parse_from([
-                    "server",
-                    "--object-store",
-                    "google",
-                    "--bucket",
-                    "mybucket",
-                    "--google-service-account",
-                    path,
-                ])
-                .unwrap(),
-            ),
-            StoreConfigs::Source(
-                SourceObjectStoreConfig::try_parse_from([
-                    "server",
-                    "--source-object-store",
-                    "google",
-                    "--source-bucket",
-                    "mybucket",
-                    "--source-google-service-account",
-                    path,
-                ])
-                .unwrap(),
-            ),
-            StoreConfigs::Sink(
-                SinkObjectStoreConfig::try_parse_from([
-                    "server",
-                    "--sink-object-store",
-                    "google",
-                    "--sink-bucket",
-                    "mybucket",
-                    "--sink-google-service-account",
-                    path,
-                ])
-                .unwrap(),
-            ),
-        ];
-
-        for config in configs {
-            let object_store = config.make_object_store().unwrap();
-            assert_eq!(
-                &object_store.to_string(),
-                "LimitStore(16, GoogleCloudStorage(mybucket))"
-            )
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "gcp")]
-    fn google_config_missing_params() {
-        let mut config =
-            ObjectStoreConfig::try_parse_from(["server", "--object-store", "google"]).unwrap();
-
-        // clean out eventual leaks via env variables
-        config.bucket = None;
-
-        let err = config.make_object_store().unwrap_err().to_string();
-
-        assert_eq!(
-            err,
-            "Error configuring GCS: Generic GCS error: Missing bucket name"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "azure")]
-    fn valid_azure_config() {
-        let config = ObjectStoreConfig::try_parse_from([
-            "server",
-            "--object-store",
-            "azure",
-            "--bucket",
-            "mybucket",
-            "--azure-storage-account",
-            "NotARealStorageAccount",
-            "--azure-storage-access-key",
-            "Zm9vYmFy", // base64 encoded "foobar"
-        ])
-        .unwrap();
-
-        let object_store = config.make_object_store().unwrap();
-        assert_eq!(
-            &object_store.to_string(),
-            "LimitStore(16, MicrosoftAzure { account: NotARealStorageAccount, container: mybucket })"
-        )
-    }
-
-    #[test]
-    #[cfg(feature = "azure")]
-    fn azure_config_missing_params() {
-        let mut config =
-            ObjectStoreConfig::try_parse_from(["server", "--object-store", "azure"]).unwrap();
-
-        // clean out eventual leaks via env variables
-        config.bucket = None;
-
-        let err = config.make_object_store().unwrap_err().to_string();
-
-        assert_eq!(
-            err,
-            "Error configuring Microsoft Azure: Generic MicrosoftAzure error: Container name must be specified"
-        );
-    }
-
-    #[test]
-    fn valid_file_config() {
-        let root = TempDir::new().unwrap();
-        let root_path = root.path().to_str().unwrap();
-
-        let config = ObjectStoreConfig::try_parse_from([
-            "server",
-            "--object-store",
-            "file",
-            "--data-dir",
-            root_path,
-        ])
-        .unwrap();
-
-        let object_store = config.make_object_store().unwrap().to_string();
-        assert!(
-            object_store.starts_with("LocalFileSystem"),
-            "{}",
-            object_store
-        )
-    }
-
-    #[test]
-    fn file_config_missing_params() {
-        // this test tests for failure to configure the object store because of data-dir configuration missing
-        // if the INFLUXDB3_DB_DIR env variable is set, the test fails because the configuration is
-        // actually present.
-        unsafe {
-            env::remove_var("INFLUXDB3_DB_DIR");
-        }
-
-        let configs = vec![
-            StoreConfigs::Base(
-                ObjectStoreConfig::try_parse_from(["server", "--object-store", "file"]).unwrap(),
-            ),
-            StoreConfigs::Source(
-                SourceObjectStoreConfig::try_parse_from([
-                    "server",
-                    "--source-object-store",
-                    "file",
-                ])
-                .unwrap(),
-            ),
-            StoreConfigs::Sink(
-                SinkObjectStoreConfig::try_parse_from(["server", "--sink-object-store", "file"])
-                    .unwrap(),
-            ),
-        ];
-
-        for config in configs {
-            let err = config.make_object_store().unwrap_err().to_string();
-            assert_eq!(
-                err,
-                "Specified File for the object store, required configuration missing for \
-            data-dir"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn local_url_signer() {
-        let root = TempDir::new().unwrap();
-        let root_path = root.path().to_str().unwrap();
-        let parquet_file_path = "1/2/something.parquet";
-
-        let signer = make_presigned_url_signer(
-            &ObjectStoreConfig::try_parse_from([
-                "server",
-                "--object-store",
-                "file",
-                "--data-dir",
-                root_path,
-            ])
-            .unwrap(),
-        )
-        .unwrap()
-        .unwrap();
-
-        let object_store_parquet_file_path = Path::parse(parquet_file_path).unwrap();
-        let upload_url = signer
-            .signed_url(
-                http_1::Method::PUT,
-                &object_store_parquet_file_path,
-                Duration::from_secs(100),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            upload_url.as_str(),
-            &format!(
-                "file://{}",
-                std::fs::canonicalize(root.path())
-                    .unwrap()
-                    .join(parquet_file_path)
-                    .display()
-            )
-        );
-    }
-
-    #[test]
-    fn endpoint() {
-        assert_eq!(
-            Endpoint::from_str("http://localhost:8080")
-                .unwrap()
-                .to_string(),
-            "http://localhost:8080",
-        );
-        assert_eq!(
-            Endpoint::from_str("http://localhost:8080/")
-                .unwrap()
-                .to_string(),
-            "http://localhost:8080",
-        );
-        assert_eq!(
-            Endpoint::from_str("whatever.com").unwrap_err().to_string(),
-            "relative URL without a base",
-        );
-    }
-
-    impl AwsCredentialReloader {
-        fn new_test(
-            path: PathBuf,
-            initial_test_credentials: AwsFileCredential,
-            time_provider: Arc<dyn TimeProvider>,
-        ) -> Self {
-            let credential = initial_test_credentials.into();
-            Self {
-                path,
-                current: Arc::new(RwLock::new(Arc::new(credential))),
-                time_provider,
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn validate_aws_credential_reloader() {
-        let initial_time = Time::from_timestamp(60 * 60 * 24 * 365, 0).unwrap();
-        let expiry = initial_time + Duration::from_secs(60 * 60);
-        let next_expiry = expiry + Duration::from_secs(60 * 60);
-
-        let mock_provider: Arc<MockProvider> = Arc::new(MockProvider::new(initial_time));
-        let time_provider: Arc<dyn TimeProvider> = Arc::clone(&mock_provider) as _;
-
-        let dir = TempDir::new().expect("must be able to create temp directory");
-        let path = dir.path().join("credentials-file");
-
-        let initial_file_credentials = AwsFileCredential {
-            aws_access_key_id: String::from("access_key_1"),
-            aws_secret_access_key: String::from("secret_key_1"),
-            aws_session_token: None,
-            expiry: Some(expiry.timestamp() as u64),
-        };
-        let initial_credentials: AwsCredential = initial_file_credentials.clone().into();
-        let initial_file_credentials_serialized =
-            serde_json::to_string(&initial_file_credentials).expect("must serialize");
-        std::fs::write(&path, initial_file_credentials_serialized).expect("must succeed writing");
-
-        let next_file_credentials = AwsFileCredential {
-            aws_access_key_id: String::from("access_key_2"),
-            aws_secret_access_key: String::from("secret_key_2"),
-            aws_session_token: None,
-            expiry: Some(next_expiry.timestamp() as u64),
-        };
-        let next_credentials: AwsCredential = next_file_credentials.clone().into();
-        let next_file_credentials_serialized =
-            serde_json::to_string(&next_file_credentials).expect("must serialize");
-
-        let reloader =
-            AwsCredentialReloader::new_test(path.clone(), initial_file_credentials, time_provider);
-
-        // validate the current reloader credentials are still equal to the initial credentials
-        assert_eq!(reloader.current.read().await.as_ref(), &initial_credentials);
-
-        reloader.spawn_background_updates();
-
-        // set the duration to five seconds after expiry and give the background task a short time
-        // to reload the credentials
-        mock_provider.set(expiry + Duration::from_secs(5));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // validate the current reloader credentials haven't changed -- nothing was written to disk
-        // yet so the initial credentials written to disk should be the same
-        assert_eq!(reloader.current.read().await.as_ref(), &initial_credentials);
-
-        // write to the credentials file
-        std::fs::write(&path, next_file_credentials_serialized).expect("must succeed writing");
-
-        // set the duration to five seconds past the default interval reloader interval so we
-        // prompt another check
-        mock_provider.set(next_expiry + Duration::from_secs(5));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // verify the credentials have been updated in the reloader
-        assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
-    }
-
-    #[derive(Debug)]
-    struct TestReloadingObjectStoreInner {
-        inner: Arc<dyn ObjectStore>,
-        next_error: Arc<Mutex<Option<object_store::Error>>>,
-    }
-
-    impl TestReloadingObjectStoreInner {
-        fn next_error(&self) -> Option<object_store::Error> {
-            self.next_error.lock().unwrap().take()
-        }
-    }
-
-    impl std::fmt::Display for TestReloadingObjectStoreInner {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "whatever")
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStore for TestReloadingObjectStoreInner {
-        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            if let Some(e) = self.next_error() {
-                Err(e)
-            } else {
-                self.inner.as_ref().copy(from, to).await
-            }
-        }
-
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            if let Some(e) = self.next_error() {
-                Err(e)
-            } else {
-                self.inner.as_ref().copy_if_not_exists(from, to).await
-            }
-        }
-
-        async fn delete(&self, location: &Path) -> object_store::Result<()> {
-            if let Some(e) = self.next_error() {
-                Err(e)
-            } else {
-                self.inner.as_ref().delete(location).await
-            }
-        }
-
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: GetOptions,
-        ) -> object_store::Result<GetResult> {
-            if let Some(e) = self.next_error() {
-                Err(e)
-            } else {
-                self.inner.as_ref().get_opts(location, options).await
-            }
-        }
-
-        fn list(
-            &self,
-            _prefix: Option<&Path>,
-        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            unimplemented!()
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> object_store::Result<ListResult> {
-            if let Some(e) = self.next_error() {
-                Err(e)
-            } else {
-                self.inner.as_ref().list_with_delimiter(prefix).await
-            }
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOpts,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            if let Some(e) = self.next_error() {
-                Err(e)
-            } else {
-                self.inner.as_ref().put_multipart_opts(location, opts).await
-            }
-        }
-
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            options: PutOptions,
-        ) -> object_store::Result<PutResult> {
-            if let Some(e) = self.next_error() {
-                Err(e)
-            } else {
-                self.inner
-                    .as_ref()
-                    .put_opts(location, payload, options)
-                    .await
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn validate_reauthing_object_store() {
-        let initial_time = Time::from_timestamp(60 * 60 * 24 * 365, 0).unwrap();
-        let expiry = initial_time + Duration::from_secs(60 * 60);
-
-        let mock_provider: Arc<MockProvider> = Arc::new(MockProvider::new(initial_time));
-        let time_provider: Arc<dyn TimeProvider> = Arc::clone(&mock_provider) as _;
-
-        let dir = TempDir::new().expect("must be able to create temp directory");
-        let path = dir.path().join("credentials-file");
-
-        let initial_file_credentials = AwsFileCredential {
-            aws_access_key_id: String::from("access_key_1"),
-            aws_secret_access_key: String::from("secret_key_1"),
-            aws_session_token: None,
-            expiry: Some(expiry.timestamp() as u64),
-        };
-        let initial_credentials: AwsCredential = initial_file_credentials.clone().into();
-        let initial_file_credentials_serialized =
-            serde_json::to_string(&initial_file_credentials).expect("must serialize");
-        std::fs::write(&path, initial_file_credentials_serialized.clone())
-            .expect("must succeed writing");
-
-        let next_file_credentials = AwsFileCredential {
-            aws_access_key_id: String::from("access_key_2"),
-            aws_secret_access_key: String::from("secret_key_2"),
-            aws_session_token: None,
-            expiry: Some(expiry.timestamp() as u64),
-        };
-        let next_credentials: AwsCredential = next_file_credentials.clone().into();
-        let next_file_credentials_serialized =
-            serde_json::to_string(&next_file_credentials).expect("must serialize");
-
-        let reloader = Arc::new(AwsCredentialReloader::new_test(
-            path.clone(),
-            initial_file_credentials.clone(),
-            time_provider,
-        ));
-
-        let reauthable_fn = || object_store::Error::Unauthenticated {
-            path: "fake".to_string(),
-            source: "fake error".into(),
-        };
-        let not_reauthable_fn = || object_store::Error::NotImplemented;
-
-        let generic_expired_token_fn = || object_store::Error::Generic {
-            store: "TestStore",
-            source: "ExpiredToken: The provided token has expired".into(),
-        };
-
-        let generic_other_error_fn = || object_store::Error::Generic {
-            store: "TestStore",
-            source: "Some other generic error".into(),
-        };
-
-        let object_store = Arc::new(object_store::memory::InMemory::new()) as _;
-        let test_inner = Arc::new(TestReloadingObjectStoreInner {
-            inner: object_store,
-            next_error: Arc::new(Mutex::new(None)),
-        });
-        let reloading_object_store =
-            ReauthingObjectStore::new_arc(Arc::clone(&test_inner) as _, Arc::clone(&reloader));
-
-        macro_rules! validate_endpoint {
-            ($expression:expr) => {
-                // validate expression works normally
-                $expression
-                    .await
-                    .expect("must succeed");
-
-                // ============================================================
-                // Test re-authable error (Error::Unauthenticated)
-
-                // set reauthable error on inner test object store
-                test_inner
-                    .as_ref()
-                    .next_error
-                    .lock()
-                    .unwrap()
-                    .replace(reauthable_fn());
-
-                // verify the initial credentials are still set
-                assert_eq!(reloader.current.read().await.as_ref(), &initial_credentials);
-
-                // write to the credentials file so we can verify it gets updated
-                std::fs::write(&path, next_file_credentials_serialized.clone()).expect("must succeed writing");
-
-                // validate that the expression still transparently works even though there is an
-                // initial authentication error
-                $expression
-                    .await
-                    .expect("must succeed");
-
-                // verify the next credentials have been loaded
-                assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
-
-                // ============================================================
-                // Test non-re-authable error
-
-                // write to the credentials file so we can verify it doesn't get updated
-                std::fs::write(&path, initial_file_credentials_serialized.clone())
-                    .expect("must succeed writing");
-
-                // set non-reauthable error on inner test object store so we can validate no re-auth occurs
-                test_inner
-                    .as_ref()
-                    .next_error
-                    .lock()
-                    .unwrap()
-                    .replace(not_reauthable_fn());
-
-                // verify the credentials are unchanged
-                assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
-
-                // validate that we get an error
-                $expression
-                    .await
-                    .expect_err("must error");
-
-                // reset the credentials to the initial state for the next test
-                *reloader.current.write().await = Arc::new(initial_file_credentials.clone().into());
-
-                // ============================================================
-                // Test Generic error with ExpiredToken
-
-                // Set generic expired token error
-                test_inner
-                    .next_error
-                    .lock()
-                    .unwrap()
-                    .replace(generic_expired_token_fn());
-
-                // Verify initial credentials are set
-                assert_eq!(reloader.current.read().await.as_ref(), &initial_credentials);
-
-                // Write new credentials to file
-                std::fs::write(&path, next_file_credentials_serialized.clone())
-                    .expect("must succeed writing");
-
-                // This should trigger re-auth due to ExpiredToken in Generic error
-                $expression
-                    .await
-                    .expect("must succeed after reauth");
-
-                // Verify credentials were reloaded
-                assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
-
-                // ============================================================
-                // Test Generic error without ExpiredToken (should return Err)
-
-                // write to the credentials file so we can verify it doesn't get updated
-                std::fs::write(&path, initial_file_credentials_serialized.clone())
-                    .expect("must succeed writing");
-
-                // set non-reauthable error on inner test object store so we can validate no re-auth occurs
-                test_inner
-                    .as_ref()
-                    .next_error
-                    .lock()
-                    .unwrap()
-                    .replace(generic_other_error_fn());
-
-                // Write initial credentials to file (to see if they get loaded)
-                std::fs::write(&path, initial_file_credentials_serialized.clone())
-                    .expect("must succeed writing");
-
-                // This should NOT trigger re-auth since no ExpiredToken in error
-                $expression
-                    .await
-                    .expect_err("must return an error");
-
-                // The error gets consumed by the first call, so we might get success or error
-                assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
-
-                // reset the credentials to the initial state for the next test
-                *reloader.current.write().await = Arc::new(initial_file_credentials.clone().into());
-            }
-        }
-
-        let obj_path = Path::from("whatever");
-        validate_endpoint!(reloading_object_store.put(&obj_path, PutPayload::from("woof")));
-        validate_endpoint!(reloading_object_store.put_opts(
-            &obj_path,
-            PutPayload::from("woof"),
-            PutOptions::default()
-        ));
-        validate_endpoint!(
-            reloading_object_store.put_multipart_opts(&obj_path, PutMultipartOpts::default())
-        );
-        validate_endpoint!(reloading_object_store.get(&obj_path));
-        validate_endpoint!(reloading_object_store.get_opts(&obj_path, GetOptions::default()));
-        validate_endpoint!(reloading_object_store.list_with_delimiter(Some(&obj_path)));
-
-        let copy_path = Path::from("whatever2");
-        validate_endpoint!(reloading_object_store.copy(&obj_path, &copy_path));
-
-        validate_endpoint!(reloading_object_store.delete(&copy_path));
-
-        // cannot validate copy_if_not_exists using the above macro since copies will fail if the
-        // destination path already has content
-        reloading_object_store
-            .copy_if_not_exists(&obj_path, &copy_path)
-            .await
-            .expect("must copy");
-        reloading_object_store
-            .delete(&copy_path)
-            .await
-            .expect("must delete");
-
-        // set reauthable error on inner test object store
-        test_inner
-            .as_ref()
-            .next_error
-            .lock()
-            .unwrap()
-            .replace(reauthable_fn());
-
-        // verify the initial credentials are still set
-        assert_eq!(reloader.current.read().await.as_ref(), &initial_credentials);
-
-        // write to the credentials file so we can verify it gets updated
-        std::fs::write(&path, next_file_credentials_serialized.clone())
-            .expect("must succeed writing");
-
-        // validate that copy still transparently works even though there is an initialy
-        // authentication error
-        reloading_object_store
-            .copy_if_not_exists(&obj_path, &copy_path)
-            .await
-            .expect("must copy");
-        // must always delete after copy_if_not_exists
-        reloading_object_store
-            .delete(&copy_path)
-            .await
-            .expect("must delete");
-
-        // verify the next credentials have been loaded
-        assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
-
-        // write to the credentials file so we can verify it doesn't get updated
-        std::fs::write(&path, initial_file_credentials_serialized.clone())
-            .expect("must succeed writing");
-
-        // set non-reauthable error on inner test object store so we can validate no re-auth occurs
-        test_inner
-            .as_ref()
-            .next_error
-            .lock()
-            .unwrap()
-            .replace(not_reauthable_fn());
-
-        // verify the credentials are unchanged
-        assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
-
-        // validate that copy still transparently works
-        reloading_object_store
-            .copy_if_not_exists(&obj_path, &copy_path)
-            .await
-            .expect_err("must error");
-
-        // reset the credentials to the initial state for the next test
-        *reloader.current.write().await = Arc::new(initial_file_credentials.clone().into());
-    }
-}
+mod tests;

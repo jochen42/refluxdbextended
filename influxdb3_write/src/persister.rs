@@ -1,14 +1,27 @@
 //! This is the implementation of the `Persister` used to write data from the buffer to object
 //! storage.
+use std::collections::HashMap;
+use std::io::Write;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::PersistedSnapshot;
+use crate::PersistedSnapshotCheckpoint;
+use crate::PersistedSnapshotCheckpointVersion;
 use crate::PersistedSnapshotVersion;
+use crate::YearMonth;
 use crate::paths::CompactionInfoFilePath;
 use crate::paths::ParquetFilePath;
+use crate::paths::SnapshotCheckpointPath;
 use crate::paths::SnapshotInfoFilePath;
+use crate::write_buffer::checkpoint::{
+    FileIndex, add_snapshot_files, build_file_index, process_removed_files,
+    year_month_from_timestamp_ms,
+};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use datafusion::common::DataFusionError;
 use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::memory_pool::MemoryPool;
@@ -20,15 +33,18 @@ use futures_util::pin_mut;
 use futures_util::stream::TryStreamExt;
 use futures_util::stream::{FuturesOrdered, StreamExt};
 use influxdb3_cache::parquet_cache::ParquetFileDataToCache;
+use influxdb3_wal::SnapshotSequenceNumber;
 use iox_time::TimeProvider;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjPath;
+use object_store_utils::AdaptivePutExt;
+use observability_deps::tracing::{debug, error, info, trace, warn};
+use parking_lot::RwLock;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
+use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
-use parquet::format::FileMetaData;
-use std::io::Write;
-use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersisterError {
@@ -52,14 +68,26 @@ pub enum PersisterError {
 
     #[error("unexpected persister error: {0:?}")]
     Unexpected(#[from] anyhow::Error),
+
+    #[error("table snapshot persistence task panicked: {0}")]
+    TableSnapshotPersistenceTaskFailed(#[source] tokio::task::JoinError),
+
+    #[error("table index error: {0}")]
+    TableIndexPathError(#[source] crate::paths::PathError),
+
+    #[error("object meta is missing filename")]
+    MissingFilename,
+
+    #[error("failed to parse snapshot sequence number from filename")]
+    InvalidSnapshotSequenceNumber,
 }
 
 impl From<PersisterError> for DataFusionError {
     fn from(error: PersisterError) -> Self {
         match error {
             PersisterError::DataFusion(e) => e,
-            PersisterError::ObjectStore(e) => DataFusionError::ObjectStore(e),
-            PersisterError::ParquetError(e) => DataFusionError::ParquetError(e),
+            PersisterError::ObjectStore(e) => DataFusionError::ObjectStore(Box::new(e)),
+            PersisterError::ParquetError(e) => DataFusionError::ParquetError(Box::new(e)),
             _ => DataFusionError::External(Box::new(error)),
         }
     }
@@ -68,6 +96,19 @@ impl From<PersisterError> for DataFusionError {
 pub type Result<T, E = PersisterError> = std::result::Result<T, E>;
 
 pub const DEFAULT_OBJECT_STORE_URL: &str = "iox://influxdb3/";
+const MAX_CONCURRENT_CHECKPOINT_LOADS: usize = 10;
+/// Number of checkpoints to retain per month when cleaning up (latest + previous for safety)
+const CHECKPOINTS_TO_RETAIN_PER_MONTH: usize = 2;
+
+/// Cached checkpoint with its file index for efficient incremental updates.
+///
+/// Storing the FileIndex alongside the checkpoint avoids rebuilding it on every
+/// snapshot persist. The index is maintained incrementally as files are added/removed.
+#[derive(Debug, Clone)]
+struct CachedCheckpoint {
+    checkpoint: PersistedSnapshotCheckpoint,
+    file_index: FileIndex,
+}
 
 /// The persister is the primary interface with object storage where InfluxDB stores all Parquet
 /// data, catalog information, as well as WAL and snapshot data.
@@ -84,20 +125,38 @@ pub struct Persister {
     /// time provider
     time_provider: Arc<dyn TimeProvider>,
     pub(crate) mem_pool: Arc<dyn MemoryPool>,
+    /// Interval between checkpoint creation attempts. None means checkpointing is disabled.
+    checkpoint_interval: Option<Duration>,
+    /// Time of the last successful checkpoint creation.
+    last_checkpoint_time: RwLock<Option<Instant>>,
+    /// Cached checkpoint for the current month to avoid reloading from object store.
+    cached_checkpoint: RwLock<Option<CachedCheckpoint>>,
 }
 
 impl Persister {
+    /// Create a new Persister.
+    ///
+    /// # Arguments
+    /// * `object_store` - The object store to persist data to
+    /// * `node_identifier_prefix` - Prefix for all paths in object store
+    /// * `time_provider` - Time provider for timestamps
+    /// * `checkpoint_interval` - Optional interval between checkpoint creation. None disables checkpointing.
     pub fn new(
         object_store: Arc<dyn ObjectStore>,
         node_identifier_prefix: impl Into<String>,
         time_provider: Arc<dyn TimeProvider>,
+        checkpoint_interval: Option<Duration>,
     ) -> Self {
+        let nip = node_identifier_prefix.into();
         Self {
             object_store_url: ObjectStoreUrl::parse(DEFAULT_OBJECT_STORE_URL).unwrap(),
-            object_store,
-            node_identifier_prefix: node_identifier_prefix.into(),
+            object_store: Arc::clone(&object_store),
+            node_identifier_prefix: nip.clone(),
             time_provider,
             mem_pool: Arc::new(UnboundedMemoryPool::default()),
+            checkpoint_interval,
+            last_checkpoint_time: RwLock::new(None),
+            cached_checkpoint: RwLock::new(None),
         }
     }
 
@@ -118,6 +177,17 @@ impl Persister {
         &self.node_identifier_prefix
     }
 
+    /// Gets the latest snapshot sequence number from the object store.
+    ///
+    /// Returns None if no snapshots exist. This is a lightweight operation that
+    /// only loads the most recent snapshot to extract its sequence number.
+    pub async fn get_latest_snapshot_sequence(&self) -> Result<Option<SnapshotSequenceNumber>> {
+        let snapshots = self.load_snapshots(1).await?;
+        Ok(snapshots.first().map(|s| match s {
+            PersistedSnapshotVersion::V1(snapshot) => snapshot.snapshot_sequence_number,
+        }))
+    }
+
     /// Loads the most recently persisted N snapshot parquet file lists from object storage.
     ///
     /// This is intended to be used on server start.
@@ -125,6 +195,11 @@ impl Persister {
         &self,
         mut most_recent_n: usize,
     ) -> Result<Vec<PersistedSnapshotVersion>> {
+        trace!(
+            most_recent_n,
+            node_identifier_prefix = %self.node_identifier_prefix,
+            "load_snapshots: starting"
+        );
         let mut futures = FuturesOrdered::new();
         let mut offset: Option<ObjPath> = None;
 
@@ -169,15 +244,26 @@ impl Persister {
 
             async fn get_snapshot(
                 location: ObjPath,
+                last_modified: DateTime<Utc>,
                 object_store: Arc<dyn ObjectStore>,
-            ) -> Result<PersistedSnapshotVersion> {
+            ) -> Result<(usize, PersistedSnapshotVersion)> {
                 let bytes = object_store.get(&location).await?.bytes().await?;
-                serde_json::from_slice(&bytes).map_err(Into::into)
+                let size = bytes.len();
+                let mut snapshot: PersistedSnapshotVersion = serde_json::from_slice(&bytes)?;
+                match &mut snapshot {
+                    PersistedSnapshotVersion::V1(ps) => {
+                        ps.persisted_at = Some(last_modified.timestamp_millis());
+                    }
+                }
+
+                Ok((size, snapshot))
             }
 
+            trace!(count = end, "load_snapshots: queueing snapshot fetches");
             for item in &list[0..end] {
                 futures.push_back(get_snapshot(
                     item.location.clone(),
+                    item.last_modified,
                     Arc::clone(&self.object_store),
                 ));
             }
@@ -192,10 +278,21 @@ impl Persister {
             offset = Some(list[end - 1].location.clone());
         }
 
+        trace!(
+            pending_fetches = futures.len(),
+            "load_snapshots: fetching snapshot contents"
+        );
         let mut results = Vec::new();
+        let mut total_bytes = 0usize;
         while let Some(result) = futures.next().await {
-            results.push(result?);
+            let (size, snapshot) = result?;
+            total_bytes += size;
+            results.push(snapshot);
         }
+        trace!(
+            count = results.len(),
+            total_bytes, "load_snapshots: completed fetching and deserializing"
+        );
         Ok(results)
     }
 
@@ -245,22 +342,587 @@ impl Persister {
         Ok(snapshots)
     }
 
-    /// Persists the snapshot file
+    /// Persists the snapshot file.
+    ///
+    /// After successful persistence, this will:
+    /// 1. Update the cached checkpoint incrementally (if checkpointing enabled)
+    /// 2. Persist the checkpoint if the checkpoint interval has elapsed
     pub async fn persist_snapshot(
         &self,
         persisted_snapshot: &PersistedSnapshotVersion,
     ) -> Result<()> {
-        let snapshot_file_path = SnapshotInfoFilePath::new(
-            self.node_identifier_prefix.as_str(),
-            match persisted_snapshot {
-                PersistedSnapshotVersion::V1(ps) => ps.snapshot_sequence_number,
-            },
-        );
+        let PersistedSnapshotVersion::V1(snapshot) = persisted_snapshot;
+        let seq = snapshot.snapshot_sequence_number;
+        let snapshot_file_path =
+            SnapshotInfoFilePath::new(self.node_identifier_prefix.as_str(), seq);
         let json = serde_json::to_vec_pretty(persisted_snapshot)?;
         self.object_store
             .put(snapshot_file_path.as_ref(), json.into())
             .await?;
+
+        debug!(
+            snapshot_sequence_number = seq.as_u64(),
+            path = %snapshot_file_path.as_ref(),
+            "persist_snapshot: completed"
+        );
+
+        if self.checkpoint_interval.is_none() {
+            return Ok(());
+        };
+
+        // Incrementally update cached checkpoint
+        self.update_cached_checkpoint(snapshot);
+
+        if self.should_persist_checkpoint() {
+            let checkpoint_to_persist = self
+                .cached_checkpoint
+                .read()
+                .as_ref()
+                .map(|c| c.checkpoint.clone());
+            let Some(checkpoint) = checkpoint_to_persist else {
+                return Ok(());
+            };
+
+            match self
+                .persist_checkpoint(&PersistedSnapshotCheckpointVersion::V1(checkpoint))
+                .await
+            {
+                Ok(()) => self.mark_checkpoint_created(),
+                Err(e) => error!(%e, "Failed to persist checkpoint after snapshot"),
+            }
+        }
+
         Ok(())
+    }
+
+    /// Check if a checkpoint should be persisted based on elapsed time.
+    fn should_persist_checkpoint(&self) -> bool {
+        let Some(interval) = self.checkpoint_interval else {
+            return false;
+        };
+
+        match *self.last_checkpoint_time.read() {
+            None => true,
+            Some(last_time) => last_time.elapsed() >= interval,
+        }
+    }
+
+    /// Mark that a checkpoint was just created.
+    fn mark_checkpoint_created(&self) {
+        *self.last_checkpoint_time.write() = Some(Instant::now());
+    }
+
+    /// Persist the previous month's checkpoint asynchronously when month rolls over.
+    ///
+    /// This is called from `update_cached_checkpoint()` when a month boundary is detected.
+    /// The persist is done asynchronously to avoid blocking snapshot persistence.
+    /// Errors are logged but don't fail the current operation.
+    fn persist_previous_month_checkpoint_async(
+        &self,
+        previous_checkpoint: PersistedSnapshotCheckpoint,
+    ) {
+        let object_store = Arc::clone(&self.object_store);
+        let node_id = self.node_identifier_prefix.clone();
+
+        tokio::spawn(async move {
+            let year_month = previous_checkpoint.year_month;
+            let seq = previous_checkpoint.last_snapshot_sequence_number;
+
+            debug!(
+                year_month = %year_month,
+                snapshot_seq = seq.as_u64(),
+                "persist_previous_month_checkpoint_async: persisting on month rollover"
+            );
+
+            let checkpoint_path = SnapshotCheckpointPath::new(&node_id, &year_month, seq);
+
+            let json = match serde_json::to_vec_pretty(&PersistedSnapshotCheckpointVersion::V1(
+                previous_checkpoint,
+            )) {
+                Ok(json) => json,
+                Err(e) => {
+                    error!(%e, year_month = %year_month, "Failed to serialize previous month checkpoint");
+                    return;
+                }
+            };
+
+            if let Err(e) = object_store
+                .put(checkpoint_path.as_ref(), json.into())
+                .await
+            {
+                error!(
+                    %e,
+                    year_month = %year_month,
+                    "Failed to persist previous month checkpoint on rollover"
+                );
+            } else {
+                debug!(
+                    year_month = %year_month,
+                    path = %checkpoint_path.as_ref(),
+                    "persist_previous_month_checkpoint_async: completed"
+                );
+            }
+        });
+    }
+
+    /// Warm the checkpoint cache with a loaded checkpoint.
+    ///
+    /// This should be called during server startup after loading checkpoints from object store.
+    /// Only populates the cache if it's currently empty, to avoid overwriting newer data.
+    /// Builds the FileIndex once here so incremental updates are O(m) instead of O(n).
+    pub fn warm_checkpoint_cache(&self, checkpoint: PersistedSnapshotCheckpoint) {
+        if self.checkpoint_interval.is_none() {
+            return;
+        }
+        let mut cache = self.cached_checkpoint.write();
+        if cache.is_some() {
+            return;
+        }
+
+        let file_index = build_file_index(&checkpoint.databases);
+        debug!(
+            month = %checkpoint.year_month,
+            last_seq = checkpoint.last_snapshot_sequence_number.as_u64(),
+            file_count = file_index.len(),
+            "warm_checkpoint_cache: populated cache from loaded checkpoint"
+        );
+        *cache = Some(CachedCheckpoint {
+            checkpoint,
+            file_index,
+        });
+    }
+
+    /// Update the cached checkpoint with a single snapshot.
+    ///
+    /// Creates a new checkpoint for the month if cache is empty or stale (month rollover).
+    /// On month rollover, persists the previous month's checkpoint asynchronously before
+    /// creating the new month's checkpoint to prevent data loss.
+    /// This is called on every snapshot persist to maintain an up-to-date in-memory checkpoint.
+    /// Uses the cached FileIndex for O(m) incremental updates instead of O(n) rebuilds.
+    fn update_cached_checkpoint(&self, snapshot: &PersistedSnapshot) {
+        let now_ms = self.time_provider.now().timestamp_millis();
+        let current_month = year_month_from_timestamp_ms(now_ms);
+
+        let mut cache = self.cached_checkpoint.write();
+
+        // Get or create CachedCheckpoint for current month
+        let cached = match cache.as_mut() {
+            Some(c) if c.checkpoint.year_month == current_month => c,
+            _ => {
+                // Month rollover or first snapshot - start fresh with empty index
+                debug!(
+                    month = %current_month,
+                    "update_cached_checkpoint: creating new checkpoint for month"
+                );
+                let new_checkpoint = PersistedSnapshotCheckpoint::new(
+                    self.node_identifier_prefix.clone(),
+                    current_month,
+                );
+                if let Some(old_checkpoint) = cache.replace(CachedCheckpoint {
+                    checkpoint: new_checkpoint,
+                    file_index: Default::default(),
+                }) {
+                    self.persist_previous_month_checkpoint_async(old_checkpoint.checkpoint);
+                }
+                cache.as_mut().unwrap()
+            }
+        };
+
+        // Apply snapshot to checkpoint using cached file_index
+        cached.checkpoint.update_from_snapshot(snapshot);
+        add_snapshot_files(
+            &mut cached.checkpoint,
+            &mut cached.file_index,
+            snapshot.databases.clone(),
+        );
+        process_removed_files(
+            &mut cached.checkpoint,
+            &mut cached.file_index,
+            snapshot.removed_files.clone(),
+        );
+
+        trace!(
+            snapshot_seq = snapshot.snapshot_sequence_number.as_u64(),
+            "update_cached_checkpoint: applied snapshot to cache"
+        );
+    }
+
+    /// Lists checkpoint paths and returns the latest path for each month.
+    ///
+    /// This is a lightweight operation that only lists paths without loading content.
+    /// Returns paths sorted by year-month (oldest first).
+    ///
+    /// If `min_sequence` is provided, only checkpoints whose range overlaps with the
+    /// lookback window are returned. A checkpoint is included if:
+    /// - Its sequence number >= min_sequence, OR
+    /// - The next checkpoint's sequence number >= min_sequence (range overlap)
+    pub async fn list_latest_checkpoints_per_month(
+        &self,
+        min_sequence: Option<SnapshotSequenceNumber>,
+    ) -> Result<Vec<ObjPath>> {
+        debug!(
+            node_identifier_prefix = %self.node_identifier_prefix,
+            ?min_sequence,
+            "list_latest_checkpoints_per_month: starting"
+        );
+
+        let checkpoint_dir = SnapshotCheckpointPath::dir(&self.node_identifier_prefix);
+        let mut checkpoint_list = self.object_store.list(Some(&checkpoint_dir));
+
+        // Collect all checkpoint paths
+        let mut paths_by_month: HashMap<YearMonth, Vec<ObjPath>> = HashMap::new();
+
+        while let Some(item) = checkpoint_list.next().await {
+            match item {
+                Ok(meta) => {
+                    let path_str = meta.location.as_ref();
+                    if let Some(year_month) = SnapshotCheckpointPath::parse_year_month(path_str) {
+                        paths_by_month
+                            .entry(year_month)
+                            .or_default()
+                            .push(meta.location);
+                    }
+                }
+                Err(e) => {
+                    if e.to_string().contains("not found") {
+                        debug!("No checkpoints directory found, returning empty list");
+                        return Ok(Vec::new());
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+
+        // For each month, select only the latest checkpoint
+        let mut result: Vec<(YearMonth, ObjPath)> = paths_by_month
+            .into_iter()
+            .map(|(month, mut paths)| {
+                paths.sort();
+                // First path after sorting is the latest due to inverted sequence numbers
+                (month, paths.into_iter().next().unwrap())
+            })
+            .collect();
+
+        // Sort by month (oldest first) for consistent ordering
+        result.sort_by_key(|a| a.0);
+
+        if let Some(min_seq) = min_sequence {
+            let min_seq_u64 = min_seq.as_u64();
+            let with_seqs: Vec<_> = result
+                .iter()
+                .filter_map(|(month, path)| {
+                    SnapshotCheckpointPath::parse_sequence_number(path.as_ref())
+                        .map(|seq| (*month, path.clone(), seq.as_u64()))
+                })
+                .collect();
+
+            // Include checkpoint if its range overlaps with the lookback window:
+            // - seq >= min_seq, OR
+            // - next checkpoint's seq >= min_seq (this checkpoint's range contains min_seq)
+            result = with_seqs
+                .iter()
+                .enumerate()
+                .filter(|(i, (_, _, seq))| {
+                    if *seq >= min_seq_u64 {
+                        return true;
+                    }
+                    with_seqs
+                        .get(i + 1)
+                        .map(|(_, _, next_seq)| *next_seq >= min_seq_u64)
+                        .unwrap_or(false)
+                })
+                .map(|(_, (month, path, _))| (*month, path.clone()))
+                .collect();
+
+            debug!(
+                filtered_count = result.len(),
+                min_seq = min_seq_u64,
+                "list_latest_checkpoints_per_month: filtered by sequence"
+            );
+        }
+
+        let paths: Vec<ObjPath> = result.into_iter().map(|(_, path)| path).collect();
+
+        debug!(
+            count = paths.len(),
+            "list_latest_checkpoints_per_month: completed"
+        );
+        Ok(paths)
+    }
+
+    /// Loads checkpoints from the given paths.
+    ///
+    /// Use with paths returned from `list_latest_checkpoints_per_month()`.
+    /// Limits concurrency to avoid overwhelming the object store.
+    pub async fn load_checkpoints(
+        &self,
+        paths: Vec<ObjPath>,
+    ) -> Result<Vec<PersistedSnapshotCheckpointVersion>> {
+        debug!(count = paths.len(), "load_checkpoints: starting");
+
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CHECKPOINT_LOADS));
+        let mut futures = FuturesOrdered::new();
+
+        for path in paths {
+            let object_store = Arc::clone(&self.object_store);
+            let semaphore = Arc::clone(&semaphore);
+            let path_clone = path.clone();
+
+            futures.push_back(async move {
+                let _permit = semaphore.acquire().await.expect("semaphore not closed");
+                trace!(path = %path_clone, "loading checkpoint");
+                let bytes = object_store.get(&path_clone).await?.bytes().await?;
+                let checkpoint: PersistedSnapshotCheckpointVersion =
+                    serde_json::from_slice(&bytes)?;
+                Result::<_, PersisterError>::Ok(checkpoint)
+            });
+        }
+
+        let mut results = Vec::new();
+        while let Some(result) = futures.next().await {
+            results.push(result?);
+        }
+
+        debug!(count = results.len(), "load_checkpoints: completed");
+        Ok(results)
+    }
+
+    /// Persists a checkpoint to object store.
+    pub async fn persist_checkpoint(
+        &self,
+        checkpoint: &PersistedSnapshotCheckpointVersion,
+    ) -> Result<()> {
+        let (year_month, seq) = match checkpoint {
+            PersistedSnapshotCheckpointVersion::V1(c) => {
+                (&c.year_month, c.last_snapshot_sequence_number)
+            }
+        };
+
+        debug!(
+            %year_month,
+            snapshot_sequence_number = seq.as_u64(),
+            "persist_checkpoint: starting"
+        );
+
+        let checkpoint_path =
+            SnapshotCheckpointPath::new(&self.node_identifier_prefix, year_month, seq);
+
+        let json = serde_json::to_vec_pretty(checkpoint)?;
+        self.object_store
+            .put(checkpoint_path.as_ref(), json.into())
+            .await?;
+
+        debug!(
+            %year_month,
+            snapshot_sequence_number = seq.as_u64(),
+            path = %checkpoint_path.as_ref(),
+            "persist_checkpoint: completed"
+        );
+
+        // Clean up old checkpoints for this month, keeping only the most recent ones
+        let node_id_prefix = self.node_identifier_prefix.clone();
+        let object_store = Arc::clone(&self.object_store);
+        let year_month = *year_month;
+        tokio::spawn(Self::cleanup_old_checkpoints_for_month(
+            node_id_prefix,
+            object_store,
+            year_month,
+        ));
+
+        Ok(())
+    }
+
+    /// Build and persist checkpoints from loaded snapshots.
+    ///
+    /// Processes one month at a time: groups snapshots by month, builds checkpoint for
+    /// the oldest month, persists it, then moves to the next month. This minimizes peak
+    /// memory usage by not holding any checkpoints in memory longer than necessary.
+    ///
+    /// Uses each snapshot's `persisted_at` field (from ObjectMeta.last_modified) to determine
+    /// which month it belongs to. Falls back to `max_time` from the snapshot itself.
+    ///
+    /// Returns only the current month's checkpoint (if any) for cache warming.
+    /// All other checkpoints are persisted and dropped to free memory.
+    pub async fn build_and_persist_checkpoints_from_snapshots(
+        &self,
+        snapshots: &[PersistedSnapshot],
+        current_month: YearMonth,
+    ) -> Option<PersistedSnapshotCheckpoint> {
+        if snapshots.is_empty() {
+            return None;
+        }
+
+        // Group snapshots by month using persisted_at
+        let mut snapshots_by_month: HashMap<YearMonth, Vec<&PersistedSnapshot>> = HashMap::new();
+
+        for snapshot in snapshots.iter() {
+            if snapshot.max_time == i64::MIN {
+                continue;
+            }
+            let timestamp_ms = snapshot.persisted_at.unwrap_or(snapshot.max_time);
+            let month = year_month_from_timestamp_ms(timestamp_ms);
+            snapshots_by_month.entry(month).or_default().push(snapshot);
+        }
+
+        if snapshots_by_month.is_empty() {
+            return None;
+        }
+
+        let mut months: Vec<_> = snapshots_by_month.keys().copied().collect();
+        months.sort();
+
+        info!(
+            month_count = months.len(),
+            snapshot_count = snapshots.len(),
+            "build_and_persist_checkpoints_from_snapshots: building checkpoints in background"
+        );
+
+        let mut current_month_checkpoint = None;
+
+        for month in months {
+            let month_snapshots = snapshots_by_month.remove(&month).unwrap();
+
+            let mut checkpoint =
+                PersistedSnapshotCheckpoint::new(self.node_identifier_prefix.clone(), month);
+            let mut file_index: FileIndex = HashMap::new();
+            for snapshot in month_snapshots.into_iter().rev() {
+                checkpoint.update_from_snapshot(snapshot);
+                add_snapshot_files(&mut checkpoint, &mut file_index, snapshot.databases.clone());
+                process_removed_files(
+                    &mut checkpoint,
+                    &mut file_index,
+                    snapshot.removed_files.clone(),
+                );
+            }
+
+            if let Err(e) = self
+                .persist_checkpoint(&PersistedSnapshotCheckpointVersion::V1(checkpoint.clone()))
+                .await
+            {
+                warn!(
+                    %e,
+                    %month,
+                    "build_and_persist_checkpoints_from_snapshots: failed to persist checkpoint"
+                );
+            } else {
+                debug!(
+                    %month,
+                    "build_and_persist_checkpoints_from_snapshots: persisted checkpoint"
+                );
+            }
+
+            // Keep current month's checkpoint for cache warming
+            if month == current_month {
+                current_month_checkpoint = Some(checkpoint);
+            }
+        }
+
+        current_month_checkpoint
+    }
+
+    /// Cleans up old checkpoints for a given month, keeping only the N most recent.
+    ///
+    /// This is called after successfully persisting a new checkpoint to prevent
+    /// unbounded accumulation of checkpoint files. We keep 2 checkpoints (latest +
+    /// previous) as a safety buffer in case the latest is corrupted.
+    async fn cleanup_old_checkpoints_for_month(
+        node_identifier_prefix: String,
+        object_store: Arc<dyn ObjectStore>,
+        year_month: YearMonth,
+    ) {
+        let month_dir = SnapshotCheckpointPath::month_dir(&node_identifier_prefix, &year_month);
+
+        // List all checkpoints for this month
+        let mut checkpoints: Vec<_> = match object_store
+            .list(Some(&month_dir))
+            .try_collect::<Vec<_>>()
+            .await
+        {
+            Ok(list) => list,
+            Err(e) => {
+                warn!(
+                    %year_month,
+                    error = %e,
+                    "Failed to list checkpoints for cleanup"
+                );
+                return;
+            }
+        };
+
+        // Sort by path - due to inverted sequence numbers, lexicographic order puts newest first
+        checkpoints.sort_by(|a, b| a.location.cmp(&b.location));
+
+        // Keep the first N (most recent), delete the rest
+        if checkpoints.len() <= CHECKPOINTS_TO_RETAIN_PER_MONTH {
+            return; // Nothing to delete
+        }
+
+        let to_delete = &checkpoints[CHECKPOINTS_TO_RETAIN_PER_MONTH..];
+        let mut deleted_count = 0;
+
+        for meta in to_delete {
+            match object_store.delete(&meta.location).await {
+                Ok(_) => {
+                    deleted_count += 1;
+                    debug!(path = %meta.location, "Deleted old checkpoint");
+                }
+                Err(e) => {
+                    // Log but don't fail - deletion is best-effort cleanup
+                    // "Not found" is okay (already deleted or race condition)
+                    let error_str = e.to_string();
+                    if !error_str.contains("not found") && !error_str.contains("No such file") {
+                        debug!(
+                            path = %meta.location,
+                            error = %e,
+                            "Failed to delete old checkpoint"
+                        );
+                    }
+                }
+            }
+        }
+
+        if deleted_count > 0 {
+            debug!(
+                %year_month,
+                deleted = deleted_count,
+                retained = CHECKPOINTS_TO_RETAIN_PER_MONTH,
+                "Cleaned up old checkpoints"
+            );
+        }
+    }
+
+    /// Loads snapshots newer than a given sequence number.
+    ///
+    /// Used after loading checkpoints to get any snapshots created since the checkpoint.
+    pub async fn load_snapshots_after(
+        &self,
+        after_sequence_number: SnapshotSequenceNumber,
+        most_recent_n: usize,
+    ) -> Result<Vec<PersistedSnapshotVersion>> {
+        debug!(
+            after_sequence_number = after_sequence_number.as_u64(),
+            most_recent_n, "load_snapshots_after: starting"
+        );
+
+        // Load snapshots and filter to those newer than the given sequence
+        let all_snapshots = self.load_snapshots(most_recent_n).await?;
+        let total_loaded = all_snapshots.len();
+
+        let filtered: Vec<_> = all_snapshots
+            .into_iter()
+            .filter(|s| match s {
+                PersistedSnapshotVersion::V1(ps) => {
+                    ps.snapshot_sequence_number > after_sequence_number
+                }
+            })
+            .collect();
+
+        debug!(
+            total_loaded,
+            after_filter = filtered.len(),
+            "load_snapshots_after: completed"
+        );
+        Ok(filtered)
     }
 
     /// Writes a [`SendableRecordBatchStream`] to the Parquet format and persists it to Object Store
@@ -269,14 +931,17 @@ impl Persister {
         &self,
         path: ParquetFilePath,
         record_batch: SendableRecordBatchStream,
-    ) -> Result<(u64, FileMetaData, ParquetFileDataToCache)> {
-        // so we have serialized parquet file bytes
+    ) -> Result<(u64, ParquetMetaData, ParquetFileDataToCache)> {
         let parquet = self.serialize_to_parquet(record_batch).await?;
         let bytes_written = parquet.bytes.len() as u64;
+
+        // Sizes vary wildly: tens to hundreds of MB under clustered
+        // workloads, 1-row "pebble" files under late-arriving workloads.
+        //
+        // bytes.clone() is cheap -- it bumps the underlying Bytes refcount.
         let put_result = self
             .object_store
-            // this bytes.clone() is cheap - uses underlying Bytes::clone
-            .put(path.as_ref(), parquet.bytes.clone().into())
+            .put_adaptive(path.as_ref(), parquet.bytes.clone())
             .await?;
 
         let to_cache = ParquetFileDataToCache::new(
@@ -316,7 +981,7 @@ pub async fn serialize_to_parquet(
     }
 
     let writer_meta = writer.close()?;
-    if writer_meta.num_rows == 0 {
+    if writer_meta.file_metadata().num_rows() == 0 {
         return Err(PersisterError::NoRows);
     }
 
@@ -329,7 +994,7 @@ pub async fn serialize_to_parquet(
 #[derive(Debug)]
 pub struct ParquetBytes {
     pub bytes: Bytes,
-    pub meta_data: FileMetaData,
+    pub meta_data: ParquetMetaData,
 }
 
 /// Wraps an [`ArrowWriter`] to track its buffered memory in a
@@ -342,7 +1007,7 @@ pub struct TrackedMemoryArrowWriter<W: Write + Send> {
     reservation: MemoryReservation,
 }
 
-/// The number of rows to write in each row group of the parquet file
+/// Parquet row group write size
 pub const ROW_GROUP_WRITE_SIZE: usize = 1_000_000; // Increased from 100,000 for better compaction
 
 impl<W: Write + Send> TrackedMemoryArrowWriter<W> {
@@ -375,372 +1040,28 @@ impl<W: Write + Send> TrackedMemoryArrowWriter<W> {
     }
 
     /// closes the writer, flushing any remaining data and returning
-    /// the written [`FileMetaData`]
-    ///
-    /// [`FileMetaData`]: parquet::format::FileMetaData
-    pub fn close(self) -> Result<parquet::format::FileMetaData> {
+    /// the written [`ParquetMetaData`]
+    pub fn close(self) -> Result<ParquetMetaData> {
         // reservation is returned on drop
         Ok(self.inner.close()?)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        DatabaseTables, ParquetFile, ParquetFileId, PersistedSnapshot, PersistedSnapshotVersion,
-    };
-    use influxdb3_catalog::catalog::CatalogSequenceNumber;
-    use influxdb3_id::{DbId, SerdeVecMap, TableId};
-    use influxdb3_wal::{SnapshotSequenceNumber, WalFileSequenceNumber};
-    use iox_time::{MockProvider, Time};
-    use object_store::memory::InMemory;
-    use pretty_assertions::assert_eq;
-    use {
-        arrow::array::Int32Array, arrow::datatypes::DataType, arrow::datatypes::Field,
-        arrow::datatypes::Schema, chrono::Utc,
-        datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder,
-        object_store::local::LocalFileSystem,
-    };
-
-    #[tokio::test]
-    async fn persist_snapshot_info_file() {
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let local_disk =
-            LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
-        let persister = Persister::new(Arc::new(local_disk), "test_host", time_provider);
-        let info_file = PersistedSnapshotVersion::V1(PersistedSnapshot {
-            node_id: "test_host".to_string(),
-            next_file_id: ParquetFileId::from(0),
-            snapshot_sequence_number: SnapshotSequenceNumber::new(0),
-            wal_file_sequence_number: WalFileSequenceNumber::new(0),
-            catalog_sequence_number: CatalogSequenceNumber::new(0),
-            databases: SerdeVecMap::new(),
-            removed_files: SerdeVecMap::new(),
-            min_time: 0,
-            max_time: 1,
-            row_count: 0,
-            parquet_size_bytes: 0,
-        });
-
-        persister.persist_snapshot(&info_file).await.unwrap();
+impl Persister {
+    /// Test helper: Get the cached checkpoint
+    fn get_cached_checkpoint(&self) -> Option<PersistedSnapshotCheckpoint> {
+        self.cached_checkpoint
+            .read()
+            .as_ref()
+            .map(|c| c.checkpoint.clone())
     }
 
-    #[tokio::test]
-    async fn persist_and_load_snapshot_info_files() {
-        let local_disk =
-            LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let persister = Persister::new(Arc::new(local_disk), "test_host", time_provider);
-        let info_file = PersistedSnapshotVersion::V1(PersistedSnapshot {
-            node_id: "test_host".to_string(),
-            next_file_id: ParquetFileId::from(0),
-            snapshot_sequence_number: SnapshotSequenceNumber::new(0),
-            wal_file_sequence_number: WalFileSequenceNumber::new(0),
-            catalog_sequence_number: CatalogSequenceNumber::default(),
-            databases: SerdeVecMap::new(),
-            removed_files: SerdeVecMap::new(),
-            max_time: 1,
-            min_time: 0,
-            row_count: 0,
-            parquet_size_bytes: 0,
-        });
-        let info_file_2 = PersistedSnapshotVersion::V1(PersistedSnapshot {
-            node_id: "test_host".to_string(),
-            next_file_id: ParquetFileId::from(1),
-            snapshot_sequence_number: SnapshotSequenceNumber::new(1),
-            wal_file_sequence_number: WalFileSequenceNumber::new(1),
-            catalog_sequence_number: CatalogSequenceNumber::default(),
-            databases: SerdeVecMap::new(),
-            removed_files: SerdeVecMap::new(),
-            min_time: 0,
-            max_time: 1,
-            row_count: 0,
-            parquet_size_bytes: 0,
-        });
-        let info_file_3 = PersistedSnapshotVersion::V1(PersistedSnapshot {
-            node_id: "test_host".to_string(),
-            next_file_id: ParquetFileId::from(2),
-            snapshot_sequence_number: SnapshotSequenceNumber::new(2),
-            wal_file_sequence_number: WalFileSequenceNumber::new(2),
-            catalog_sequence_number: CatalogSequenceNumber::default(),
-            databases: SerdeVecMap::new(),
-            removed_files: SerdeVecMap::new(),
-            min_time: 0,
-            max_time: 1,
-            row_count: 0,
-            parquet_size_bytes: 0,
-        });
-
-        persister.persist_snapshot(&info_file).await.unwrap();
-        persister.persist_snapshot(&info_file_2).await.unwrap();
-        persister.persist_snapshot(&info_file_3).await.unwrap();
-
-        let snapshots = persister.load_snapshots(2).await.unwrap();
-        assert_eq!(snapshots.len(), 2);
-        // The most recent files are first
-        assert_eq!(snapshots[0].v1_ref().next_file_id.as_u64(), 2);
-        assert_eq!(snapshots[0].v1_ref().wal_file_sequence_number.as_u64(), 2);
-        assert_eq!(snapshots[0].v1_ref().snapshot_sequence_number.as_u64(), 2);
-        assert_eq!(snapshots[1].v1_ref().next_file_id.as_u64(), 1);
-        assert_eq!(snapshots[1].v1_ref().wal_file_sequence_number.as_u64(), 1);
-        assert_eq!(snapshots[1].v1_ref().snapshot_sequence_number.as_u64(), 1);
-    }
-
-    #[tokio::test]
-    async fn persist_and_load_snapshot_info_files_with_fewer_than_requested() {
-        let local_disk =
-            LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let persister = Persister::new(Arc::new(local_disk), "test_host", time_provider);
-        let info_file = PersistedSnapshotVersion::V1(PersistedSnapshot {
-            node_id: "test_host".to_string(),
-            next_file_id: ParquetFileId::from(0),
-            snapshot_sequence_number: SnapshotSequenceNumber::new(0),
-            wal_file_sequence_number: WalFileSequenceNumber::new(0),
-            catalog_sequence_number: CatalogSequenceNumber::default(),
-            databases: SerdeVecMap::new(),
-            removed_files: SerdeVecMap::new(),
-            min_time: 0,
-            max_time: 1,
-            row_count: 0,
-            parquet_size_bytes: 0,
-        });
-        persister.persist_snapshot(&info_file).await.unwrap();
-        let snapshots = persister.load_snapshots(2).await.unwrap();
-        // We asked for the most recent 2 but there should only be 1
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].v1_ref().wal_file_sequence_number.as_u64(), 0);
-    }
-
-    #[tokio::test]
-    /// This test makes sure that the logic for offset lists works
-    async fn persist_and_load_over_1000_snapshot_info_files() {
-        let local_disk =
-            LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let persister = Persister::new(Arc::new(local_disk), "test_host", time_provider);
-        for id in 0..1001 {
-            let info_file = PersistedSnapshotVersion::V1(PersistedSnapshot {
-                node_id: "test_host".to_string(),
-                next_file_id: ParquetFileId::from(id),
-                snapshot_sequence_number: SnapshotSequenceNumber::new(id),
-                wal_file_sequence_number: WalFileSequenceNumber::new(id),
-                catalog_sequence_number: CatalogSequenceNumber::new(id),
-                databases: SerdeVecMap::new(),
-                removed_files: SerdeVecMap::new(),
-                min_time: 0,
-                max_time: 1,
-                row_count: 0,
-                parquet_size_bytes: 0,
-            });
-            persister.persist_snapshot(&info_file).await.unwrap();
-        }
-        let snapshots = persister.load_snapshots(1500).await.unwrap();
-        // We asked for the most recent 1500 so there should be 1001 of them
-        assert_eq!(snapshots.len(), 1001);
-        assert_eq!(snapshots[0].v1_ref().next_file_id.as_u64(), 1000);
-        assert_eq!(
-            snapshots[0].v1_ref().wal_file_sequence_number.as_u64(),
-            1000
-        );
-        assert_eq!(
-            snapshots[0].v1_ref().snapshot_sequence_number.as_u64(),
-            1000
-        );
-        assert_eq!(snapshots[0].v1_ref().catalog_sequence_number.get(), 1000);
-    }
-
-    #[tokio::test]
-    // This test makes sure that the proper next_file_id is used if a parquet file
-    // is added
-    async fn persist_add_parquet_file_and_load_snapshot() {
-        let local_disk =
-            LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let persister = Persister::new(Arc::new(local_disk), "test_host", time_provider);
-        let mut info_file = PersistedSnapshot::new(
-            "test_host".to_string(),
-            SnapshotSequenceNumber::new(0),
-            WalFileSequenceNumber::new(0),
-            CatalogSequenceNumber::new(0),
-        );
-
-        for _ in 0..=9875 {
-            let _id = ParquetFileId::new();
-        }
-
-        info_file.add_parquet_file(
-            DbId::from(0),
-            TableId::from(0),
-            crate::ParquetFile {
-                // Use a number that will be bigger than what's created in the
-                // PersistedSnapshot automatically
-                id: ParquetFileId::new(),
-                path: "test".into(),
-                size_bytes: 5,
-                row_count: 5,
-                chunk_time: 5,
-                min_time: 0,
-                max_time: 1,
-            },
-        );
-        persister
-            .persist_snapshot(&PersistedSnapshotVersion::V1(info_file))
-            .await
-            .unwrap();
-        let snapshots = persister.load_snapshots(10).await.unwrap();
-        assert_eq!(snapshots.len(), 1);
-        // Should be the next available id after the largest number
-        assert_eq!(snapshots[0].v1_ref().next_file_id.as_u64(), 9877);
-        assert_eq!(snapshots[0].v1_ref().wal_file_sequence_number.as_u64(), 0);
-        assert_eq!(snapshots[0].v1_ref().snapshot_sequence_number.as_u64(), 0);
-        assert_eq!(snapshots[0].v1_ref().catalog_sequence_number.get(), 0);
-    }
-
-    #[tokio::test]
-    async fn load_snapshot_works_with_no_exising_snapshots() {
-        let store = InMemory::new();
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let persister = Persister::new(Arc::new(store), "test_host", time_provider);
-
-        let snapshots = persister.load_snapshots(100).await.unwrap();
-        assert!(snapshots.is_empty());
-    }
-
-    #[test]
-    fn persisted_snapshot_structure() {
-        let databases = [
-            (
-                DbId::new(0),
-                DatabaseTables {
-                    tables: [
-                        (
-                            TableId::new(0),
-                            vec![
-                                ParquetFile::create_for_test("1.parquet"),
-                                ParquetFile::create_for_test("2.parquet"),
-                            ],
-                        ),
-                        (
-                            TableId::new(1),
-                            vec![
-                                ParquetFile::create_for_test("3.parquet"),
-                                ParquetFile::create_for_test("4.parquet"),
-                            ],
-                        ),
-                    ]
-                    .into(),
-                },
-            ),
-            (
-                DbId::new(1),
-                DatabaseTables {
-                    tables: [
-                        (
-                            TableId::new(0),
-                            vec![
-                                ParquetFile::create_for_test("5.parquet"),
-                                ParquetFile::create_for_test("6.parquet"),
-                            ],
-                        ),
-                        (
-                            TableId::new(1),
-                            vec![
-                                ParquetFile::create_for_test("7.parquet"),
-                                ParquetFile::create_for_test("8.parquet"),
-                            ],
-                        ),
-                    ]
-                    .into(),
-                },
-            ),
-        ]
-        .into();
-        let snapshot = PersistedSnapshotVersion::V1(PersistedSnapshot {
-            node_id: "host".to_string(),
-            next_file_id: ParquetFileId::new(),
-            snapshot_sequence_number: SnapshotSequenceNumber::new(0),
-            wal_file_sequence_number: WalFileSequenceNumber::new(0),
-            catalog_sequence_number: CatalogSequenceNumber::new(0),
-            parquet_size_bytes: 1_024,
-            row_count: 1,
-            min_time: 0,
-            max_time: 1,
-            removed_files: SerdeVecMap::new(),
-            databases,
-        });
-        insta::assert_json_snapshot!(snapshot);
-    }
-
-    #[tokio::test]
-    async fn get_parquet_bytes() {
-        let local_disk =
-            LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let persister = Persister::new(Arc::new(local_disk), "test_host", time_provider);
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let stream_builder = RecordBatchReceiverStreamBuilder::new(Arc::clone(&schema), 5);
-
-        let id_array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let batch1 = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(id_array)]).unwrap();
-
-        let id_array = Int32Array::from(vec![6, 7, 8, 9, 10]);
-        let batch2 = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(id_array)]).unwrap();
-
-        stream_builder.tx().send(Ok(batch1)).await.unwrap();
-        stream_builder.tx().send(Ok(batch2)).await.unwrap();
-
-        let parquet = persister
-            .serialize_to_parquet(stream_builder.build())
-            .await
-            .unwrap();
-
-        // Assert we've written all the expected rows
-        assert_eq!(parquet.meta_data.num_rows, 10);
-    }
-
-    #[tokio::test]
-    async fn persist_and_load_parquet_bytes() {
-        let local_disk =
-            LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let persister = Persister::new(Arc::new(local_disk), "test_host", time_provider);
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let stream_builder = RecordBatchReceiverStreamBuilder::new(Arc::clone(&schema), 5);
-
-        let id_array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let batch1 = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(id_array)]).unwrap();
-
-        let id_array = Int32Array::from(vec![6, 7, 8, 9, 10]);
-        let batch2 = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(id_array)]).unwrap();
-
-        stream_builder.tx().send(Ok(batch1)).await.unwrap();
-        stream_builder.tx().send(Ok(batch2)).await.unwrap();
-
-        let path = ParquetFilePath::new(
-            "test_host",
-            "db_one",
-            0,
-            "table_one",
-            0,
-            Utc::now().timestamp_nanos_opt().unwrap(),
-            WalFileSequenceNumber::new(1),
-        );
-        let (bytes_written, meta, _) = persister
-            .persist_parquet_file(path.clone(), stream_builder.build())
-            .await
-            .unwrap();
-
-        // Assert we've written all the expected rows
-        assert_eq!(meta.num_rows, 10);
-
-        let bytes = persister.load_parquet_file(path).await.unwrap();
-
-        // Assert that we have a file of bytes > 0
-        assert!(!bytes.is_empty());
-        assert_eq!(bytes.len() as u64, bytes_written);
+    /// Test helper: Get the last checkpoint time
+    fn get_last_checkpoint_time(&self) -> Option<Instant> {
+        *self.last_checkpoint_time.read()
     }
 }
+
+#[cfg(test)]
+mod tests;

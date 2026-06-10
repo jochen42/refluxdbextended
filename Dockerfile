@@ -1,5 +1,5 @@
 #syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.88
+ARG RUST_VERSION=1.92
 FROM rust:${RUST_VERSION}-slim-bookworm as build
 
 # cache mounts below may already exist and owned by root
@@ -94,7 +94,7 @@ RUN chmod +x /usr/bin/influxdb3 /usr/bin/entrypoint.sh
 
 EXPOSE 8181
 
-ENV LOG_FILTER=info
+ENV INFLUXDB3_LOG_FILTER=info
 
 ENTRYPOINT ["/usr/bin/entrypoint.sh"]
 

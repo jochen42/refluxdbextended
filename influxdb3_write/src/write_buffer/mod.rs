@@ -1,5 +1,6 @@
 //! Implementation of an in-memory buffer for writes that persists data into a wal if it is configured.
 
+pub mod checkpoint;
 mod metrics;
 pub mod persisted_files;
 pub mod queryable_buffer;
@@ -11,19 +12,18 @@ pub mod validator;
 
 use crate::{
     BufferedWriteRequest, Bufferer, ChunkContainer, ChunkFilter, DistinctCacheManager,
-    LastCacheManager, ParquetFile, PersistedSnapshot, PersistedSnapshotVersion, Precision,
-    WriteBuffer, WriteLineError,
+    LastCacheManager, ParquetFile, PersistedSnapshot, PersistedSnapshotCheckpointVersion,
+    PersistedSnapshotVersion, Precision, WriteBuffer, WriteLineError,
     chunk::ParquetChunk,
     persister::{Persister, PersisterError},
     write_buffer::{
-        persisted_files::PersistedFiles, queryable_buffer::QueryableBuffer,
-        validator::WriteValidator,
+        checkpoint::year_month_from_timestamp_ms, persisted_files::PersistedFiles,
+        queryable_buffer::QueryableBuffer, validator::WriteValidator,
     },
 };
 use async_trait::async_trait;
 use data_types::{
     ChunkId, ChunkOrder, ColumnType, NamespaceName, NamespaceNameError, PartitionHashId,
-    PartitionId,
 };
 use datafusion::{
     catalog::Session, common::DataFusionError, datasource::object_store::ObjectStoreUrl,
@@ -42,7 +42,7 @@ use influxdb3_catalog::{
 };
 use influxdb3_id::{DbId, TableId};
 use influxdb3_wal::{
-    Wal, WalConfig, WalFileNotifier, WalOp,
+    SnapshotSequenceNumber, Wal, WalConfig, WalFileNotifier, WalOp,
     object_store::{CreateWalObjectStoreArgs, WalObjectStore},
 };
 use iox_query::{
@@ -54,16 +54,21 @@ use iox_time::{Time, TimeProvider};
 use metric::Registry;
 use metrics::WriteMetrics;
 use object_store::{ObjectMeta, ObjectStore, path::Path as ObjPath};
-use observability_deps::tracing::{debug, error, warn};
-use parquet_file::storage::ParquetExecInput;
+use observability_deps::tracing::{debug, info, trace, warn};
+use parquet_file::storage::DataSourceExecInput;
 use queryable_buffer::QueryableBufferArgs;
 use schema::Schema;
-use std::{borrow::Borrow, sync::Arc, time::Duration};
+use std::{
+    borrow::Borrow,
+    num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
+    time::Duration,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("parsing for line protocol failed")]
+    #[error("line protocol parse failed: {}", .0.error_message)]
     ParseError(WriteLineError),
 
     #[error("incoming write was empty")]
@@ -106,6 +111,9 @@ pub enum Error {
     #[error("tried creating database named '{0}' that already exists")]
     DatabaseExists(String),
 
+    #[error("cannot write to soft-deleted database '{0}' - it is marked for deletion")]
+    DatabaseDeleted(String),
+
     #[error("tried accessing table that do not exist")]
     TableDoesNotExist,
 
@@ -126,9 +134,6 @@ pub enum Error {
 
     #[error("error from wal: {0}")]
     WalError(#[from] influxdb3_wal::Error),
-
-    #[error("cannot write to a read-only server")]
-    NoWriteInReadOnly,
 
     #[error("error in distinct value cache: {0}")]
     DistinctCacheError(#[from] distinct_cache::ProviderError),
@@ -173,7 +178,7 @@ pub struct WriteBufferImpl {
 }
 
 /// The maximum number of snapshots to load on start
-pub const N_SNAPSHOTS_TO_LOAD_ON_START: usize = 1_000;
+pub const N_SNAPSHOTS_TO_LOAD_ON_START: NonZeroU64 = NonZeroU64::new(1_000).unwrap();
 
 #[derive(Debug)]
 pub struct WriteBufferImplArgs {
@@ -188,9 +193,10 @@ pub struct WriteBufferImplArgs {
     pub metric_registry: Arc<Registry>,
     pub snapshotted_wal_files_to_keep: u64,
     pub query_file_limit: Option<usize>,
-    pub n_snapshots_to_load_on_start: usize,
+    pub n_snapshots_to_load_on_start: NonZeroU64,
     pub shutdown: ShutdownToken,
-    pub wal_replay_concurrency_limit: Option<usize>,
+    pub wal_replay_concurrency_limit: usize,
+    pub parquet_snapshot_concurrency_limit: NonZeroUsize,
     /// Set in multi-node deployments so WAL-driven snapshots are also published
     /// to a globally-readable namespace. `None` keeps legacy single-node
     /// behavior (per-node snapshot prefix only).
@@ -214,37 +220,200 @@ impl WriteBufferImpl {
             n_snapshots_to_load_on_start,
             shutdown,
             wal_replay_concurrency_limit,
+            parquet_snapshot_concurrency_limit,
             shared_inventory,
         }: WriteBufferImplArgs,
     ) -> Result<Arc<Self>> {
-        // load snapshots and replay the wal into the in memory buffer
-        let persisted_snapshots = persister
-            .load_snapshots(n_snapshots_to_load_on_start)
-            .await?
-            .into_iter()
-            // map the persisted snapshots into the newest version
-            .map(|psv| match psv {
-                PersistedSnapshotVersion::V1(ps) => ps,
-            })
-            .collect::<Vec<PersistedSnapshot>>();
-        let last_wal_sequence_number = persisted_snapshots
-            .first()
-            .map(|s| s.wal_file_sequence_number);
-        let last_snapshot_sequence_number = persisted_snapshots
-            .first()
-            .map(|s| s.snapshot_sequence_number);
-        // If we have any snapshots, set sequential IDs from the newest one.
-        if let Some(first_snapshot) = persisted_snapshots.first() {
-            first_snapshot.next_file_id.set_next_id();
-        }
+        // Calculate sequence cutoff based on n_snapshots_to_load_on_start
+        let sequence_cutoff = match persister.get_latest_snapshot_sequence().await {
+            Ok(Some(latest)) => {
+                let cutoff = latest
+                    .as_u64()
+                    .saturating_sub(n_snapshots_to_load_on_start.get());
+                Some(SnapshotSequenceNumber::new(cutoff))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(%e, "Failed to get latest snapshot sequence, loading all checkpoints");
+                None
+            }
+        };
 
+        // Try to load from checkpoints first for faster startup
+        let checkpoint_paths = match persister
+            .list_latest_checkpoints_per_month(sequence_cutoff)
+            .await
+        {
+            Ok(paths) => paths,
+            Err(e) => {
+                warn!(
+                    %e,
+                    "Failed to list checkpoints, falling back to snapshot loading. \
+                     This may result in slower startup."
+                );
+                Vec::new()
+            }
+        };
+
+        let (persisted_files, last_wal_sequence_number, last_snapshot_sequence_number) =
+            if !checkpoint_paths.is_empty() {
+                // Load checkpoints and any snapshots newer than the checkpoints
+                info!(
+                    checkpoint_count = checkpoint_paths.len(),
+                    "Loading from checkpoints for faster startup"
+                );
+
+                let checkpoints = persister
+                    .load_checkpoints(checkpoint_paths)
+                    .await?
+                    .into_iter()
+                    .map(|cpv| match cpv {
+                        PersistedSnapshotCheckpointVersion::V1(cp) => cp,
+                    })
+                    .collect::<Vec<_>>();
+
+                // Warm the persister's checkpoint cache with the current month's checkpoint
+                // This enables incremental updates during this server session
+                {
+                    let current_month =
+                        year_month_from_timestamp_ms(time_provider.now().timestamp_millis());
+                    if let Some(current_month_checkpoint) =
+                        checkpoints.iter().find(|c| c.year_month == current_month)
+                    {
+                        persister.warm_checkpoint_cache(current_month_checkpoint.clone());
+                    }
+                }
+
+                // Find the max snapshot sequence number across all checkpoints
+                let max_checkpoint_snapshot_seq = checkpoints
+                    .iter()
+                    .map(|c| c.last_snapshot_sequence_number)
+                    .max();
+
+                // Load snapshots newer than the checkpoint
+                let additional_snapshots = if let Some(max_seq) = max_checkpoint_snapshot_seq {
+                    persister
+                        .load_snapshots_after(max_seq, n_snapshots_to_load_on_start.get() as usize)
+                        .await?
+                        .into_iter()
+                        .map(|psv| match psv {
+                            PersistedSnapshotVersion::V1(ps) => ps,
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+
+                info!(
+                    checkpoints_loaded = checkpoints.len(),
+                    additional_snapshots = additional_snapshots.len(),
+                    "Checkpoint loading complete"
+                );
+
+                // Determine last WAL/snapshot sequence from either additional snapshots or checkpoints
+                let (last_wal_seq, last_snap_seq, next_file_id) =
+                    if let Some(first_snap) = additional_snapshots.first() {
+                        (
+                            Some(first_snap.wal_file_sequence_number),
+                            Some(first_snap.snapshot_sequence_number),
+                            Some(first_snap.next_file_id),
+                        )
+                    } else if let Some(newest_checkpoint) = checkpoints
+                        .iter()
+                        .max_by_key(|c| c.last_snapshot_sequence_number)
+                    {
+                        (
+                            Some(newest_checkpoint.wal_file_sequence_number),
+                            Some(newest_checkpoint.last_snapshot_sequence_number),
+                            newest_checkpoint.next_file_id,
+                        )
+                    } else {
+                        (None, None, None)
+                    };
+
+                // Set the next file ID if available
+                if let Some(file_id) = next_file_id {
+                    file_id.set_next_id();
+                }
+
+                let persisted_files = Arc::new(PersistedFiles::new_from_checkpoints_and_snapshots(
+                    None,
+                    checkpoints,
+                    additional_snapshots,
+                ));
+
+                (persisted_files, last_wal_seq, last_snap_seq)
+            } else {
+                // Fall back to loading snapshots directly
+                debug!("No checkpoints found, loading snapshots directly");
+
+                let persisted_snapshots = persister
+                    .load_snapshots(n_snapshots_to_load_on_start.get() as usize)
+                    .await?
+                    .into_iter()
+                    .map(|psv| match psv {
+                        PersistedSnapshotVersion::V1(ps) => ps,
+                    })
+                    .collect::<Vec<PersistedSnapshot>>();
+
+                // Wrap snapshots in Arc to share between background task and PersistedFiles
+                // without cloning the entire Vec
+                let persisted_snapshots = Arc::new(persisted_snapshots);
+
+                // Build and persist checkpoints from loaded snapshots for faster future startup
+                // This runs in a background task to avoid blocking server startup
+                if !persisted_snapshots.is_empty() {
+                    let current_month =
+                        year_month_from_timestamp_ms(time_provider.now().timestamp_millis());
+                    let persister_clone = Arc::clone(&persister);
+                    let snapshots_for_background = Arc::clone(&persisted_snapshots);
+
+                    tokio::spawn(async move {
+                        if let Some(current_checkpoint) = persister_clone
+                            .build_and_persist_checkpoints_from_snapshots(
+                                &snapshots_for_background,
+                                current_month,
+                            )
+                            .await
+                        {
+                            // Warm cache with current month's checkpoint for incremental updates
+                            persister_clone.warm_checkpoint_cache(current_checkpoint);
+                        }
+                    });
+                }
+
+                let last_wal_seq = persisted_snapshots
+                    .first()
+                    .map(|s| s.wal_file_sequence_number);
+                let last_snap_seq = persisted_snapshots
+                    .first()
+                    .map(|s| s.snapshot_sequence_number);
+
+                // If we have any snapshots, set sequential IDs from the newest one.
+                if let Some(first_snapshot) = persisted_snapshots.first() {
+                    first_snapshot.next_file_id.set_next_id();
+                }
+
+                let persisted_files = Arc::new(PersistedFiles::new_from_persisted_snapshots(
+                    None,
+                    persisted_snapshots,
+                ));
+
+                (persisted_files, last_wal_seq, last_snap_seq)
+            };
         // Load compaction manifests and replay them after WAL snapshots so their
         // `removed_files` correctly cancel inputs that the WAL snapshots added.
         // Compaction manifests don't drive WAL/snapshot sequence numbers.
-        let compaction_snapshots = persister.load_compaction_snapshots().await?;
-
-        let mut combined_snapshots = persisted_snapshots;
-        combined_snapshots.extend(compaction_snapshots);
+        match persister.load_compaction_snapshots().await {
+            Ok(compaction_snapshots) => {
+                for snapshot in compaction_snapshots {
+                    persisted_files.add_persisted_snapshot_files(snapshot);
+                }
+            }
+            Err(e) => {
+                warn!(%e, "failed to load compaction manifests at startup");
+            }
+        }
 
         // Multi-node: also fold every peer's published WAL snapshots plus
         // checkpoint-pruned compaction manifests from the shared inventory.
@@ -258,10 +427,12 @@ impl WriteBufferImpl {
                 Ok(loaded) => {
                     initial_wal_watermarks = loaded.wal_watermarks.clone();
                     initial_compaction_watermark = loaded.compaction_watermark.clone();
-                    combined_snapshots.extend(loaded.flatten());
+                    for snapshot in loaded.flatten() {
+                        persisted_files.add_persisted_snapshot_files(snapshot);
+                    }
                 }
                 Err(e) => {
-                    observability_deps::tracing::warn!(
+                    warn!(
                         %e, "failed to load shared inventory at startup; \
                              only local node's data will be visible"
                     );
@@ -269,9 +440,6 @@ impl WriteBufferImpl {
             }
         }
 
-        let persisted_files = Arc::new(PersistedFiles::new_from_persisted_snapshots(
-            combined_snapshots,
-        ));
         let queryable_buffer = Arc::new(QueryableBuffer::new(QueryableBufferArgs {
             executor,
             catalog: Arc::clone(&catalog),
@@ -280,11 +448,17 @@ impl WriteBufferImpl {
             distinct_cache_provider: Arc::clone(&distinct_cache),
             persisted_files: Arc::clone(&persisted_files),
             parquet_cache: parquet_cache.clone(),
+            parquet_snapshot_concurrency_limit,
             shared_inventory: shared_inventory.clone(),
         }));
 
         // create the wal instance, which will replay into the queryable buffer and start
         // the background flush task.
+        trace!(
+            ?last_wal_sequence_number,
+            ?last_snapshot_sequence_number,
+            "WriteBufferImpl::new: creating WalObjectStore"
+        );
         let wal = WalObjectStore::new(CreateWalObjectStoreArgs {
             time_provider: Arc::clone(&time_provider),
             object_store: persister.object_store(),
@@ -438,12 +612,14 @@ impl WriteBufferImpl {
         if parquet_files.len() > self.query_file_limit {
             return Err(DataFusionError::External(
                 format!(
-                    "Query would exceed file limit of {} parquet files. \
-                     Please specify a smaller time range for your \
-                     query. You can increase the file limit with the \
-                     `--query-file-limit` option in the serve command, however, \
-                     query performance will be slower and the server may get \
-                     OOM killed or become unstable as a result",
+                    "Query would scan {} Parquet files, exceeding the file limit. \
+                     InfluxDB 3 Core caps file access to prevent performance degradation \
+                     and memory issues. Use a narrower time range, or increase the limit \
+                     with --query-file-limit (this may cause slower queries or instability).\n\n\
+                     To remove this limitation, upgrade to InfluxDB 3 Enterprise, which \
+                     automatically compacts files for efficient querying across any time range. \
+                     Free for non-commercial and home use, and free trials for commercial \
+                     evaluation: https://www.influxdata.com/downloads",
                     self.query_file_limit
                 )
                 .into(),
@@ -474,22 +650,19 @@ impl WriteBufferImpl {
             );
         }
 
-        let mut chunk_order = chunks.len() as i64;
         // Although this sends a cache request, it does not mean all these
         // files will be cached. This depends on parquet cache's capacity
         // and whether these files are recent enough
         cache_parquet_files(self.parquet_cache.clone(), &parquet_files);
 
-        for parquet_file in parquet_files {
+        for (chunk_order, parquet_file) in (chunks.len() as i64..).zip(parquet_files.iter()) {
             let parquet_chunk = parquet_chunk_from_file(
-                &parquet_file,
+                parquet_file,
                 &table_def.schema,
                 self.persister.object_store_url().clone(),
                 self.persister.object_store(),
                 chunk_order,
             );
-
-            chunk_order += 1;
 
             chunks.push(Arc::new(parquet_chunk));
         }
@@ -549,13 +722,7 @@ pub fn parquet_chunk_from_file(
     chunk_order: i64,
 ) -> ParquetChunk {
     let partition_key = data_types::PartitionKey::from(parquet_file.chunk_time.to_string());
-    let partition_id = data_types::partition::TransitionPartitionId::from_parts(
-        PartitionId::new(0),
-        Some(PartitionHashId::new(
-            data_types::TableId::new(0),
-            &partition_key,
-        )),
-    );
+    let partition_id = PartitionHashId::new(data_types::TableId::new(0), &partition_key);
 
     let chunk_stats = create_chunk_statistics(
         Some(parquet_file.row_count as usize),
@@ -564,14 +731,14 @@ pub fn parquet_chunk_from_file(
         &NoColumnRanges,
     );
 
-    let location = ObjPath::from(parquet_file.path.clone());
+    let location = ObjPath::parse(&parquet_file.path).expect("path should be parseable");
 
-    let parquet_exec = ParquetExecInput {
+    let parquet_exec = DataSourceExecInput {
         object_store_url,
         object_meta: ObjectMeta {
             location,
             last_modified: Default::default(),
-            size: parquet_file.size_bytes as usize,
+            size: parquet_file.size_bytes,
             e_tag: None,
             version: None,
         },
@@ -738,2916 +905,4 @@ async fn check_mem_and_force_snapshot(
 
 #[cfg(test)]
 #[allow(clippy::await_holding_lock)]
-mod tests {
-    use std::num::NonZeroUsize;
-
-    use super::*;
-    use crate::PersistedSnapshot;
-    use crate::paths::SnapshotInfoFilePath;
-    use crate::persister::Persister;
-    use crate::test_helpers::WriteBufferTester;
-    use arrow::array::AsArray;
-    use arrow::datatypes::Int32Type;
-    use arrow::record_batch::RecordBatch;
-    use arrow_util::{assert_batches_eq, assert_batches_sorted_eq};
-    use bytes::Bytes;
-    use datafusion_util::config::register_iox_object_store;
-    use executor::DedicatedExecutor;
-    use futures_util::StreamExt;
-    use influxdb3_cache::parquet_cache::test_cached_obj_store_and_oracle;
-    use influxdb3_catalog::catalog::{CatalogSequenceNumber, HardDeletionTime};
-    use influxdb3_catalog::log::FieldDataType;
-    use influxdb3_id::{ColumnId, DbId, ParquetFileId};
-    use influxdb3_shutdown::ShutdownManager;
-    use influxdb3_test_helpers::object_store::RequestCountedObjectStore;
-    use influxdb3_types::http::LastCacheSize;
-    use influxdb3_wal::{Gen1Duration, SnapshotSequenceNumber, WalFileSequenceNumber};
-    use iox_query::exec::{Executor, ExecutorConfig, IOxSessionContext, PerQueryMemoryPoolConfig};
-    use iox_time::{MockProvider, Time};
-    use metric::{Attributes, Metric, U64Counter};
-    use metrics::{
-        WRITE_BYTES_METRIC_NAME, WRITE_LINES_METRIC_NAME, WRITE_LINES_REJECTED_METRIC_NAME,
-    };
-    use object_store::local::LocalFileSystem;
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use object_store::{ObjectStore, PutPayload};
-    use parquet_file::storage::{ParquetStorage, StorageId};
-    use pretty_assertions::assert_eq;
-
-    #[tokio::test]
-    async fn parse_lp_into_buffer() {
-        let node_id = Arc::from("sample-host-id");
-        let obj_store = Arc::new(InMemory::new());
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let catalog = Arc::new(
-            Catalog::new(node_id, obj_store, time_provider, Default::default())
-                .await
-                .unwrap(),
-        );
-        let db_name = NamespaceName::new("foo").unwrap();
-        let lp = "cpu,region=west user=23.2 100\nfoo f1=1i";
-        WriteValidator::initialize(db_name, Arc::clone(&catalog))
-            .unwrap()
-            .v1_parse_lines_and_catalog_updates(
-                lp,
-                false,
-                Time::from_timestamp_nanos(0),
-                Precision::Nanosecond,
-            )
-            .unwrap()
-            .commit_catalog_changes()
-            .await
-            .unwrap()
-            .unwrap_success()
-            .convert_lines_to_buffer(Gen1Duration::new_5m());
-
-        let db = catalog.db_schema_by_id(&DbId::from(1)).unwrap();
-
-        assert_eq!(db.tables.len(), 2);
-        // cpu table
-        assert_eq!(
-            db.tables
-                .get_by_id(&TableId::from(0))
-                .unwrap()
-                .num_columns(),
-            3
-        );
-        // foo table
-        assert_eq!(
-            db.tables
-                .get_by_id(&TableId::from(1))
-                .unwrap()
-                .num_columns(),
-            2
-        );
-    }
-
-    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-    async fn writes_data_to_wal_and_is_queryable() {
-        let obj_store = Arc::new(InMemory::new());
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let catalog = Arc::new(
-            Catalog::new("test_host", obj_store, time_provider, Default::default())
-                .await
-                .unwrap(),
-        );
-        let time_provider: Arc<dyn TimeProvider> =
-            Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-        let (object_store, parquet_cache) = test_cached_obj_store_and_oracle(
-            catalog.object_store(),
-            Arc::clone(&time_provider),
-            Default::default(),
-        );
-        let persister = Arc::new(Persister::new(
-            catalog.object_store(),
-            "test_host",
-            Arc::clone(&time_provider),
-        ));
-        let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog) as _)
-            .await
-            .unwrap();
-        let distinct_cache = DistinctCacheProvider::new_from_catalog(
-            Arc::clone(&time_provider),
-            Arc::clone(&catalog),
-        )
-        .await
-        .unwrap();
-        let write_buffer = WriteBufferImpl::new(WriteBufferImplArgs {
-            persister: Arc::clone(&persister),
-            catalog: Arc::clone(&catalog),
-            last_cache,
-            distinct_cache,
-            time_provider: Arc::clone(&time_provider),
-            executor: make_exec(),
-            wal_config: WalConfig::test_config(),
-            parquet_cache: Some(Arc::clone(&parquet_cache)),
-            metric_registry: Default::default(),
-            snapshotted_wal_files_to_keep: 10,
-            query_file_limit: None,
-            n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
-            shutdown: ShutdownManager::new_testing().register(),
-            wal_replay_concurrency_limit: Some(1),
-            shared_inventory: None,
-        })
-        .await
-        .unwrap();
-        let session_context = IOxSessionContext::with_testing();
-        let runtime_env = session_context.inner().runtime_env();
-        register_iox_object_store(runtime_env, "influxdb3", Arc::clone(&object_store));
-
-        let _ = write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu bar=1 10",
-                Time::from_timestamp_nanos(123),
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
-            .unwrap();
-
-        let expected = [
-            "+-----+--------------------------------+",
-            "| bar | time                           |",
-            "+-----+--------------------------------+",
-            "| 1.0 | 1970-01-01T00:00:00.000000010Z |",
-            "+-----+--------------------------------+",
-        ];
-        let actual = write_buffer
-            .get_record_batches_unchecked("foo", "cpu", &session_context)
-            .await;
-        assert_batches_eq!(&expected, &actual);
-
-        // do two more writes to trigger a snapshot
-        let _ = write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu bar=2 20",
-                Time::from_timestamp_nanos(124),
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
-            .unwrap();
-
-        let _ = write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu bar=3 30",
-                Time::from_timestamp_nanos(125),
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await;
-
-        // query the buffer and make sure we get the data back
-        let expected = [
-            "+-----+--------------------------------+",
-            "| bar | time                           |",
-            "+-----+--------------------------------+",
-            "| 1.0 | 1970-01-01T00:00:00.000000010Z |",
-            "| 2.0 | 1970-01-01T00:00:00.000000020Z |",
-            "| 3.0 | 1970-01-01T00:00:00.000000030Z |",
-            "+-----+--------------------------------+",
-        ];
-        let actual = write_buffer
-            .get_record_batches_unchecked("foo", "cpu", &session_context)
-            .await;
-        assert_batches_eq!(&expected, &actual);
-
-        // now load a new buffer from object storage
-        let catalog = Arc::new(
-            Catalog::new(
-                "test_host",
-                catalog.object_store(),
-                Arc::clone(&time_provider),
-                Default::default(),
-            )
-            .await
-            .unwrap(),
-        );
-        let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog) as _)
-            .await
-            .unwrap();
-        let distinct_cache = DistinctCacheProvider::new_from_catalog(
-            Arc::clone(&time_provider),
-            Arc::clone(&catalog),
-        )
-        .await
-        .unwrap();
-        let write_buffer = WriteBufferImpl::new(WriteBufferImplArgs {
-            persister,
-            catalog,
-            last_cache,
-            distinct_cache,
-            time_provider,
-            executor: make_exec(),
-            wal_config: WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(50),
-                snapshot_size: 100,
-                ..Default::default()
-            },
-            parquet_cache: Some(Arc::clone(&parquet_cache)),
-            metric_registry: Default::default(),
-            snapshotted_wal_files_to_keep: 10,
-            query_file_limit: None,
-            n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
-            shutdown: ShutdownManager::new_testing().register(),
-            wal_replay_concurrency_limit: Some(1),
-            shared_inventory: None,
-        })
-        .await
-        .unwrap();
-
-        let actual = write_buffer
-            .get_record_batches_unchecked("foo", "cpu", &session_context)
-            .await;
-        assert_batches_eq!(&expected, &actual);
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn last_cache_create_and_delete_is_durable() {
-        let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (wbuf, _ctx, time_provider) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-        )
-        .await;
-        let db_name = "db";
-        let tbl_name = "table";
-        let cache_name = "cache";
-        // Write some data to the current segment and update the catalog:
-        wbuf.write_lp(
-            NamespaceName::new(db_name).unwrap(),
-            format!("{tbl_name},t1=a f1=true").as_str(),
-            Time::from_timestamp(20, 0).unwrap(),
-            false,
-            Precision::Nanosecond,
-            false,
-        )
-        .await
-        .unwrap();
-        // Create a last cache:
-        wbuf.catalog()
-            .create_last_cache(
-                db_name,
-                tbl_name,
-                Some(cache_name),
-                None as Option<&[&str]>,
-                None as Option<&[&str]>,
-                Default::default(),
-                Default::default(),
-            )
-            .await
-            .unwrap();
-
-        let reload = || async {
-            debug!("reloading the write buffer");
-            let time_provider = Arc::clone(&time_provider);
-            let catalog = Arc::new(
-                Catalog::new(
-                    "test_host",
-                    Arc::clone(&obj_store),
-                    Arc::clone(&time_provider),
-                    Default::default(),
-                )
-                .await
-                .unwrap(),
-            );
-            let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog) as _)
-                .await
-                .unwrap();
-            let distinct_cache = DistinctCacheProvider::new_from_catalog(
-                Arc::clone(&time_provider),
-                Arc::clone(&catalog),
-            )
-            .await
-            .unwrap();
-            WriteBufferImpl::new(WriteBufferImplArgs {
-                persister: Arc::clone(&wbuf.persister),
-                catalog,
-                last_cache,
-                distinct_cache,
-                time_provider,
-                executor: Arc::clone(&wbuf.buffer.executor),
-                wal_config: WalConfig {
-                    gen1_duration: Gen1Duration::new_1m(),
-                    max_write_buffer_size: 100,
-                    flush_interval: Duration::from_millis(10),
-                    snapshot_size: 1,
-                    ..Default::default()
-                },
-                parquet_cache: wbuf.parquet_cache.clone(),
-                metric_registry: Default::default(),
-                snapshotted_wal_files_to_keep: 10,
-                query_file_limit: None,
-                n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
-                shutdown: ShutdownManager::new_testing().register(),
-                wal_replay_concurrency_limit: Some(1),
-                shared_inventory: None,
-            })
-            .await
-            .unwrap()
-        };
-
-        // load a new write buffer to ensure its durable
-        let wbuf = reload().await;
-
-        let catalog_json = wbuf.catalog.snapshot();
-        debug!(?catalog_json, "reloaded catalog");
-        insta::assert_json_snapshot!("catalog-immediately-after-last-cache-create",
-            catalog_json,
-            { ".catalog_uuid" => "[uuid]" }
-        );
-
-        // Do another write that will update the state of the catalog, specifically, the table
-        // that the last cache was created for, and add a new field to the table/cache `f2`:
-        wbuf.write_lp(
-            NamespaceName::new(db_name).unwrap(),
-            format!("{tbl_name},t1=a f1=false,f2=42i").as_str(),
-            Time::from_timestamp(30, 0).unwrap(),
-            false,
-            Precision::Nanosecond,
-            false,
-        )
-        .await
-        .unwrap();
-
-        // and do another replay and verification
-        let wbuf = reload().await;
-
-        let catalog_json = wbuf.catalog.snapshot();
-        insta::assert_json_snapshot!(
-           "catalog-after-last-cache-create-and-new-field",
-           catalog_json,
-           { ".catalog_uuid" => "[uuid]" }
-        );
-
-        // write a new data point to fill the cache
-        wbuf.write_lp(
-            NamespaceName::new(db_name).unwrap(),
-            format!("{tbl_name},t1=a f1=true,f2=53i").as_str(),
-            Time::from_timestamp(40, 0).unwrap(),
-            false,
-            Precision::Nanosecond,
-            false,
-        )
-        .await
-        .unwrap();
-
-        // Fetch record batches from the last cache directly:
-        let expected = [
-            "+----+------+----+----------------------+",
-            "| t1 | f1   | f2 | time                 |",
-            "+----+------+----+----------------------+",
-            "| a  | true | 53 | 1970-01-01T00:00:40Z |",
-            "+----+------+----+----------------------+",
-        ];
-        let db_schema = wbuf.catalog().db_schema(db_name).unwrap();
-        let tbl_id = db_schema.table_name_to_id(tbl_name).unwrap();
-        let actual = wbuf
-            .last_cache_provider()
-            .get_cache_record_batches(db_schema.id, tbl_id, None)
-            .unwrap()
-            .unwrap();
-        assert_batches_eq!(&expected, &actual);
-        // Delete the last cache:
-        wbuf.catalog()
-            .delete_last_cache(db_name, tbl_name, cache_name)
-            .await
-            .unwrap();
-
-        // do another reload and verify it's gone
-        reload().await;
-
-        let catalog_json = wbuf.catalog.snapshot();
-        insta::assert_json_snapshot!("catalog-immediately-after-last-cache-delete",
-            catalog_json,
-            { ".catalog_uuid" => "[uuid]" }
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn returns_chunks_across_parquet_and_buffered_data() {
-        let obj_store = Arc::new(InMemory::new());
-        let (write_buffer, session_context, time_provider) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store) as _,
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 2,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let _ = write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu bar=1",
-                Time::from_timestamp(10, 0).unwrap(),
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
-            .unwrap();
-
-        let expected = [
-            "+-----+----------------------+",
-            "| bar | time                 |",
-            "+-----+----------------------+",
-            "| 1.0 | 1970-01-01T00:00:10Z |",
-            "+-----+----------------------+",
-        ];
-        let actual = write_buffer
-            .get_record_batches_unchecked("foo", "cpu", &session_context)
-            .await;
-        assert_batches_sorted_eq!(&expected, &actual);
-
-        let _ = write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu bar=2",
-                Time::from_timestamp(65, 0).unwrap(),
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
-            .unwrap();
-
-        let expected = [
-            "+-----+----------------------+",
-            "| bar | time                 |",
-            "+-----+----------------------+",
-            "| 1.0 | 1970-01-01T00:00:10Z |",
-            "| 2.0 | 1970-01-01T00:01:05Z |",
-            "+-----+----------------------+",
-        ];
-        let actual = write_buffer
-            .get_record_batches_unchecked("foo", "cpu", &session_context)
-            .await;
-        assert_batches_sorted_eq!(&expected, &actual);
-
-        // trigger snapshot with a third write, creating parquet files
-        let _ = write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu bar=3 147000000000",
-                Time::from_timestamp(147, 0).unwrap(),
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
-            .unwrap();
-
-        // give the snapshot some time to persist in the background
-        let mut ticks = 0;
-        loop {
-            ticks += 1;
-            let persisted = write_buffer.persister.load_snapshots(1000).await.unwrap();
-            if !persisted.is_empty() {
-                assert_eq!(persisted.len(), 1);
-                assert_eq!(persisted[0].v1_ref().min_time, 10000000000);
-                assert_eq!(persisted[0].v1_ref().row_count, 2);
-                break;
-            } else if ticks > 10 {
-                panic!("not persisting");
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        let expected = [
-            "+-----+----------------------+",
-            "| bar | time                 |",
-            "+-----+----------------------+",
-            "| 3.0 | 1970-01-01T00:02:27Z |",
-            "| 2.0 | 1970-01-01T00:01:05Z |",
-            "| 1.0 | 1970-01-01T00:00:10Z |",
-            "+-----+----------------------+",
-        ];
-        let actual = write_buffer
-            .get_record_batches_unchecked("foo", "cpu", &session_context)
-            .await;
-        assert_batches_sorted_eq!(&expected, &actual);
-
-        // now validate that buffered data and parquet data are all returned
-        let _ = write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu bar=4",
-                Time::from_timestamp(250, 0).unwrap(),
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
-            .unwrap();
-
-        let expected = [
-            "+-----+----------------------+",
-            "| bar | time                 |",
-            "+-----+----------------------+",
-            "| 3.0 | 1970-01-01T00:02:27Z |",
-            "| 4.0 | 1970-01-01T00:04:10Z |",
-            "| 2.0 | 1970-01-01T00:01:05Z |",
-            "| 1.0 | 1970-01-01T00:00:10Z |",
-            "+-----+----------------------+",
-        ];
-        let actual = write_buffer
-            .get_record_batches_unchecked("foo", "cpu", &session_context)
-            .await;
-        assert_batches_sorted_eq!(&expected, &actual);
-
-        let actual = write_buffer
-            .get_record_batches_unchecked("foo", "cpu", &session_context)
-            .await;
-        assert_batches_sorted_eq!(&expected, &actual);
-        // and now replay in a new write buffer and attempt to write
-        let catalog = Arc::new(
-            Catalog::new(
-                "test_host",
-                Arc::clone(&obj_store) as _,
-                Arc::clone(&time_provider),
-                Default::default(),
-            )
-            .await
-            .unwrap(),
-        );
-        let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog) as _)
-            .await
-            .unwrap();
-        let distinct_cache = DistinctCacheProvider::new_from_catalog(
-            Arc::clone(&time_provider),
-            Arc::clone(&catalog),
-        )
-        .await
-        .unwrap();
-        let write_buffer = WriteBufferImpl::new(WriteBufferImplArgs {
-            persister: Arc::clone(&write_buffer.persister),
-            catalog,
-            last_cache,
-            distinct_cache,
-            time_provider: Arc::clone(&time_provider),
-            executor: Arc::clone(&write_buffer.buffer.executor),
-            wal_config: WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 2,
-                ..Default::default()
-            },
-            parquet_cache: write_buffer.parquet_cache.clone(),
-            metric_registry: Default::default(),
-            snapshotted_wal_files_to_keep: 10,
-            query_file_limit: None,
-            n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
-            shutdown: ShutdownManager::new_testing().register(),
-            wal_replay_concurrency_limit: Some(1),
-            shared_inventory: None,
-        })
-        .await
-        .unwrap();
-        let ctx = IOxSessionContext::with_testing();
-        let runtime_env = ctx.inner().runtime_env();
-        register_iox_object_store(
-            runtime_env,
-            "influxdb3",
-            write_buffer.persister.object_store(),
-        );
-
-        // verify the data is still there
-        let actual = write_buffer
-            .get_record_batches_unchecked("foo", "cpu", &ctx)
-            .await;
-        assert_batches_sorted_eq!(&expected, &actual);
-
-        // now write some new data
-        let _ = write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu bar=5",
-                Time::from_timestamp(300, 0).unwrap(),
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
-            .unwrap();
-
-        // and write more to force another snapshot
-        let _ = write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu bar=6",
-                Time::from_timestamp(330, 0).unwrap(),
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        let expected = [
-            "+-----+----------------------+",
-            "| bar | time                 |",
-            "+-----+----------------------+",
-            "| 1.0 | 1970-01-01T00:00:10Z |",
-            "| 2.0 | 1970-01-01T00:01:05Z |",
-            "| 3.0 | 1970-01-01T00:02:27Z |",
-            "| 4.0 | 1970-01-01T00:04:10Z |",
-            "| 5.0 | 1970-01-01T00:05:00Z |",
-            "| 6.0 | 1970-01-01T00:05:30Z |",
-            "+-----+----------------------+",
-        ];
-        let actual = write_buffer
-            .get_record_batches_unchecked("foo", "cpu", &ctx)
-            .await;
-        assert_batches_sorted_eq!(&expected, &actual);
-    }
-
-    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-    async fn catalog_snapshots_only_if_updated() {
-        let (write_buffer, _ctx, _time_provider) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::new(InMemory::new()),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(5),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let db_name = "foo";
-        // do three writes to force a snapshot
-        do_writes(
-            db_name,
-            write_buffer.as_ref(),
-            &[
-                TestWrite {
-                    lp: "cpu bar=1",
-                    time_seconds: 10,
-                },
-                TestWrite {
-                    lp: "cpu bar=2",
-                    time_seconds: 20,
-                },
-                TestWrite {
-                    lp: "cpu bar=3",
-                    time_seconds: 30,
-                },
-            ],
-        )
-        .await;
-
-        verify_snapshot_count(1, &write_buffer.persister).await;
-
-        // need another 3 writes to trigger next snapshot
-        do_writes(
-            db_name,
-            write_buffer.as_ref(),
-            &[
-                TestWrite {
-                    lp: "cpu bar=4",
-                    time_seconds: 40,
-                },
-                TestWrite {
-                    lp: "cpu bar=5",
-                    time_seconds: 50,
-                },
-                TestWrite {
-                    lp: "cpu bar=6",
-                    time_seconds: 60,
-                },
-            ],
-        )
-        .await;
-
-        // verify the catalog didn't get persisted, but a snapshot did
-        verify_snapshot_count(2, &write_buffer.persister).await;
-
-        // and finally, do 3 more, with a catalog update, forcing persistence
-        do_writes(
-            db_name,
-            write_buffer.as_ref(),
-            &[
-                TestWrite {
-                    lp: "cpu bar=7,asdf=true",
-                    time_seconds: 60,
-                },
-                TestWrite {
-                    lp: "cpu bar=8,asdf=true",
-                    time_seconds: 70,
-                },
-                TestWrite {
-                    lp: "cpu bar=9,asdf=true",
-                    time_seconds: 80,
-                },
-            ],
-        )
-        .await;
-
-        verify_snapshot_count(3, &write_buffer.persister).await;
-    }
-
-    /// Check that when a WriteBuffer is initialized with existing snapshot files, that newly
-    /// generated snapshot files use the next sequence number.
-    #[tokio::test]
-    async fn new_snapshots_use_correct_sequence() {
-        // set up a local file system object store:
-        let object_store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap());
-
-        // create a snapshot file that will be loaded on initialization of the write buffer:
-        // Set ParquetFileId to a non zero number for the snapshot
-        ParquetFileId::from(500).set_next_id();
-        let prev_snapshot_seq = SnapshotSequenceNumber::new(42);
-        let prev_snapshot = PersistedSnapshot::new(
-            "test_host".to_string(),
-            prev_snapshot_seq,
-            WalFileSequenceNumber::new(0),
-            CatalogSequenceNumber::new(0),
-        );
-        let snapshot_json =
-            serde_json::to_vec(&PersistedSnapshotVersion::V1(prev_snapshot)).unwrap();
-        // set ParquetFileId to be 0 so that we can make sure when it's loaded from the
-        // snapshot that it becomes the expected number
-        ParquetFileId::from(0).set_next_id();
-
-        // put the snapshot file in object store:
-        object_store
-            .put(
-                &SnapshotInfoFilePath::new("test_host", prev_snapshot_seq),
-                PutPayload::from_bytes(Bytes::from(snapshot_json)),
-            )
-            .await
-            .unwrap();
-
-        // setup the write buffer:
-        let (wbuf, _ctx, _time_provider) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&object_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(5),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        // Assert that loading the snapshots sets ParquetFileId to the correct id number
-        assert_eq!(ParquetFileId::new().as_u64(), 500);
-
-        // there should be one snapshot already, i.e., the one we created above:
-        verify_snapshot_count(1, &wbuf.persister).await;
-
-        // do three writes to force a new snapshot
-        wbuf.write_lp(
-            NamespaceName::new("foo").unwrap(),
-            "cpu bar=1",
-            Time::from_timestamp(10, 0).unwrap(),
-            false,
-            Precision::Nanosecond,
-            false,
-        )
-        .await
-        .unwrap();
-        wbuf.write_lp(
-            NamespaceName::new("foo").unwrap(),
-            "cpu bar=2",
-            Time::from_timestamp(20, 0).unwrap(),
-            false,
-            Precision::Nanosecond,
-            false,
-        )
-        .await
-        .unwrap();
-        wbuf.write_lp(
-            NamespaceName::new("foo").unwrap(),
-            "cpu bar=3",
-            Time::from_timestamp(30, 0).unwrap(),
-            false,
-            Precision::Nanosecond,
-            false,
-        )
-        .await
-        .unwrap();
-
-        // Check that there are now 2 snapshots:
-        verify_snapshot_count(2, &wbuf.persister).await;
-        // Check that the next sequence number is used for the new snapshot:
-        assert_eq!(
-            prev_snapshot_seq.next(),
-            wbuf.wal.last_snapshot_sequence_number().await
-        );
-        // Check the catalog sequence number in the latest snapshot is correct:
-        let persisted_snapshot_bytes = object_store
-            .get(&SnapshotInfoFilePath::new(
-                "test_host",
-                prev_snapshot_seq.next(),
-            ))
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-        let persisted_snapshot =
-            serde_json::from_slice::<PersistedSnapshot>(&persisted_snapshot_bytes).unwrap();
-        assert_eq!(
-            CatalogSequenceNumber::new(2),
-            persisted_snapshot.catalog_sequence_number
-        );
-    }
-
-    #[tokio::test]
-    async fn next_id_is_correct_number() {
-        // set up a local file system object store:
-        let object_store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap());
-
-        let prev_snapshot_seq = SnapshotSequenceNumber::new(42);
-        let mut prev_snapshot = PersistedSnapshot::new(
-            "test_host".to_string(),
-            prev_snapshot_seq,
-            WalFileSequenceNumber::new(0),
-            CatalogSequenceNumber::new(0),
-        );
-
-        assert_eq!(prev_snapshot.next_file_id.as_u64(), 0);
-
-        for _ in 0..=5 {
-            prev_snapshot.add_parquet_file(
-                DbId::from(0),
-                TableId::from(0),
-                ParquetFile {
-                    id: ParquetFileId::new(),
-                    path: "file/path2".into(),
-                    size_bytes: 20,
-                    row_count: 1,
-                    chunk_time: 1,
-                    min_time: 0,
-                    max_time: 1,
-                },
-            );
-        }
-
-        assert_eq!(prev_snapshot.databases.len(), 1);
-        let files = prev_snapshot.databases[&DbId::from(0)].tables[&TableId::from(0)].clone();
-
-        // Assert that all of the files are smaller than the next_file_id field
-        // and that their index corresponds to the order they were added in
-        assert_eq!(prev_snapshot.next_file_id.as_u64(), 6);
-        assert_eq!(files.len(), 6);
-        for (i, file) in files.iter().enumerate() {
-            assert_ne!(file.id, ParquetFileId::from(6));
-            assert!(file.id.as_u64() < 6);
-            assert_eq!(file.id.as_u64(), i as u64);
-        }
-
-        let snapshot_json =
-            serde_json::to_vec(&PersistedSnapshotVersion::V1(prev_snapshot)).unwrap();
-
-        // put the snapshot file in object store:
-        object_store
-            .put(
-                &SnapshotInfoFilePath::new("test_host", prev_snapshot_seq),
-                PutPayload::from_bytes(Bytes::from(snapshot_json)),
-            )
-            .await
-            .unwrap();
-
-        // setup the write buffer:
-        let (_wbuf, _ctx, _time_provider) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&object_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(5),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        // Test that the next_file_id has been set properly
-        assert_eq!(ParquetFileId::next_id().as_u64(), 6);
-    }
-
-    /// This is the reproducer for [#25277][see]
-    ///
-    /// [see]: https://github.com/influxdata/influxdb/issues/25277
-    #[test_log::test(tokio::test)]
-    async fn writes_not_dropped_on_snapshot() {
-        let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let wal_config = WalConfig {
-            gen1_duration: influxdb3_wal::Gen1Duration::new_1m(),
-            max_write_buffer_size: 100,
-            flush_interval: Duration::from_millis(10),
-            snapshot_size: 1,
-            ..Default::default()
-        };
-        let (mut wbuf, mut ctx, _time_provider) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store),
-            wal_config,
-        )
-        .await;
-
-        let db_name = "coffee_shop";
-        let tbl_name = "menu";
-
-        // do some writes to get a snapshot:
-        do_writes(
-            db_name,
-            wbuf.as_ref(),
-            &[
-                TestWrite {
-                    lp: format!("{tbl_name},name=espresso price=2.50"),
-                    time_seconds: 1,
-                },
-                TestWrite {
-                    lp: format!("{tbl_name},name=americano price=3.00"),
-                    time_seconds: 2,
-                },
-                TestWrite {
-                    lp: format!("{tbl_name},name=latte price=4.50"),
-                    time_seconds: 3,
-                },
-            ],
-        )
-        .await;
-
-        // wait for snapshot to be created:
-        verify_snapshot_count(1, &wbuf.persister).await;
-        // Get the record batches from before shutting down buffer:
-        let batches = wbuf
-            .get_record_batches_unchecked(db_name, tbl_name, &ctx)
-            .await;
-        assert_batches_sorted_eq!(
-            [
-                "+-----------+-------+----------------------+",
-                "| name      | price | time                 |",
-                "+-----------+-------+----------------------+",
-                "| americano | 3.0   | 1970-01-01T00:00:02Z |",
-                "| espresso  | 2.5   | 1970-01-01T00:00:01Z |",
-                "| latte     | 4.5   | 1970-01-01T00:00:03Z |",
-                "+-----------+-------+----------------------+",
-            ],
-            &batches
-        );
-        // initialize twice
-        for _i in 0..2 {
-            (wbuf, ctx, _) = setup(
-                Time::from_timestamp_nanos(0),
-                Arc::clone(&obj_store),
-                wal_config,
-            )
-            .await;
-        }
-
-        // Get the record batches from replayed buffer:
-        let batches = wbuf
-            .get_record_batches_unchecked(db_name, tbl_name, &ctx)
-            .await;
-        assert_batches_sorted_eq!(
-            [
-                "+-----------+-------+----------------------+",
-                "| name      | price | time                 |",
-                "+-----------+-------+----------------------+",
-                "| americano | 3.0   | 1970-01-01T00:00:02Z |",
-                "| espresso  | 2.5   | 1970-01-01T00:00:01Z |",
-                "| latte     | 4.5   | 1970-01-01T00:00:03Z |",
-                "+-----------+-------+----------------------+",
-            ],
-            &batches
-        );
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn writes_not_dropped_on_larger_snapshot_size() {
-        let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (wbuf, _, _) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 2,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let db_name = "coffee_shop";
-        let tbl_name = "menu";
-
-        // Do six writes to trigger a snapshot
-        do_writes(
-            db_name,
-            wbuf.as_ref(),
-            &[
-                TestWrite {
-                    lp: format!("{tbl_name},name=espresso,type=drink price=2.50"),
-                    time_seconds: 1,
-                },
-                TestWrite {
-                    lp: format!("{tbl_name},name=americano,type=drink price=3.00"),
-                    time_seconds: 2,
-                },
-                TestWrite {
-                    lp: format!("{tbl_name},name=latte,type=drink price=4.50"),
-                    time_seconds: 3,
-                },
-                TestWrite {
-                    lp: format!("{tbl_name},name=croissant,type=food price=5.50"),
-                    time_seconds: 4,
-                },
-                TestWrite {
-                    lp: format!("{tbl_name},name=muffin,type=food price=4.50"),
-                    time_seconds: 5,
-                },
-                TestWrite {
-                    lp: format!("{tbl_name},name=biscotto,type=food price=3.00"),
-                    time_seconds: 6,
-                },
-            ],
-        )
-        .await;
-
-        verify_snapshot_count(1, &wbuf.persister).await;
-
-        // Drop the write buffer, and create a new one that replays:
-        drop(wbuf);
-        let (wbuf, ctx, _time_provider) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 2,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        // Get the record batches from replyed buffer:
-        let batches = wbuf
-            .get_record_batches_unchecked(db_name, tbl_name, &ctx)
-            .await;
-        assert_batches_sorted_eq!(
-            [
-                "+-----------+-------+----------------------+-------+",
-                "| name      | price | time                 | type  |",
-                "+-----------+-------+----------------------+-------+",
-                "| americano | 3.0   | 1970-01-01T00:00:02Z | drink |",
-                "| biscotto  | 3.0   | 1970-01-01T00:00:06Z | food  |",
-                "| croissant | 5.5   | 1970-01-01T00:00:04Z | food  |",
-                "| espresso  | 2.5   | 1970-01-01T00:00:01Z | drink |",
-                "| latte     | 4.5   | 1970-01-01T00:00:03Z | drink |",
-                "| muffin    | 4.5   | 1970-01-01T00:00:05Z | food  |",
-                "+-----------+-------+----------------------+-------+",
-            ],
-            &batches
-        );
-    }
-
-    #[tokio::test]
-    async fn writes_not_dropped_with_future_writes() {
-        let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (wbuf, _, _) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let db_name = "coffee_shop";
-        let tbl_name = "menu";
-
-        // do some writes to get a snapshot:
-        do_writes(
-            db_name,
-            wbuf.as_ref(),
-            &[
-                TestWrite {
-                    lp: format!("{tbl_name},name=espresso price=2.50"),
-                    time_seconds: 1,
-                },
-                // This write is way out in the future, so as to be outside the normal
-                // range for a snapshot:
-                TestWrite {
-                    lp: format!("{tbl_name},name=americano price=3.00"),
-                    time_seconds: 20_000,
-                },
-                // This write will trigger the snapshot:
-                TestWrite {
-                    lp: format!("{tbl_name},name=latte price=4.50"),
-                    time_seconds: 3,
-                },
-            ],
-        )
-        .await;
-
-        // Wait for snapshot to be created:
-        verify_snapshot_count(1, &wbuf.persister).await;
-
-        // Now drop the write buffer, and create a new one that replays:
-        drop(wbuf);
-        let (wbuf, ctx, _) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        // Get the record batches from replayed buffer:
-        let batches = wbuf
-            .get_record_batches_unchecked(db_name, tbl_name, &ctx)
-            .await;
-        assert_batches_sorted_eq!(
-            [
-                "+-----------+-------+----------------------+",
-                "| name      | price | time                 |",
-                "+-----------+-------+----------------------+",
-                "| americano | 3.0   | 1970-01-01T05:33:20Z |",
-                "| espresso  | 2.5   | 1970-01-01T00:00:01Z |",
-                "| latte     | 4.5   | 1970-01-01T00:00:03Z |",
-                "+-----------+-------+----------------------+",
-            ],
-            &batches
-        );
-    }
-
-    #[tokio::test]
-    async fn notifies_watchers_of_snapshot() {
-        let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (wbuf, _, _) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let mut watcher = wbuf.watch_persisted_snapshots();
-        watcher.mark_changed();
-
-        let db_name = "coffee_shop";
-        let tbl_name = "menu";
-
-        // do some writes to get a snapshot:
-        do_writes(
-            db_name,
-            wbuf.as_ref(),
-            &[
-                TestWrite {
-                    lp: format!("{tbl_name},name=espresso price=2.50"),
-                    time_seconds: 1,
-                },
-                TestWrite {
-                    lp: format!("{tbl_name},name=americano price=3.00"),
-                    time_seconds: 2,
-                },
-                TestWrite {
-                    lp: format!("{tbl_name},name=latte price=4.50"),
-                    time_seconds: 3,
-                },
-            ],
-        )
-        .await;
-
-        // wait for snapshot to be created:
-        verify_snapshot_count(1, &wbuf.persister).await;
-        watcher.changed().await.unwrap();
-        let snapshot = watcher.borrow();
-        assert!(snapshot.is_some(), "watcher should be notified of snapshot");
-    }
-
-    #[tokio::test]
-    async fn test_db_id_is_persisted_and_updated() {
-        let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (wbuf, _, _) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        // do some writes to get a snapshot:
-        do_writes(
-            "coffee_shop",
-            wbuf.as_ref(),
-            &[
-                TestWrite {
-                    lp: "menu,name=espresso price=2.50",
-                    time_seconds: 1,
-                },
-                // This write is way out in the future, so as to be outside the normal
-                // range for a snapshot:
-                TestWrite {
-                    lp: "menu,name=americano price=3.00",
-                    time_seconds: 20_000,
-                },
-                // This write will trigger the snapshot:
-                TestWrite {
-                    lp: "menu,name=latte price=4.50",
-                    time_seconds: 3,
-                },
-            ],
-        )
-        .await;
-
-        // this persists the catalog immediately, so we don't wait for anything, just assert that
-        // the next db id is 1, since the above would have used 0
-        assert_eq!(wbuf.catalog().next_db_id(), DbId::new(2));
-
-        // drop the write buffer, and create a new one that replays and re-loads the catalog:
-        drop(wbuf);
-
-        // Set DbId to a large number to make sure it is properly set on replay
-        // and assert that it's what we expect it to be before we replay
-        let (wbuf, _, _) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        // check that the next db id is still 1
-        assert_eq!(wbuf.catalog().next_db_id(), DbId::new(2));
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_parquet_cache() {
-        // set up a write buffer using a TestObjectStore so we can spy on requests that get
-        // through to the object store for parquet files:
-        let test_store = Arc::new(RequestCountedObjectStore::new(Arc::new(InMemory::new())));
-        let obj_store: Arc<dyn ObjectStore> = Arc::clone(&test_store) as _;
-        let (wbuf, ctx, _) = setup_cache_optional(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-            true,
-        )
-        .await;
-        let db_name = "my_corp";
-        let db_id = DbId::from(1);
-        let tbl_name = "temp";
-        let tbl_id = TableId::from(0);
-
-        // make some writes to generate a snapshot:
-        do_writes(
-            db_name,
-            wbuf.as_ref(),
-            &[
-                TestWrite {
-                    lp: format!(
-                        "\
-                        {tbl_name},warehouse=us-east,room=01a,device=10001 reading=36\n\
-                        {tbl_name},warehouse=us-east,room=01b,device=10002 reading=29\n\
-                        {tbl_name},warehouse=us-east,room=02a,device=30003 reading=33\n\
-                        "
-                    ),
-                    time_seconds: 1,
-                },
-                TestWrite {
-                    lp: format!(
-                        "\
-                        {tbl_name},warehouse=us-east,room=01a,device=10001 reading=37\n\
-                        {tbl_name},warehouse=us-east,room=01b,device=10002 reading=28\n\
-                        {tbl_name},warehouse=us-east,room=02a,device=30003 reading=32\n\
-                        "
-                    ),
-                    time_seconds: 2,
-                },
-                // This write will trigger the snapshot:
-                TestWrite {
-                    lp: format!(
-                        "\
-                        {tbl_name},warehouse=us-east,room=01a,device=10001 reading=35\n\
-                        {tbl_name},warehouse=us-east,room=01b,device=10002 reading=24\n\
-                        {tbl_name},warehouse=us-east,room=02a,device=30003 reading=30\n\
-                        "
-                    ),
-                    time_seconds: 3,
-                },
-            ],
-        )
-        .await;
-
-        // Wait for snapshot to be created, once this is done, then the parquet has been persisted:
-        verify_snapshot_count(1, &wbuf.persister).await;
-
-        // get the path for the created parquet file:
-        let persisted_files = wbuf.persisted_files().get_files(db_id, tbl_id);
-        assert_eq!(1, persisted_files.len());
-        let path = ObjPath::from(persisted_files[0].path.as_str());
-
-        // check the number of requests to that path before making a query:
-        // there should be no get request, made by the cache oracle:
-        assert_eq!(0, test_store.get_request_count(&path));
-        assert_eq!(0, test_store.get_opts_request_count(&path));
-        assert_eq!(0, test_store.get_ranges_request_count(&path));
-        assert_eq!(0, test_store.get_range_request_count(&path));
-        assert_eq!(0, test_store.head_request_count(&path));
-
-        let batches = wbuf
-            .get_record_batches_unchecked(db_name, tbl_name, &ctx)
-            .await;
-        assert_batches_sorted_eq!(
-            [
-                "+--------+---------+------+----------------------+-----------+",
-                "| device | reading | room | time                 | warehouse |",
-                "+--------+---------+------+----------------------+-----------+",
-                "| 10001  | 35.0    | 01a  | 1970-01-01T00:00:03Z | us-east   |",
-                "| 10001  | 36.0    | 01a  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 10001  | 37.0    | 01a  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 10002  | 24.0    | 01b  | 1970-01-01T00:00:03Z | us-east   |",
-                "| 10002  | 28.0    | 01b  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 10002  | 29.0    | 01b  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 30003  | 30.0    | 02a  | 1970-01-01T00:00:03Z | us-east   |",
-                "| 30003  | 32.0    | 02a  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 30003  | 33.0    | 02a  | 1970-01-01T00:00:01Z | us-east   |",
-                "+--------+---------+------+----------------------+-----------+",
-            ],
-            &batches
-        );
-
-        // counts should not change, since requests for this parquet file hit the cache:
-        assert_eq!(0, test_store.get_request_count(&path));
-        assert_eq!(0, test_store.get_opts_request_count(&path));
-        assert_eq!(0, test_store.get_ranges_request_count(&path));
-        assert_eq!(0, test_store.get_range_request_count(&path));
-        assert_eq!(0, test_store.head_request_count(&path));
-    }
-    #[tokio::test]
-    async fn test_no_parquet_cache() {
-        // set up a write buffer using a TestObjectStore so we can spy on requests that get
-        // through to the object store for parquet files:
-        let test_store = Arc::new(RequestCountedObjectStore::new(Arc::new(InMemory::new())));
-        let obj_store: Arc<dyn ObjectStore> = Arc::clone(&test_store) as _;
-        let (wbuf, ctx, _) = setup_cache_optional(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-            false,
-        )
-        .await;
-        let db_name = "my_corp";
-        let db_id = DbId::from(1);
-        let tbl_name = "temp";
-        let tbl_id = TableId::from(0);
-
-        // make some writes to generate a snapshot:
-        do_writes(
-            db_name,
-            wbuf.as_ref(),
-            &[
-                TestWrite {
-                    lp: format!(
-                        "\
-                        {tbl_name},warehouse=us-east,room=01a,device=10001 reading=36\n\
-                        {tbl_name},warehouse=us-east,room=01b,device=10002 reading=29\n\
-                        {tbl_name},warehouse=us-east,room=02a,device=30003 reading=33\n\
-                        "
-                    ),
-                    time_seconds: 1,
-                },
-                TestWrite {
-                    lp: format!(
-                        "\
-                        {tbl_name},warehouse=us-east,room=01a,device=10001 reading=37\n\
-                        {tbl_name},warehouse=us-east,room=01b,device=10002 reading=28\n\
-                        {tbl_name},warehouse=us-east,room=02a,device=30003 reading=32\n\
-                        "
-                    ),
-                    time_seconds: 2,
-                },
-                // This write will trigger the snapshot:
-                TestWrite {
-                    lp: format!(
-                        "\
-                        {tbl_name},warehouse=us-east,room=01a,device=10001 reading=35\n\
-                        {tbl_name},warehouse=us-east,room=01b,device=10002 reading=24\n\
-                        {tbl_name},warehouse=us-east,room=02a,device=30003 reading=30\n\
-                        "
-                    ),
-                    time_seconds: 3,
-                },
-            ],
-        )
-        .await;
-
-        // Wait for snapshot to be created, once this is done, then the parquet has been persisted:
-        verify_snapshot_count(1, &wbuf.persister).await;
-
-        // get the path for the created parquet file:
-        let persisted_files = wbuf.persisted_files().get_files(db_id, tbl_id);
-        assert_eq!(1, persisted_files.len());
-        let path = ObjPath::from(persisted_files[0].path.as_str());
-
-        // check the number of requests to that path before making a query:
-        // there should be no get or get_range requests since nothing has asked for this file yet:
-        assert_eq!(0, test_store.get_request_count(&path));
-        assert_eq!(0, test_store.get_opts_request_count(&path));
-        assert_eq!(0, test_store.get_ranges_request_count(&path));
-        assert_eq!(0, test_store.get_range_request_count(&path));
-        assert_eq!(0, test_store.head_request_count(&path));
-
-        let batches = wbuf
-            .get_record_batches_unchecked(db_name, tbl_name, &ctx)
-            .await;
-        assert_batches_sorted_eq!(
-            [
-                "+--------+---------+------+----------------------+-----------+",
-                "| device | reading | room | time                 | warehouse |",
-                "+--------+---------+------+----------------------+-----------+",
-                "| 10001  | 35.0    | 01a  | 1970-01-01T00:00:03Z | us-east   |",
-                "| 10001  | 36.0    | 01a  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 10001  | 37.0    | 01a  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 10002  | 24.0    | 01b  | 1970-01-01T00:00:03Z | us-east   |",
-                "| 10002  | 28.0    | 01b  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 10002  | 29.0    | 01b  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 30003  | 30.0    | 02a  | 1970-01-01T00:00:03Z | us-east   |",
-                "| 30003  | 32.0    | 02a  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 30003  | 33.0    | 02a  | 1970-01-01T00:00:01Z | us-east   |",
-                "+--------+---------+------+----------------------+-----------+",
-            ],
-            &batches
-        );
-
-        // counts should change, since requests for this parquet file were made with no cache:
-        assert_eq!(0, test_store.get_request_count(&path));
-        assert_eq!(0, test_store.get_opts_request_count(&path));
-        assert_eq!(1, test_store.get_ranges_request_count(&path));
-        assert_eq!(2, test_store.get_range_request_count(&path));
-        assert_eq!(0, test_store.head_request_count(&path));
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_delete_database() {
-        let start_time = Time::from_rfc3339("2024-11-14T11:00:00+00:00").unwrap();
-        let test_store = Arc::new(InMemory::new());
-        let wal_config = WalConfig {
-            gen1_duration: Gen1Duration::new_1m(),
-            max_write_buffer_size: 100,
-            flush_interval: Duration::from_millis(10),
-            snapshot_size: 1,
-            ..Default::default()
-        };
-        let (write_buffer, _, _) =
-            setup_cache_optional(start_time, test_store, wal_config, false).await;
-        let _ = write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu,warehouse=us-east,room=01a,device=10001 reading=37\n",
-                start_time,
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
-            .unwrap();
-
-        let result = write_buffer
-            .catalog()
-            .soft_delete_database("foo", HardDeletionTime::Never)
-            .await;
-
-        assert!(result.is_ok());
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_delete_internal_database() {
-        let start_time = Time::from_rfc3339("2024-11-14T11:00:00+00:00").unwrap();
-        let test_store = Arc::new(InMemory::new());
-        let wal_config = WalConfig {
-            gen1_duration: Gen1Duration::new_1m(),
-            max_write_buffer_size: 100,
-            flush_interval: Duration::from_millis(10),
-            snapshot_size: 1,
-            wal_replay_fail_on_error: false,
-        };
-        let (write_buffer, _, _) =
-            setup_cache_optional(start_time, test_store, wal_config, false).await;
-        let returned_error = write_buffer
-            .catalog()
-            .soft_delete_database("_internal", HardDeletionTime::Never)
-            .await
-            .expect_err("delete _internal to fail");
-        assert!(matches!(
-            returned_error,
-            CatalogError::CannotDeleteInternalDatabase
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_delete_table() {
-        let start_time = Time::from_rfc3339("2024-11-14T11:00:00+00:00").unwrap();
-        let test_store = Arc::new(InMemory::new());
-        let wal_config = WalConfig {
-            gen1_duration: Gen1Duration::new_1m(),
-            max_write_buffer_size: 100,
-            flush_interval: Duration::from_millis(10),
-            snapshot_size: 1,
-            ..Default::default()
-        };
-        let (write_buffer, _, _) =
-            setup_cache_optional(start_time, test_store, wal_config, false).await;
-        let _ = write_buffer
-            .write_lp(
-                NamespaceName::new("foo").unwrap(),
-                "cpu,warehouse=us-east,room=01a,device=10001 reading=37\n",
-                start_time,
-                false,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
-            .unwrap();
-
-        let result = write_buffer
-            .catalog()
-            .soft_delete_table("foo", "cpu", HardDeletionTime::Never)
-            .await;
-
-        assert!(result.is_ok());
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn write_metrics() {
-        let object_store = Arc::new(InMemory::new());
-        let (buf, metrics) = setup_with_metrics(
-            Time::from_timestamp_nanos(0),
-            object_store,
-            WalConfig::test_config(),
-        )
-        .await;
-        let lines_observer = metrics
-            .get_instrument::<Metric<U64Counter>>(WRITE_LINES_METRIC_NAME)
-            .unwrap();
-        let lines_rejected_observer = metrics
-            .get_instrument::<Metric<U64Counter>>(WRITE_LINES_REJECTED_METRIC_NAME)
-            .unwrap();
-        let bytes_observer = metrics
-            .get_instrument::<Metric<U64Counter>>(WRITE_BYTES_METRIC_NAME)
-            .unwrap();
-
-        let db_1 = "foo";
-        let db_2 = "bar";
-
-        // do a write and check the metrics:
-        let lp = "\
-            cpu,region=us,host=a usage=10\n\
-            cpu,region=eu,host=b usage=10\n\
-            cpu,region=ca,host=c usage=10\n\
-            ";
-        do_writes(
-            db_1,
-            buf.as_ref(),
-            &[TestWrite {
-                lp,
-                time_seconds: 1,
-            }],
-        )
-        .await;
-        assert_eq!(
-            3,
-            lines_observer
-                .get_observer(&Attributes::from(&[("db", db_1)]))
-                .unwrap()
-                .fetch()
-        );
-        assert_eq!(
-            0,
-            lines_rejected_observer
-                .get_observer(&Attributes::from(&[("db", db_1)]))
-                .unwrap()
-                .fetch()
-        );
-        let mut bytes: usize = lp.lines().map(|l| l.len()).sum();
-        assert_eq!(
-            bytes as u64,
-            bytes_observer
-                .get_observer(&Attributes::from(&[("db", db_1)]))
-                .unwrap()
-                .fetch()
-        );
-
-        // do another write to that db and check again for updates:
-        let lp = "\
-            mem,region=us,host=a used=1,swap=4\n\
-            mem,region=eu,host=b used=1,swap=4\n\
-            mem,region=ca,host=c used=1,swap=4\n\
-            ";
-        do_writes(
-            db_1,
-            buf.as_ref(),
-            &[TestWrite {
-                lp,
-                time_seconds: 1,
-            }],
-        )
-        .await;
-        assert_eq!(
-            6,
-            lines_observer
-                .get_observer(&Attributes::from(&[("db", db_1)]))
-                .unwrap()
-                .fetch()
-        );
-        assert_eq!(
-            0,
-            lines_rejected_observer
-                .get_observer(&Attributes::from(&[("db", db_1)]))
-                .unwrap()
-                .fetch()
-        );
-        bytes += lp.lines().map(|l| l.len()).sum::<usize>();
-        assert_eq!(
-            bytes as u64,
-            bytes_observer
-                .get_observer(&Attributes::from(&[("db", db_1)]))
-                .unwrap()
-                .fetch()
-        );
-
-        // now do a write that will only be partially accepted to ensure that
-        // the metrics are only calculated for writes that get accepted:
-
-        // the legume will not be accepted, because it contains an invalid field type
-        // so should not be included in metric calculations:
-        let lp = "\
-            produce,type=fruit,name=banana price=1.50\n\
-            produce,type=fruit,name=papaya price=5.50\n\
-            produce,type=vegetable,name=lettuce price=1.00\n\
-            produce,type=fruit,name=lentils,family=legume price=2i\n\
-            ";
-        do_writes_partial(
-            db_2,
-            buf.as_ref(),
-            &[TestWrite {
-                lp,
-                time_seconds: 1,
-            }],
-        )
-        .await;
-        assert_eq!(
-            3,
-            lines_observer
-                .get_observer(&Attributes::from(&[("db", db_2)]))
-                .unwrap()
-                .fetch()
-        );
-        assert_eq!(
-            1,
-            lines_rejected_observer
-                .get_observer(&Attributes::from(&[("db", db_2)]))
-                .unwrap()
-                .fetch()
-        );
-        // only take first three (valid) lines to get expected bytes:
-        let bytes: usize = lp.lines().take(3).map(|l| l.len()).sum();
-        assert_eq!(
-            bytes as u64,
-            bytes_observer
-                .get_observer(&Attributes::from(&[("db", db_2)]))
-                .unwrap()
-                .fetch()
-        );
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_check_mem_and_force_snapshot() {
-        let tmp_dir = test_helpers::tmp_dir().unwrap();
-        debug!(
-            ?tmp_dir,
-            "using tmp dir for test_check_mem_and_force_snapshot"
-        );
-        let obj_store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(tmp_dir).unwrap());
-        let (write_buffer, _, _) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100_000,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 10,
-                ..Default::default()
-            },
-        )
-        .await;
-        // do bunch of writes
-        let lp = "\
-            cpu,region=us,host=a usage=10\n\
-            cpu,region=eu,host=b usage=10\n\
-            cpu,region=ca,host=c usage=10\n\
-            cpu,region=us,host=a usage=10\n\
-            cpu,region=eu,host=b usage=10\n\
-            cpu,region=ca,host=c usage=10\n\
-            cpu,region=us,host=a usage=10\n\
-            cpu,region=eu,host=b usage=10\n\
-            cpu,region=ca,host=c usage=10\n\
-            cpu,region=us,host=a usage=10\n\
-            cpu,region=eu,host=b usage=10\n\
-            cpu,region=ca,host=c usage=10\n\
-            cpu,region=us,host=a usage=10\n\
-            cpu,region=eu,host=b usage=10\n\
-            cpu,region=ca,host=c usage=10\n\
-            ";
-        for i in 1..=20 {
-            do_writes(
-                "sample",
-                write_buffer.as_ref(),
-                &[TestWrite {
-                    lp,
-                    time_seconds: i,
-                }],
-            )
-            .await;
-        }
-        let total_buffer_size_bytes_before = write_buffer.buffer.get_total_size_bytes();
-        debug!(?total_buffer_size_bytes_before, "total buffer size");
-
-        debug!("1st snapshot..");
-        check_mem_and_force_snapshot(&Arc::clone(&write_buffer), 50).await;
-
-        // check memory has gone down after forcing first snapshot
-        let total_buffer_size_bytes_after = write_buffer.buffer.get_total_size_bytes();
-        debug!(?total_buffer_size_bytes_after, "total buffer size");
-        assert!(total_buffer_size_bytes_before > total_buffer_size_bytes_after);
-        assert_dbs_not_empty_in_snapshot_file(&obj_store, "test_host").await;
-
-        let total_buffer_size_bytes_before = total_buffer_size_bytes_after;
-        debug!("2nd snapshot..");
-        //   PersistedSnapshot{
-        //     node_id: "test_host",
-        //     next_file_id: ParquetFileId(1),
-        //     next_db_id: DbId(1),
-        //     next_table_id: TableId(1),
-        //     next_column_id: ColumnId(4),
-        //     snapshot_sequence_number: SnapshotSequenceNumber(2),
-        //     wal_file_sequence_number: WalFileSequenceNumber(22),
-        //     catalog_sequence_number: CatalogSequenceNumber(2),
-        //     parquet_size_bytes: 0,
-        //     row_count: 0,
-        //     min_time: 9223372036854775807,
-        //     max_time: -9223372036854775808,
-        //     databases: SerdeVecMap({})
-        // }
-        // This snapshot file was observed when running under high memory pressure.
-        //
-        // The min/max time comes from the snapshot chunks that have been evicted from
-        // the query buffer. But when there's nothing evicted then the min/max stays
-        // the same as what they were initialized to i64::MAX/i64::MIN respectively.
-        //
-        // This however does not stop loading the data into memory as no empty
-        // parquet files are written out. But this test recreates that issue and checks
-        // object store directly to make sure inconsistent snapshot file isn't written
-        // out in the first place
-        check_mem_and_force_snapshot(&Arc::clone(&write_buffer), 50).await;
-        let total_buffer_size_bytes_after = write_buffer.buffer.get_total_size_bytes();
-        // no other writes so nothing can be snapshotted, so mem should stay same
-        assert!(total_buffer_size_bytes_before == total_buffer_size_bytes_after);
-
-        drop(write_buffer);
-        assert_dbs_not_empty_in_snapshot_file(&obj_store, "test_host").await;
-
-        // dropping write_buffer does not kill any background task (like snapshot which does a
-        // WAL file cleanup) which means when we start the buffer again it sees the WAL file but
-        // before it can read it's removed by the previous snapshot run. This extra sleep works
-        // around that issue for now.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // restart
-        debug!("Restarting..");
-        let (write_buffer_after_restart, _, _) = setup(
-            Time::from_timestamp_nanos(300),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100_000,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 10,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        assert_dbs_not_empty_in_snapshot_file(&obj_store, "test_host").await;
-        drop(write_buffer_after_restart);
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        // restart
-        debug!("Restarting again..");
-        let (_, _, _) = setup(
-            Time::from_timestamp_nanos(400),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100_000,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 10,
-                ..Default::default()
-            },
-        )
-        .await;
-        assert_dbs_not_empty_in_snapshot_file(&obj_store, "test_host").await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_out_of_order_data() {
-        let tmp_dir = test_helpers::tmp_dir().unwrap();
-        debug!(
-            ?tmp_dir,
-            "using tmp dir for test_check_mem_and_force_snapshot"
-        );
-        let obj_store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(tmp_dir).unwrap());
-        let (write_buffer, _, _) = setup(
-            // starting with 100
-            Time::from_timestamp_nanos(100),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100_000,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 5,
-                ..Default::default()
-            },
-        )
-        .await;
-        // do bunch of writes
-        let lp = "\
-            cpu,region=us,host=a usage=10\n\
-            ";
-
-        // add bunch of 100 - 111 timestamped data
-        for i in 100..=111 {
-            do_writes(
-                "sample",
-                write_buffer.as_ref(),
-                &[TestWrite {
-                    lp,
-                    time_seconds: i,
-                }],
-            )
-            .await;
-        }
-
-        // now introduce 20 - 30 timestamp data
-        // this is similar to back filling
-        for i in 20..=30 {
-            do_writes(
-                "sample",
-                write_buffer.as_ref(),
-                &[TestWrite {
-                    lp,
-                    time_seconds: i,
-                }],
-            )
-            .await;
-        }
-
-        let session_context = IOxSessionContext::with_testing();
-        let runtime_env = session_context.inner().runtime_env();
-        register_iox_object_store(runtime_env, "influxdb3", Arc::clone(&obj_store));
-
-        // at this point all of the data in query buffer will be
-        // for timestamps 20 - 50 and none of recent data will be
-        // in buffer.
-        let actual = write_buffer
-            .get_record_batches_unchecked("sample", "cpu", &session_context)
-            .await;
-        // not sorting, intentionally
-        assert_batches_eq!(
-            [
-                "+------+--------+----------------------+-------+",
-                "| host | region | time                 | usage |",
-                "+------+--------+----------------------+-------+",
-                "| a    | us     | 1970-01-01T00:00:23Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:24Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:25Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:26Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:27Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:28Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:29Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:30Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:01:40Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:01:41Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:01:42Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:01:43Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:01:44Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:01:45Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:01:46Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:01:47Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:01:48Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:01:49Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:01:50Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:01:51Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:20Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:21Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:22Z | 10.0  |",
-                "+------+--------+----------------------+-------+",
-            ],
-            &actual
-        );
-        debug!(num_items = ?actual.len(), "actual");
-
-        // so all the recent data which were in buffer have been snapshotted
-        // only the data that came in later to backfill is in buffer -
-        // it's visible by times below
-        let actual =
-            get_table_batches_from_query_buffer(&write_buffer, "sample", "cpu", &session_context)
-                .await;
-        assert_batches_eq!(
-            [
-                "+------+--------+----------------------+-------+",
-                "| host | region | time                 | usage |",
-                "+------+--------+----------------------+-------+",
-                "| a    | us     | 1970-01-01T00:00:23Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:24Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:25Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:26Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:27Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:28Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:29Z | 10.0  |",
-                "| a    | us     | 1970-01-01T00:00:30Z | 10.0  |",
-                "+------+--------+----------------------+-------+",
-            ],
-            &actual
-        );
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_out_of_order_data_with_last_cache() {
-        let tmp_dir = test_helpers::tmp_dir().unwrap();
-        debug!(
-            ?tmp_dir,
-            "using tmp dir for test_check_mem_and_force_snapshot"
-        );
-        let obj_store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(tmp_dir).unwrap());
-        let (write_buffer, _, _) = setup(
-            // starting with 100
-            Time::from_timestamp_nanos(100),
-            Arc::clone(&obj_store),
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100_000,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 5,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        // create db, table and last cache
-        write_buffer
-            .catalog()
-            .create_database("sample")
-            .await
-            .unwrap();
-
-        write_buffer
-            .catalog()
-            .create_table(
-                "sample",
-                "cpu",
-                &["region", "host"],
-                &[("usage", FieldDataType::Float)],
-            )
-            .await
-            .unwrap();
-
-        let db_schema = write_buffer.catalog().db_schema("sample").unwrap();
-        let table_id = db_schema.table_name_to_id("cpu").unwrap();
-        let db_id = db_schema.id;
-
-        write_buffer
-            .catalog()
-            .create_last_cache(
-                "sample",
-                "cpu",
-                Some("sample_cpu_usage"),
-                None as Option<&[&str]>,
-                None as Option<&[&str]>,
-                LastCacheSize::new(2).unwrap(),
-                Default::default(),
-            )
-            .await
-            .unwrap();
-
-        // do bunch of writes
-        let lp = "\
-            cpu,region=us,host=a usage=10\n\
-            ";
-
-        // add bunch of 100 - 111 timestamped data
-        for i in 100..=111 {
-            do_writes(
-                "sample",
-                write_buffer.as_ref(),
-                &[TestWrite {
-                    lp,
-                    time_seconds: i,
-                }],
-            )
-            .await;
-        }
-
-        // all above writes are in sequence, so querying last cache
-        // should fetch last 2 items inserted - namely 110 and 111
-        let all_vals = write_buffer
-            .last_cache_provider()
-            .get_cache_record_batches(db_id, table_id, Some("sample_cpu_usage"))
-            .unwrap()
-            .unwrap();
-        assert_batches_eq!(
-            [
-                "+--------+------+----------------------+-------+",
-                "| region | host | time                 | usage |",
-                "+--------+------+----------------------+-------+",
-                "| us     | a    | 1970-01-01T00:01:51Z | 10.0  |",
-                "| us     | a    | 1970-01-01T00:01:50Z | 10.0  |",
-                "+--------+------+----------------------+-------+",
-            ],
-            &all_vals
-        );
-
-        // now introduce 20 - 50 timestamp data
-        // this is similar to back filling
-        for i in 20..=30 {
-            do_writes(
-                "sample",
-                write_buffer.as_ref(),
-                &[TestWrite {
-                    lp,
-                    time_seconds: i,
-                }],
-            )
-            .await;
-        }
-
-        // we still want the same timestamps to be around when back filling
-        // the data
-        let all_vals = write_buffer
-            .last_cache_provider()
-            .get_cache_record_batches(db_id, table_id, Some("sample_cpu_usage"))
-            .unwrap()
-            .unwrap();
-        assert_batches_eq!(
-            [
-                "+--------+------+----------------------+-------+",
-                "| region | host | time                 | usage |",
-                "+--------+------+----------------------+-------+",
-                "| us     | a    | 1970-01-01T00:01:51Z | 10.0  |",
-                "| us     | a    | 1970-01-01T00:01:50Z | 10.0  |",
-                "+--------+------+----------------------+-------+",
-            ],
-            &all_vals
-        );
-    }
-
-    // 2 threads are used here as we drop the write buffer in this test and the test
-    // relies on parquet cache being able to work with eventual mode cache requests.
-    // When write buffer is dropped the default background_cache_handler loop gets
-    // stuck waiting for new messages in the channel. So, using another thread works
-    // around the problem - another way may have been to have some shutdown hook
-    // but that'd require further changes. For now, this work around should suffice
-    // if finer grained control is necessary, shutdown hook can be explored.
-    #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-    async fn test_query_path_parquet_cache() {
-        let inner_store = Arc::new(RequestCountedObjectStore::new(Arc::new(InMemory::new())));
-        let (write_buffer, ctx, _) = setup_cache_optional(
-            Time::from_timestamp_nanos(100),
-            Arc::clone(&inner_store) as _,
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-            false,
-        )
-        .await;
-        let db_name = "test_db";
-        // perform writes over time to generate WAL files and some snapshots
-        for i in 1..=3 {
-            let _ = write_buffer
-                .write_lp(
-                    NamespaceName::new(db_name).unwrap(),
-                    "temp,warehouse=us-east,room=01a,device=10001 reading=36\n\
-                temp,warehouse=us-east,room=01b,device=10002 reading=29\n\
-                temp,warehouse=us-east,room=02a,device=30003 reading=33\n\
-                ",
-                    Time::from_timestamp_nanos(i * 1_000_000_000),
-                    false,
-                    Precision::Nanosecond,
-                    false,
-                )
-                .await
-                .unwrap();
-        }
-
-        // Wait for snapshot to be created, once this is done, then the parquet has been persisted
-        verify_snapshot_count(1, &write_buffer.persister).await;
-
-        // get the path for the created parquet file
-        let persisted_files = write_buffer
-            .persisted_files()
-            .get_files(DbId::from(1), TableId::from(0));
-        assert_eq!(1, persisted_files.len());
-        let path = ObjPath::from(persisted_files[0].path.as_str());
-
-        let batches = write_buffer
-            .get_record_batches_unchecked(db_name, "temp", &ctx)
-            .await;
-        assert_batches_sorted_eq!(
-            [
-                "+--------+---------+------+----------------------+-----------+",
-                "| device | reading | room | time                 | warehouse |",
-                "+--------+---------+------+----------------------+-----------+",
-                "| 10001  | 36.0    | 01a  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 10001  | 36.0    | 01a  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 10001  | 36.0    | 01a  | 1970-01-01T00:00:03Z | us-east   |",
-                "| 10002  | 29.0    | 01b  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 10002  | 29.0    | 01b  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 10002  | 29.0    | 01b  | 1970-01-01T00:00:03Z | us-east   |",
-                "| 30003  | 33.0    | 02a  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 30003  | 33.0    | 02a  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 30003  | 33.0    | 02a  | 1970-01-01T00:00:03Z | us-east   |",
-                "+--------+---------+------+----------------------+-----------+",
-            ],
-            &batches
-        );
-
-        // at this point everything should've been snapshotted
-        drop(write_buffer);
-
-        debug!("test: stopped");
-        // nothing in the cache at this point and not in buffer
-        let (write_buffer, ctx, _) = setup_cache_optional(
-            // move the time
-            Time::from_timestamp_nanos(2_000_000_000),
-            Arc::clone(&inner_store) as _,
-            WalConfig {
-                gen1_duration: Gen1Duration::new_1m(),
-                max_write_buffer_size: 100,
-                flush_interval: Duration::from_millis(10),
-                snapshot_size: 1,
-                ..Default::default()
-            },
-            true,
-        )
-        .await;
-        debug!("test: restarted");
-
-        // nothing in query buffer
-        let batches =
-            get_table_batches_from_query_buffer(&write_buffer, db_name, "temp", &ctx).await;
-        assert_batches_sorted_eq!(["++", "++",], &batches);
-
-        // we need to get everything from OS and cache them
-        let batches = write_buffer
-            .get_record_batches_unchecked(db_name, "temp", &ctx)
-            .await;
-        assert_batches_sorted_eq!(
-            [
-                "+--------+---------+------+----------------------+-----------+",
-                "| device | reading | room | time                 | warehouse |",
-                "+--------+---------+------+----------------------+-----------+",
-                "| 10001  | 36.0    | 01a  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 10001  | 36.0    | 01a  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 10001  | 36.0    | 01a  | 1970-01-01T00:00:03Z | us-east   |",
-                "| 10002  | 29.0    | 01b  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 10002  | 29.0    | 01b  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 10002  | 29.0    | 01b  | 1970-01-01T00:00:03Z | us-east   |",
-                "| 30003  | 33.0    | 02a  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 30003  | 33.0    | 02a  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 30003  | 33.0    | 02a  | 1970-01-01T00:00:03Z | us-east   |",
-                "+--------+---------+------+----------------------+-----------+",
-            ],
-            &batches
-        );
-
-        // Give the cache a little time to populate before making another request
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        assert!(inner_store.total_read_request_count(&path) > 0);
-        let expected_req_counts = inner_store.total_read_request_count(&path);
-
-        let batches = write_buffer
-            .get_record_batches_unchecked(db_name, "temp", &ctx)
-            .await;
-        assert_batches_sorted_eq!(
-            [
-                "+--------+---------+------+----------------------+-----------+",
-                "| device | reading | room | time                 | warehouse |",
-                "+--------+---------+------+----------------------+-----------+",
-                "| 10001  | 36.0    | 01a  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 10001  | 36.0    | 01a  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 10001  | 36.0    | 01a  | 1970-01-01T00:00:03Z | us-east   |",
-                "| 10002  | 29.0    | 01b  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 10002  | 29.0    | 01b  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 10002  | 29.0    | 01b  | 1970-01-01T00:00:03Z | us-east   |",
-                "| 30003  | 33.0    | 02a  | 1970-01-01T00:00:01Z | us-east   |",
-                "| 30003  | 33.0    | 02a  | 1970-01-01T00:00:02Z | us-east   |",
-                "| 30003  | 33.0    | 02a  | 1970-01-01T00:00:03Z | us-east   |",
-                "+--------+---------+------+----------------------+-----------+",
-            ],
-            &batches
-        );
-
-        // everything came from cache, all counts should stay the same as
-        // above
-        assert_eq!(
-            expected_req_counts,
-            inner_store.total_read_request_count(&path)
-        );
-    }
-
-    #[tokio::test]
-    async fn series_key_updated_on_new_tag() {
-        let catalog = Arc::new(Catalog::new_in_memory("test-catalog").await.unwrap());
-        let db_name = NamespaceName::new("foo").unwrap();
-        let lp = "test_table,tag0=foo field0=1";
-        WriteValidator::initialize(db_name.clone(), Arc::clone(&catalog))
-            .unwrap()
-            .v1_parse_lines_and_catalog_updates(
-                lp,
-                false,
-                Time::from_timestamp_nanos(0),
-                Precision::Nanosecond,
-            )
-            .unwrap()
-            .commit_catalog_changes()
-            .await
-            .unwrap()
-            .unwrap_success()
-            .convert_lines_to_buffer(Gen1Duration::new_5m());
-
-        let db = catalog.db_schema_by_id(&DbId::from(1)).unwrap();
-
-        assert_eq!(db.tables.len(), 1);
-        assert_eq!(
-            db.tables
-                .get_by_id(&TableId::from(0))
-                .unwrap()
-                .num_columns(),
-            3
-        );
-
-        let lp = "test_table,tag1=bar field0=1";
-        WriteValidator::initialize(db_name, Arc::clone(&catalog))
-            .unwrap()
-            .v1_parse_lines_and_catalog_updates(
-                lp,
-                false,
-                Time::from_timestamp_nanos(0),
-                Precision::Nanosecond,
-            )
-            .unwrap()
-            .commit_catalog_changes()
-            .await
-            .unwrap()
-            .unwrap_success()
-            .convert_lines_to_buffer(Gen1Duration::new_5m());
-
-        assert_eq!(db.tables.len(), 1);
-        let db = catalog.db_schema_by_id(&DbId::from(1)).unwrap();
-        let table = db.tables.get_by_id(&TableId::from(0)).unwrap();
-        assert_eq!(table.num_columns(), 4);
-        assert_eq!(table.series_key.len(), 2);
-        assert_eq!(table.series_key[0], ColumnId::from(0));
-        assert_eq!(table.series_key[1], ColumnId::from(3));
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_empty_write_does_not_corrupt_wal() {
-        let object_store = Arc::new(InMemory::new());
-
-        let init = async || -> Arc<WriteBufferImpl> {
-            let (buf, _, _) = setup(
-                Time::from_timestamp_nanos(0),
-                Arc::clone(&object_store) as _,
-                WalConfig {
-                    gen1_duration: Gen1Duration::new_1m(),
-                    max_write_buffer_size: 1,
-                    flush_interval: Duration::from_millis(10),
-                    snapshot_size: 1,
-                    ..Default::default()
-                },
-            )
-            .await;
-            buf
-        };
-
-        let buf = init().await;
-
-        // empty write should be rejected:
-        let err = buf
-            .write_lp(
-                NamespaceName::new("cats").unwrap(),
-                "",
-                Time::from_timestamp_nanos(1),
-                true,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::EmptyWrite),
-            "should get an empty write error"
-        );
-
-        // do a write with only invalid lines:
-        let res = buf
-            .write_lp(
-                NamespaceName::new("cats").unwrap(),
-                "not_valid_line_protocol",
-                Time::from_timestamp_nanos(1),
-                true,
-                Precision::Nanosecond,
-                false,
-            )
-            .await
-            .unwrap();
-        assert_eq!(0, res.line_count);
-        assert_eq!(1, res.invalid_lines.len());
-
-        drop(buf);
-
-        // this should replay the wal and successfully initialize:
-        let _buf = init().await;
-    }
-
-    /// Check for the case where tags that exist in a table, but have not been written to since
-    /// the most recent server start, are perstisted as NULL and not an empty string
-    #[test_log::test(tokio::test)]
-    async fn test_null_tags_persisted_as_null_not_empty_string() {
-        // Setup object store and write buffer for first time
-        let object_store = Arc::new(InMemory::new());
-        let wal_config = WalConfig {
-            gen1_duration: influxdb3_wal::Gen1Duration::new_1m(),
-            max_write_buffer_size: 100,
-            flush_interval: Duration::from_millis(10),
-            snapshot_size: 1,
-            ..Default::default()
-        };
-        let (wb, _ctx, _tp) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&object_store) as _,
-            wal_config,
-        )
-        .await;
-
-        // Do enough writes to trigger a snapshot, so the row containing `tag` is flushed out
-        // of the write buffer, and will not be brought back when it is restarted:
-        do_writes(
-            "foo",
-            wb.as_ref(),
-            &[
-                // first write has `tag`, but all subsequent writes do not
-                TestWrite {
-                    lp: "bar,tag=a val=1",
-                    time_seconds: 1,
-                },
-                TestWrite {
-                    lp: "bar val=2",
-                    time_seconds: 2,
-                },
-                TestWrite {
-                    lp: "bar val=3",
-                    time_seconds: 3,
-                },
-            ],
-        )
-        .await;
-
-        // Wait until there is a snapshot; this will ensure that the row with the tag value
-        // is flushed out of the write buffer, and will not be replayed from the WAL on the
-        // next startup:
-        verify_snapshot_count(1, &wb.persister).await;
-
-        // Drop the write buffer so we can re-initialize:
-        drop(wb);
-
-        // Re-initialize the write buffer:
-        let (wb, ctx, _tp) = setup(
-            Time::from_timestamp_nanos(0),
-            Arc::clone(&object_store) as _,
-            wal_config,
-        )
-        .await;
-
-        // Do enough writes again to trigger a snapshot; the `tag` column was never written here
-        // so the persistence step will be responsible for filling in that column with NULL:
-        do_writes(
-            "foo",
-            wb.as_ref(),
-            &[
-                TestWrite {
-                    lp: "bar val=4",
-                    time_seconds: 4,
-                },
-                TestWrite {
-                    lp: "bar val=5",
-                    time_seconds: 5,
-                },
-                TestWrite {
-                    lp: "bar val=6",
-                    time_seconds: 6,
-                },
-            ],
-        )
-        .await;
-
-        // Wait for snapshot again to make sure when we query below, we are drawing from parquet
-        // and not in-memory data:
-        verify_snapshot_count(2, &wb.persister).await;
-
-        // Get batches from the buffer, including what is still in the queryable buffer in
-        // memory as well as what has been persisted as parquet:
-        let batches = wb.get_record_batches_unchecked("foo", "bar", &ctx).await;
-        assert_batches_sorted_eq!(
-            [
-                "+-----+----------------------+-----+",
-                "| tag | time                 | val |",
-                "+-----+----------------------+-----+",
-                "|     | 1970-01-01T00:00:02Z | 2.0 |",
-                "|     | 1970-01-01T00:00:03Z | 3.0 |",
-                "|     | 1970-01-01T00:00:04Z | 4.0 |",
-                "|     | 1970-01-01T00:00:05Z | 5.0 |",
-                "|     | 1970-01-01T00:00:06Z | 6.0 |",
-                "| a   | 1970-01-01T00:00:01Z | 1.0 |",
-                "+-----+----------------------+-----+",
-            ],
-            &batches
-        );
-
-        debug!("record batches:\n\n{batches:#?}");
-
-        // Iterate over the `tag` column values and check that none of them are an empty string
-        for batch in batches {
-            let tag_col = batch
-                .column_by_name("tag")
-                .unwrap()
-                .as_dictionary::<Int32Type>();
-            let tag_vals = tag_col.values().as_string::<i32>();
-            for s in tag_vals.iter().flatten() {
-                assert!(!s.is_empty(), "there should not be any empty strings");
-            }
-        }
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_parquet_cache_hits() {
-        let object_store = Arc::new(InMemory::new());
-        let wal_config = WalConfig {
-            gen1_duration: influxdb3_wal::Gen1Duration::new_1m(),
-            max_write_buffer_size: 100,
-            flush_interval: Duration::from_millis(10),
-            snapshot_size: 1,
-            ..Default::default()
-        };
-        let (wb, ctx, metrics) = setup_with_metrics_and_parquet_cache(
-            Time::from_timestamp_nanos(0),
-            object_store,
-            wal_config,
-        )
-        .await;
-
-        // Do enough writes to trigger a snapshot:
-        do_writes(
-            "foo",
-            wb.as_ref(),
-            &[
-                // first write has `tag`, but all subsequent writes do not
-                TestWrite {
-                    lp: "bar,tag=a val=1",
-                    time_seconds: 1,
-                },
-                TestWrite {
-                    lp: "bar,tag=b val=2",
-                    time_seconds: 2,
-                },
-                TestWrite {
-                    lp: "bar,tag=c val=3",
-                    time_seconds: 3,
-                },
-            ],
-        )
-        .await;
-
-        verify_snapshot_count(1, &wb.persister).await;
-
-        let instrument = metrics
-            .get_instrument::<Metric<U64Counter>>("influxdb3_parquet_cache_access")
-            .unwrap();
-
-        let cached_count = instrument.observer(&[("status", "cached")]).fetch();
-        // We haven't queried anything so nothing has hit the cache yet:
-        assert_eq!(0, cached_count);
-
-        let batches = wb.get_record_batches_unchecked("foo", "bar", &ctx).await;
-        assert_batches_sorted_eq!(
-            [
-                "+-----+----------------------+-----+",
-                "| tag | time                 | val |",
-                "+-----+----------------------+-----+",
-                "| a   | 1970-01-01T00:00:01Z | 1.0 |",
-                "| b   | 1970-01-01T00:00:02Z | 2.0 |",
-                "| c   | 1970-01-01T00:00:03Z | 3.0 |",
-                "+-----+----------------------+-----+",
-            ],
-            &batches
-        );
-
-        let cached_count = instrument.observer(&[("status", "cached")]).fetch();
-        // NB: although there should only be a single file in the store, datafusion may make more
-        // than one request to fetch the file in chunks, which is why there is more than a single
-        // cache hit:
-        assert_eq!(3, cached_count);
-    }
-
-    struct TestWrite<LP> {
-        lp: LP,
-        time_seconds: i64,
-    }
-
-    async fn do_writes<W: WriteBuffer, LP: AsRef<str> + Send + Sync>(
-        db: &'static str,
-        buffer: &W,
-        writes: &[TestWrite<LP>],
-    ) {
-        for w in writes {
-            buffer
-                .write_lp(
-                    NamespaceName::new(db).unwrap(),
-                    w.lp.as_ref(),
-                    Time::from_timestamp_nanos(w.time_seconds * 1_000_000_000),
-                    false,
-                    Precision::Nanosecond,
-                    false,
-                )
-                .await
-                .unwrap();
-        }
-    }
-
-    async fn do_writes_partial<W: WriteBuffer, LP: AsRef<str> + Send + Sync>(
-        db: &'static str,
-        buffer: &W,
-        writes: &[TestWrite<LP>],
-    ) {
-        for w in writes {
-            buffer
-                .write_lp(
-                    NamespaceName::new(db).unwrap(),
-                    w.lp.as_ref(),
-                    Time::from_timestamp_nanos(w.time_seconds * 1_000_000_000),
-                    true,
-                    Precision::Nanosecond,
-                    false,
-                )
-                .await
-                .unwrap();
-        }
-    }
-
-    async fn verify_snapshot_count(n: usize, persister: &Arc<Persister>) {
-        let mut checks = 0;
-        loop {
-            let persisted_snapshots = persister.load_snapshots(1000).await.unwrap();
-            if persisted_snapshots.len() > n {
-                panic!(
-                    "checking for {} snapshots but found {}",
-                    n,
-                    persisted_snapshots.len()
-                );
-            } else if persisted_snapshots.len() == n && checks > 5 {
-                // let enough checks happen to ensure extra snapshots aren't running ion the background
-                break;
-            } else {
-                checks += 1;
-                if checks > 10 {
-                    panic!("not persisting snapshots");
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-    }
-
-    async fn setup(
-        start: Time,
-        object_store: Arc<dyn ObjectStore>,
-        wal_config: WalConfig,
-    ) -> (
-        Arc<WriteBufferImpl>,
-        IOxSessionContext,
-        Arc<dyn TimeProvider>,
-    ) {
-        let (buf, ctx, time_provider, _metrics) =
-            setup_inner(start, object_store, wal_config, true).await;
-        (buf, ctx, time_provider)
-    }
-
-    async fn setup_cache_optional(
-        start: Time,
-        object_store: Arc<dyn ObjectStore>,
-        wal_config: WalConfig,
-        use_cache: bool,
-    ) -> (
-        Arc<WriteBufferImpl>,
-        IOxSessionContext,
-        Arc<dyn TimeProvider>,
-    ) {
-        let (buf, ctx, time_provider, _metrics) =
-            setup_inner(start, object_store, wal_config, use_cache).await;
-        (buf, ctx, time_provider)
-    }
-
-    async fn setup_with_metrics(
-        start: Time,
-        object_store: Arc<dyn ObjectStore>,
-        wal_config: WalConfig,
-    ) -> (Arc<WriteBufferImpl>, Arc<Registry>) {
-        let (buf, _ctx, _time_provider, metrics) =
-            setup_inner(start, object_store, wal_config, false).await;
-        (buf, metrics)
-    }
-
-    async fn setup_with_metrics_and_parquet_cache(
-        start: Time,
-        object_store: Arc<dyn ObjectStore>,
-        wal_config: WalConfig,
-    ) -> (Arc<WriteBufferImpl>, IOxSessionContext, Arc<Registry>) {
-        let (buf, ctx, _time_provider, metrics) =
-            setup_inner(start, object_store, wal_config, true).await;
-        (buf, ctx, metrics)
-    }
-
-    async fn setup_inner(
-        start: Time,
-        object_store: Arc<dyn ObjectStore>,
-        wal_config: WalConfig,
-        use_cache: bool,
-    ) -> (
-        Arc<WriteBufferImpl>,
-        IOxSessionContext,
-        Arc<dyn TimeProvider>,
-        Arc<Registry>,
-    ) {
-        let time_provider: Arc<dyn TimeProvider> = Arc::new(MockProvider::new(start));
-        let metric_registry = Arc::new(Registry::new());
-        let (object_store, parquet_cache) = if use_cache {
-            let (object_store, parquet_cache) = test_cached_obj_store_and_oracle(
-                object_store,
-                Arc::clone(&time_provider),
-                Arc::clone(&metric_registry),
-            );
-            (object_store, Some(parquet_cache))
-        } else {
-            (object_store, None)
-        };
-        let persister = Arc::new(Persister::new(
-            Arc::clone(&object_store),
-            "test_host",
-            Arc::clone(&time_provider) as _,
-        ));
-        let catalog = Arc::new(
-            Catalog::new(
-                "test_host",
-                Arc::clone(&object_store),
-                Arc::clone(&time_provider),
-                Default::default(),
-            )
-            .await
-            .unwrap(),
-        );
-        let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog) as _)
-            .await
-            .unwrap();
-        let distinct_cache = DistinctCacheProvider::new_from_catalog(
-            Arc::clone(&time_provider),
-            Arc::clone(&catalog),
-        )
-        .await
-        .unwrap();
-        let wbuf = WriteBufferImpl::new(WriteBufferImplArgs {
-            persister,
-            catalog,
-            last_cache,
-            distinct_cache,
-            time_provider: Arc::clone(&time_provider),
-            executor: make_exec(),
-            wal_config,
-            parquet_cache,
-            metric_registry: Arc::clone(&metric_registry),
-            snapshotted_wal_files_to_keep: 10,
-            query_file_limit: None,
-            n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
-            shutdown: ShutdownManager::new_testing().register(),
-            wal_replay_concurrency_limit: None,
-            shared_inventory: None,
-        })
-        .await
-        .unwrap();
-        let ctx = IOxSessionContext::with_testing();
-        let runtime_env = ctx.inner().runtime_env();
-        register_iox_object_store(runtime_env, "influxdb3", Arc::clone(&object_store));
-        (wbuf, ctx, time_provider, metric_registry)
-    }
-
-    /// Get table batches from the buffer only
-    ///
-    /// This is meant to be used in tests.
-    async fn get_table_batches_from_query_buffer(
-        write_buffer: &WriteBufferImpl,
-        database_name: &str,
-        table_name: &str,
-        ctx: &IOxSessionContext,
-    ) -> Vec<RecordBatch> {
-        let chunks = write_buffer.get_table_chunks_from_buffer_only(
-            database_name,
-            table_name,
-            &ChunkFilter::default(),
-            None,
-            &ctx.inner().state(),
-        );
-        let mut batches = vec![];
-        for chunk in chunks {
-            let chunk = chunk
-                .data()
-                .read_to_batches(chunk.schema(), ctx.inner())
-                .await;
-            batches.extend(chunk);
-        }
-        batches
-    }
-
-    async fn assert_dbs_not_empty_in_snapshot_file(obj_store: &Arc<dyn ObjectStore>, host: &str) {
-        let from = Path::from(format!("{host}/snapshots/"));
-        let file_paths = load_files_from_obj_store(obj_store, &from).await;
-        debug!(?file_paths, "obj store snapshots");
-        for file_path in file_paths {
-            let bytes = obj_store
-                .get(&file_path)
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap();
-            let persisted_snapshot: PersistedSnapshot = serde_json::from_slice(&bytes).unwrap();
-            // dbs not empty
-            assert!(!persisted_snapshot.databases.is_empty());
-            // min and max times aren't defaults
-            assert!(persisted_snapshot.min_time != i64::MAX);
-            assert!(persisted_snapshot.max_time != i64::MIN);
-        }
-    }
-
-    async fn load_files_from_obj_store(
-        object_store: &Arc<dyn ObjectStore>,
-        path: &Path,
-    ) -> Vec<Path> {
-        let mut paths = Vec::new();
-        let mut offset: Option<Path> = None;
-        loop {
-            let mut listing = if let Some(offset) = offset {
-                object_store.list_with_offset(Some(path), &offset)
-            } else {
-                object_store.list(Some(path))
-            };
-            let path_count = paths.len();
-
-            while let Some(item) = listing.next().await {
-                paths.push(item.unwrap().location);
-            }
-
-            if path_count == paths.len() {
-                paths.sort();
-                break;
-            }
-
-            paths.sort();
-            offset = Some(paths.last().unwrap().clone())
-        }
-        paths
-    }
-
-    fn make_exec() -> Arc<Executor> {
-        let metrics = Arc::new(metric::Registry::default());
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-
-        let parquet_store = ParquetStorage::new(
-            Arc::clone(&object_store),
-            StorageId::from("test_exec_storage"),
-        );
-        Arc::new(Executor::new_with_config_and_executor(
-            ExecutorConfig {
-                target_query_partitions: NonZeroUsize::new(1).unwrap(),
-                object_stores: [&parquet_store]
-                    .into_iter()
-                    .map(|store| (store.id(), Arc::clone(store.object_store())))
-                    .collect(),
-                metric_registry: Arc::clone(&metrics),
-                // Default to 1gb
-                mem_pool_size: 1024 * 1024 * 1024, // 1024 (b/kb) * 1024 (kb/mb) * 1024 (mb/gb)
-                per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
-                heap_memory_limit: None,
-            },
-            DedicatedExecutor::new_testing(),
-        ))
-    }
-}
+mod tests;

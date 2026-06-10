@@ -1,6 +1,5 @@
 use crate::server::TestServer;
 use anyhow::{Result, bail};
-use assert_cmd::cargo::CommandCargoExt;
 use influxdb3_types::http::FieldType;
 use serde_json::Value;
 use std::io::Write;
@@ -36,43 +35,54 @@ impl TestServer {
             command_args.push("--token");
             command_args.push(token);
         }
-        let mut child_process = Command::cargo_bin("influxdb3")?
-            .args(&command_args)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        if let Some(input) = input {
-            let input = input.to_string();
-            let mut stdin = child_process.stdin.take().expect("failed to open stdin");
-            thread::spawn(move || {
-                stdin
-                    .write_all(input.as_bytes())
-                    .expect("cannot write confirmation msg to stdin");
-            });
-        }
-        let output = child_process.wait_with_output()?;
-
-        if !output.status.success() {
-            println!(
-                "failed to run influxdb3 {} {}",
-                command_args.join(" "),
-                args.join(" ")
-            );
-            bail!("{}", String::from_utf8_lossy(&output.stderr));
-        }
-
-        Ok(String::from_utf8(output.stdout)?.trim().into())
+        run_cmd_with_result(args, input, command_args)
     }
+
     pub fn run(&self, commands: Vec<&str>, args: &[&str]) -> Result<String> {
         self.run_with_options(commands, args, None)
     }
+
     pub fn run_with_confirmation(&self, commands: Vec<&str>, args: &[&str]) -> Result<String> {
         self.run_with_options(commands, args, Some("yes"))
     }
 }
+
+pub(super) fn run_cmd_with_result(
+    args: &[&str],
+    input: Option<&str>,
+    command_args: Vec<&str>,
+) -> std::result::Result<String, anyhow::Error> {
+    let mut child_process = Command::new(assert_cmd::cargo_bin!("influxdb3"))
+        .args(&command_args)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(input) = input {
+        let input = input.to_string();
+        let mut stdin = child_process.stdin.take().expect("failed to open stdin");
+        thread::spawn(move || {
+            stdin
+                .write_all(input.as_bytes())
+                .expect("cannot write confirmation msg to stdin");
+        });
+    }
+    let output = child_process.wait_with_output()?;
+
+    if !output.status.success() {
+        println!(
+            "failed to run influxdb3 {} {}",
+            command_args.join(" "),
+            args.join(" ")
+        );
+        bail!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    Ok(String::from_utf8(output.stdout)?.trim().into())
+}
+
 impl CreateDatabaseQuery<'_> {
     pub fn run(self) -> Result<String> {
         self.server.run(
@@ -250,12 +260,50 @@ impl ShowDatabasesQuery<'_> {
     }
 }
 
+// Builder for the 'show plugins' command
+#[derive(Debug)]
+pub struct ShowPluginsQuery<'a> {
+    server: &'a TestServer,
+    format: Option<String>,
+}
+
+impl TestServer {
+    pub fn show_plugins(&self) -> ShowPluginsQuery<'_> {
+        ShowPluginsQuery {
+            server: self,
+            format: None,
+        }
+    }
+}
+
+impl ShowPluginsQuery<'_> {
+    pub fn with_format(mut self, format: impl Into<String>) -> Self {
+        self.format = Some(format.into());
+        self
+    }
+
+    pub fn run(self) -> Result<String> {
+        let mut args = Vec::new();
+
+        if let Some(format) = self.format.as_ref() {
+            args.push("--format");
+            args.push(format);
+        }
+
+        args.push("--tls-ca");
+        args.push("../testing-certs/rootCA.pem");
+
+        self.server.run(vec!["show", "plugins"], &args)
+    }
+}
+
 // Builder for the 'delete database' command
 #[derive(Debug)]
 pub struct DeleteDatabaseQuery<'a> {
     server: &'a TestServer,
     name: String,
     hard_delete: Option<String>,
+    yes: bool,
 }
 
 impl TestServer {
@@ -264,6 +312,7 @@ impl TestServer {
             server: self,
             name: name.into(),
             hard_delete: None,
+            yes: false,
         }
     }
 }
@@ -271,6 +320,11 @@ impl TestServer {
 impl DeleteDatabaseQuery<'_> {
     pub fn with_hard_delete(mut self, when: impl Into<String>) -> Self {
         self.hard_delete = Some(when.into());
+        self
+    }
+
+    pub fn with_yes(mut self) -> Self {
+        self.yes = true;
         self
     }
 
@@ -282,15 +336,28 @@ impl DeleteDatabaseQuery<'_> {
             args.push(hard_delete);
         }
 
-        self.server.run_with_confirmation(
-            vec![
-                "delete",
-                "database",
-                "--tls-ca",
-                "../testing-certs/rootCA.pem",
-            ],
-            &args,
-        )
+        if self.yes {
+            args.push("--yes");
+            self.server.run(
+                vec![
+                    "delete",
+                    "database",
+                    "--tls-ca",
+                    "../testing-certs/rootCA.pem",
+                ],
+                &args,
+            )
+        } else {
+            self.server.run_with_confirmation(
+                vec![
+                    "delete",
+                    "database",
+                    "--tls-ca",
+                    "../testing-certs/rootCA.pem",
+                ],
+                &args,
+            )
+        }
     }
 }
 
@@ -379,6 +446,7 @@ pub struct DeleteTableQuery<'a> {
     db_name: String,
     table_name: String,
     hard_delete: Option<String>,
+    yes: bool,
 }
 
 impl TestServer {
@@ -392,6 +460,7 @@ impl TestServer {
             db_name: db_name.into(),
             table_name: table_name.into(),
             hard_delete: None,
+            yes: false,
         }
     }
 }
@@ -399,6 +468,11 @@ impl TestServer {
 impl DeleteTableQuery<'_> {
     pub fn with_hard_delete(mut self, when: impl Into<String>) -> Self {
         self.hard_delete = Some(when.into());
+        self
+    }
+
+    pub fn with_yes(mut self) -> Self {
+        self.yes = true;
         self
     }
 
@@ -417,8 +491,13 @@ impl DeleteTableQuery<'_> {
         args.push("--tls-ca");
         args.push("../testing-certs/rootCA.pem");
 
-        self.server
-            .run_with_confirmation(vec!["delete", "table"], &args)
+        if self.yes {
+            args.push("--yes");
+            self.server.run(vec!["delete", "table"], &args)
+        } else {
+            self.server
+                .run_with_confirmation(vec!["delete", "table"], &args)
+        }
     }
 }
 
@@ -558,11 +637,13 @@ pub struct CreateTriggerQuery<'a> {
     trigger_name: String,
     db_name: String,
     plugin_filename: String,
+    path: Option<String>,
     trigger_spec: String,
     trigger_arguments: Vec<String>,
     disabled: bool,
     run_asynchronous: bool,
     error_behavior: Option<String>,
+    upload: bool,
 }
 
 impl TestServer {
@@ -578,11 +659,13 @@ impl TestServer {
             db_name: db_name.into(),
             trigger_name: trigger_name.into(),
             plugin_filename: plugin_filename.into(),
+            path: None,
             trigger_spec: trigger_spec.into(),
             trigger_arguments: Vec::new(),
             disabled: false,
             run_asynchronous: false,
             error_behavior: None,
+            upload: false,
         }
     }
 }
@@ -616,18 +699,38 @@ impl CreateTriggerQuery<'_> {
         self
     }
 
+    pub fn upload(mut self, upload: bool) -> Self {
+        self.upload = upload;
+        self
+    }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
     pub fn run(self) -> Result<String> {
         let mut args = vec![
             self.trigger_name.as_str(),
             "--database",
             self.db_name.as_str(),
-            "--plugin-filename",
-            self.plugin_filename.as_str(),
+        ];
+
+        // Use --path if set, otherwise fall back to --plugin-filename
+        if let Some(ref path) = self.path {
+            args.push("--path");
+            args.push(path.as_str());
+        } else {
+            args.push("--plugin-filename");
+            args.push(self.plugin_filename.as_str());
+        }
+
+        args.extend_from_slice(&[
             "--trigger-spec",
             self.trigger_spec.as_str(),
             "--tls-ca",
             "../testing-certs/rootCA.pem",
-        ];
+        ]);
 
         let trigger_args = self.trigger_arguments.join(",");
 
@@ -647,6 +750,10 @@ impl CreateTriggerQuery<'_> {
         if let Some(behavior) = &self.error_behavior {
             args.push("--error-behavior");
             args.push(behavior);
+        }
+
+        if self.upload {
+            args.push("--upload");
         }
 
         self.server.run(vec!["create", "trigger"], args.as_slice())

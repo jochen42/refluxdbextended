@@ -14,7 +14,10 @@ pub mod leases;
 pub mod remote_write_buffer;
 pub mod paths;
 pub mod persister;
+pub mod retention_period_handler;
 pub mod shared_inventory;
+pub mod table_index;
+pub mod table_index_cache;
 pub mod wal_tail;
 pub mod write_buffer;
 
@@ -40,7 +43,7 @@ use iox_query::QueryChunk;
 use iox_time::Time;
 use observability_deps::tracing::debug;
 use schema::TIME_COLUMN_NAME;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::{fmt::Debug, sync::Arc};
 use thiserror::Error;
 
@@ -58,7 +61,7 @@ pub enum Error {
     #[error("queries not supported in compactor only mode")]
     CompactorOnly,
 
-    #[error(transparent)]
+    #[error("unexpected: {0:?}")]
     Anyhow(#[from] anyhow::Error),
 }
 
@@ -154,11 +157,31 @@ pub trait LastCacheManager: Debug + Send + Sync + 'static {
 
 /// A single write request can have many lines in it. A writer can request to accept all lines that are valid, while
 /// returning an error for any invalid lines. This is the error information for a single invalid line.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct WriteLineError {
     pub original_line: String,
     pub line_number: usize,
     pub error_message: String,
+}
+
+impl Serialize for WriteLineError {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("WriteLineError", 3)?;
+        const TRUNCATE_LIMIT: usize = 20;
+        let truncated_line = if self.original_line.len() > TRUNCATE_LIMIT {
+            &self.original_line[..TRUNCATE_LIMIT]
+        } else {
+            &self.original_line
+        };
+        state.serialize_field("error_message", &self.error_message)?;
+        state.serialize_field("line_number", &self.line_number)?;
+        state.serialize_field("original_line", truncated_line)?;
+        state.end()
+    }
 }
 
 /// A write that has been validated against the catalog schema, written to the WAL (if configured), and buffered in
@@ -218,6 +241,11 @@ pub struct PersistedSnapshot {
     /// The tables will then have their name and the parquet file that was removed.
     #[serde(default)]
     pub removed_files: SerdeVecMap<DbId, DatabaseTables>,
+    /// The timestamp (ms since epoch) when this snapshot was persisted to object storage.
+    /// Populated from ObjectMeta.last_modified during loading. Used for checkpoint grouping.
+    /// Not serialized - this is transient metadata populated at load time.
+    #[serde(skip)]
+    pub persisted_at: Option<i64>,
 }
 
 impl PersistedSnapshot {
@@ -239,6 +267,7 @@ impl PersistedSnapshot {
             max_time: i64::MIN,
             databases: SerdeVecMap::new(),
             removed_files: SerdeVecMap::new(),
+            persisted_at: None,
         }
     }
 
@@ -310,6 +339,25 @@ pub struct ParquetFile {
     pub max_time: i64,
 }
 
+impl std::hash::Hash for ParquetFile {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.path.hash(state);
+    }
+}
+
+impl std::cmp::Ord for ParquetFile {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id.cmp(&other.id)
+    }
+}
+
+impl std::cmp::PartialOrd for ParquetFile {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl ParquetFile {
     pub fn timestamp_min_max(&self) -> TimestampMinMax {
         TimestampMinMax {
@@ -340,34 +388,313 @@ impl ParquetFile {
     }
 }
 
-/// Guess precision based off of a given timestamp.
-// Note that this will fail in June 2128, but that's not our problem
-pub(crate) fn guess_precision(timestamp: i64) -> Precision {
-    const NANO_SECS_PER_SEC: i64 = 1_000_000_000;
-    // Get the absolute value of the timestamp so we can work with negative
-    // numbers
-    let val = timestamp.abs() / NANO_SECS_PER_SEC;
+/// A year-month value in YYYY-MM format (e.g., "2025-01").
+///
+/// Used for organizing snapshot checkpoints by month. Stores year and month
+/// as integers for efficient comparison and sorting, while serializing to
+/// the standard "YYYY-MM" string format for backward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct YearMonth {
+    year: u16,
+    month: u8,
+}
 
-    if val < 5 {
-        // If the time sent to us is in seconds then this will be a number less than
-        // 5 so for example if the time in seconds is 1_708_976_567 then it will be
-        // 1 (due to integer truncation) and be less than 5
-        Precision::Second
-    } else if val < 5_000 {
-        // If however the value is milliseconds and not seconds than the same number
-        // for time but now in milliseconds 1_708_976_567_000 when divided will now
-        // be 1708 which is bigger than the previous if statement but less than this
-        // one and so we return milliseconds
-        Precision::Millisecond
-    } else if val < 5_000_000 {
-        // If we do the same thing here by going up another order of magnitude then
-        // 1_708_976_567_000_000 when divided will be 1708976 which is large enough
-        // for this if statement
-        Precision::Microsecond
-    } else {
-        // Anything else we can assume is large enough of a number that it must
-        // be nanoseconds
-        Precision::Nanosecond
+/// Error type for invalid YearMonth values.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum YearMonthError {
+    #[error("invalid month {0}, expected 1-12")]
+    InvalidMonth(u8),
+    #[error("invalid year-month format: {0}, expected YYYY-MM")]
+    InvalidFormat(String),
+}
+
+impl YearMonth {
+    /// Create a YearMonth from year and month without validation.
+    ///
+    /// # Safety
+    /// Use only when the values are known to be valid (e.g., from chrono).
+    /// In debug builds, panics if month is not in 1-12.
+    pub fn new_unchecked(year: u16, month: u8) -> Self {
+        debug_assert!((1..=12).contains(&month), "month must be 1-12");
+        Self { year, month }
+    }
+
+    /// Get the year component.
+    pub fn year(&self) -> u16 {
+        self.year
+    }
+
+    /// Get the month component (1-12).
+    pub fn month(&self) -> u8 {
+        self.month
+    }
+}
+
+impl std::fmt::Display for YearMonth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:04}-{:02}", self.year, self.month)
+    }
+}
+
+impl std::str::FromStr for YearMonth {
+    type Err = YearMonthError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Expected format: "YYYY-MM" (exactly 7 chars)
+        if s.len() != 7 || s.as_bytes().get(4) != Some(&b'-') {
+            return Err(YearMonthError::InvalidFormat(s.to_string()));
+        }
+        let year = s[0..4]
+            .parse::<u16>()
+            .map_err(|_| YearMonthError::InvalidFormat(s.to_string()))?;
+        let month = s[5..7]
+            .parse::<u8>()
+            .map_err(|_| YearMonthError::InvalidFormat(s.to_string()))?;
+        if !(1..=12).contains(&month) {
+            return Err(YearMonthError::InvalidMonth(month));
+        }
+        Ok(Self::new_unchecked(year, month))
+    }
+}
+
+impl serde::Serialize for YearMonth {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for YearMonth {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// A versioned container for snapshot checkpoint persistence.
+/// Used for serialization/deserialization with version tagging.
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
+#[serde(tag = "version")]
+pub enum PersistedSnapshotCheckpointVersion {
+    #[serde(rename = "1")]
+    V1(PersistedSnapshotCheckpoint),
+}
+
+impl PersistedSnapshotCheckpointVersion {
+    /// Get the last snapshot sequence number from the checkpoint
+    pub fn last_snapshot_sequence_number(&self) -> SnapshotSequenceNumber {
+        match self {
+            Self::V1(checkpoint) => checkpoint.last_snapshot_sequence_number,
+        }
+    }
+
+    /// Get the year-month from the checkpoint
+    pub fn year_month(&self) -> YearMonth {
+        match self {
+            Self::V1(checkpoint) => checkpoint.year_month,
+        }
+    }
+}
+
+/// A checkpoint that aggregates snapshot data for a specific month.
+/// Used to speed up server startup by reducing the number of snapshot files to load.
+///
+/// Checkpoints consolidate parquet file metadata from multiple snapshots within a month,
+/// allowing the server to load a single checkpoint per month instead of many individual
+/// snapshot files. Each checkpoint tracks:
+/// - All parquet files added during the month
+/// - Files marked for removal that reference previous months (pending_removed_files)
+/// - The latest snapshot sequence number that was merged into this checkpoint
+///
+/// Checkpoints do not enable us to delete old persisted snapshots and they are not used in
+/// resolving retention periods for gen1 files. TableIndexCaches are used for retention period
+/// handling.
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
+pub struct PersistedSnapshotCheckpoint {
+    /// The node identifier that created this checkpoint
+    pub node_id: String,
+    /// The year-month this checkpoint covers (e.g., "2025-01")
+    pub year_month: YearMonth,
+    /// The latest snapshot sequence number merged into this checkpoint
+    pub last_snapshot_sequence_number: SnapshotSequenceNumber,
+    /// The next file ID to be used with `ParquetFile`s when the checkpoint is loaded.
+    /// None for newly created checkpoints until update_from_snapshot() is called.
+    #[serde(default)]
+    pub next_file_id: Option<ParquetFileId>,
+    /// The WAL file sequence number from the latest merged snapshot
+    pub wal_file_sequence_number: WalFileSequenceNumber,
+    /// The catalog sequence number from the latest merged snapshot
+    pub catalog_sequence_number: CatalogSequenceNumber,
+    /// The size of all parquet files in bytes
+    pub parquet_size_bytes: u64,
+    /// The number of rows across all parquet files
+    pub row_count: u64,
+    /// The min time from all parquet files
+    pub min_time: i64,
+    /// The max time from all parquet files
+    pub max_time: i64,
+    /// The aggregated collection of databases/tables/files.
+    /// This is the cumulative state after applying all snapshots for the month.
+    pub databases: SerdeVecMap<DbId, DatabaseTables>,
+    /// Files marked for removal that reference files from previous months.
+    /// These are retained because they may reference files not in this checkpoint's databases.
+    #[serde(default)]
+    pub pending_removed_files: SerdeVecMap<DbId, DatabaseTables>,
+}
+
+impl PersistedSnapshotCheckpoint {
+    /// Create a new empty checkpoint for the given node and month
+    pub fn new(node_id: String, year_month: YearMonth) -> Self {
+        Self {
+            node_id,
+            year_month,
+            last_snapshot_sequence_number: SnapshotSequenceNumber::new(0),
+            next_file_id: None,
+            wal_file_sequence_number: WalFileSequenceNumber::new(0),
+            catalog_sequence_number: CatalogSequenceNumber::new(0),
+            parquet_size_bytes: 0,
+            row_count: 0,
+            min_time: i64::MAX,
+            max_time: i64::MIN,
+            databases: SerdeVecMap::new(),
+            pending_removed_files: SerdeVecMap::new(),
+        }
+    }
+
+    /// Add a file to the checkpoint and update metrics.
+    pub fn add_file(&mut self, db_id: DbId, table_id: TableId, file: ParquetFile) {
+        self.parquet_size_bytes += file.size_bytes;
+        self.row_count += file.row_count;
+        self.min_time = self.min_time.min(file.min_time);
+        self.max_time = self.max_time.max(file.max_time);
+
+        self.databases
+            .entry(db_id)
+            .or_default()
+            .tables
+            .entry(table_id)
+            .or_default()
+            .push(file);
+    }
+
+    /// Remove a file from the checkpoint and adjust metrics.
+    /// Returns true if the file was found and removed.
+    pub fn remove_file(&mut self, db_id: DbId, table_id: TableId, file_id: ParquetFileId) -> bool {
+        let Some(db_tables) = self.databases.get_mut(&db_id) else {
+            return false;
+        };
+        let Some(table_files) = db_tables.tables.get_mut(&table_id) else {
+            return false;
+        };
+        let Some(pos) = table_files.iter().position(|f| f.id == file_id) else {
+            return false;
+        };
+
+        let removed = table_files.remove(pos);
+        self.parquet_size_bytes = self.parquet_size_bytes.saturating_sub(removed.size_bytes);
+        self.row_count = self.row_count.saturating_sub(removed.row_count);
+
+        // Note: min_time/max_time can't be recalculated from the perspective of a single file
+        // removal without iterating over all remaining files; that iteration is expected to be
+        // handled by the calling context using `recalculate_time_range` once all removals have
+        // been handled
+        true
+    }
+
+    /// Add a file to the pending_removed_files collection.
+    pub fn add_pending_removed(&mut self, db_id: DbId, table_id: TableId, file: ParquetFile) {
+        self.pending_removed_files
+            .entry(db_id)
+            .or_default()
+            .tables
+            .entry(table_id)
+            .or_default()
+            .push(file);
+    }
+
+    /// Update sequence numbers from a snapshot.
+    pub fn update_from_snapshot(&mut self, snapshot: &PersistedSnapshot) {
+        self.last_snapshot_sequence_number = snapshot.snapshot_sequence_number;
+        self.next_file_id = Some(snapshot.next_file_id);
+        self.wal_file_sequence_number = snapshot.wal_file_sequence_number;
+        self.catalog_sequence_number = snapshot.catalog_sequence_number;
+    }
+
+    /// Recalculate min_time and max_time by scanning all files.
+    pub fn recalculate_time_range(&mut self) {
+        let mut min_time = i64::MAX;
+        let mut max_time = i64::MIN;
+
+        for (_, db_tables) in &self.databases {
+            for (_, files) in &db_tables.tables {
+                for file in files {
+                    min_time = min_time.min(file.min_time);
+                    max_time = max_time.max(file.max_time);
+                }
+            }
+        }
+
+        self.min_time = min_time;
+        self.max_time = max_time;
+    }
+
+    /// Merge another checkpoint into this one.
+    ///
+    /// The `other` checkpoint should be chronologically later than `self`.
+    /// This method:
+    /// 1. Adds all files from `other.databases` to `self`
+    /// 2. Applies `other.pending_removed_files` to remove files from `self`
+    /// 3. Updates sequence numbers from `other`
+    pub fn merge(&mut self, other: PersistedSnapshotCheckpoint) {
+        // Add all files from the other checkpoint
+        for (db_id, db_tables) in other.databases {
+            for (table_id, files) in db_tables.tables {
+                for file in files {
+                    self.add_file(db_id, table_id, file);
+                }
+            }
+        }
+
+        // Apply pending_removed_files from the other checkpoint
+        // These reference files from previous months (i.e., files in self)
+        let mut any_removed = false;
+        for (db_id, db_tables) in other.pending_removed_files {
+            let Some(self_db_tables) = self.databases.get_mut(&db_id) else {
+                continue;
+            };
+
+            for (table_id, files_to_remove) in db_tables.tables {
+                let Some(self_table_files) = self_db_tables.tables.get_mut(&table_id) else {
+                    continue;
+                };
+
+                for file in files_to_remove {
+                    if let Some(idx) = self_table_files.iter().position(|f| f.id == file.id) {
+                        let removed = self_table_files.remove(idx);
+                        self.parquet_size_bytes =
+                            self.parquet_size_bytes.saturating_sub(removed.size_bytes);
+                        self.row_count = self.row_count.saturating_sub(removed.row_count);
+                        any_removed = true;
+                    }
+                }
+            }
+        }
+
+        if any_removed {
+            self.recalculate_time_range();
+        }
+
+        // Update sequence numbers and metadata from the later checkpoint
+        self.year_month = other.year_month;
+        self.last_snapshot_sequence_number = other.last_snapshot_sequence_number;
+        self.next_file_id = other.next_file_id;
+        self.wal_file_sequence_number = other.wal_file_sequence_number;
+        self.catalog_sequence_number = other.catalog_sequence_number;
     }
 }
 
@@ -415,12 +742,23 @@ impl<'a> ChunkFilter<'a> {
             // Determine time bounds, if provided:
             let boundaries = ExprBoundaries::try_new_unbounded(&arrow_schema)
                 .context("unable to create unbounded expr boundaries on incoming expression")?;
-            let mut analysis = analyze(
+            // DataFusion does not support all possible expressions. If the expression can't be analyzed
+            // skip the analysis rather than erroring the query
+            // see https://github.com/influxdata/influxdb/issues/26163
+            let Ok(mut analysis) = analyze(
                 &physical_expr,
                 AnalysisContext::new(boundaries),
                 &arrow_schema,
             )
-            .context("unable to analyze provided filters for a boundary on the time column")?;
+            .inspect_err(|error| {
+                debug!(
+                    ?error,
+                    logical_expr = ?expr,
+                    "unable to analyze provided filters for a boundary on the time column"
+                );
+            }) else {
+                continue;
+            };
 
             // Set the boundaries on the time column using the evaluated
             // interval, if it exists.
@@ -430,17 +768,19 @@ impl<'a> ChunkFilter<'a> {
             // - the derived intervals do not intersect, this should be a user
             //   error, i.e., a poorly formed query or querying outside of a
             //   retention policy for the table
-            if let Some(ExprBoundaries { interval, .. }) = (time_col_index
-                < analysis.boundaries.len())
-            .then_some(analysis.boundaries.remove(time_col_index))
+            if let Some(ExprBoundaries {
+                interval: Some(new_interval),
+                ..
+            }) = (time_col_index < analysis.boundaries.len())
+                .then_some(analysis.boundaries.remove(time_col_index))
             {
                 if let Some(existing) = time_interval.take() {
-                    let intersection = existing.intersect(interval).context(
+                    let intersection = existing.intersect(new_interval).context(
                                 "failed to derive a time interval from provided filters",
                             )?.context("provided filters on time column did not produce a valid set of boundaries")?;
-                    time_interval.replace(intersection);
+                    time_interval = Some(intersection);
                 } else {
-                    time_interval.replace(interval);
+                    time_interval = Some(new_interval);
                 }
             }
         }
@@ -493,6 +833,7 @@ pub mod test_helpers {
     use crate::WriteBuffer;
     use crate::write_buffer::validator::WriteValidator;
     use arrow::array::RecordBatch;
+    use data_types::NamespaceName;
     use datafusion::prelude::Expr;
     use influxdb3_catalog::catalog::{Catalog, DatabaseSchema};
     use influxdb3_wal::{Gen1Duration, WriteBatch};
@@ -568,6 +909,20 @@ pub mod test_helpers {
         }
     }
 
+    pub async fn do_write(wb: &dyn WriteBuffer, db: &str, lp: &str, time: Time) {
+        let db_name = NamespaceName::new(db.to_owned()).expect("valid namespace name for database");
+        wb.write_lp(
+            db_name,
+            lp,
+            time,
+            false,
+            influxdb3_types::write::Precision::Auto,
+            false,
+        )
+        .await
+        .expect("valid write operation");
+    }
+
     #[derive(Debug)]
     pub struct TestWriter {
         catalog: Arc<Catalog>,
@@ -618,169 +973,4 @@ pub mod test_helpers {
 }
 
 #[cfg(test)]
-mod tests {
-    use influxdb3_catalog::catalog::CatalogSequenceNumber;
-    use influxdb3_id::{DbId, ParquetFileId, SerdeVecMap, TableId};
-    use influxdb3_wal::{SnapshotSequenceNumber, WalFileSequenceNumber};
-
-    use crate::{DatabaseTables, ParquetFile, PersistedSnapshot};
-
-    #[test]
-    fn test_overall_counts() {
-        let host = "host_id";
-        // db 1 setup
-        let db_id_1 = DbId::from(0);
-        let mut dbs_1 = SerdeVecMap::new();
-        let table_id_1 = TableId::from(0);
-        let mut tables_1 = SerdeVecMap::new();
-        let parquet_files_1 = vec![
-            ParquetFile {
-                id: ParquetFileId::from(1),
-                path: "some_path".to_string(),
-                size_bytes: 100_000,
-                row_count: 200,
-                chunk_time: 1123456789,
-                min_time: 11234567777,
-                max_time: 11234567788,
-            },
-            ParquetFile {
-                id: ParquetFileId::from(2),
-                path: "some_path".to_string(),
-                size_bytes: 100_000,
-                row_count: 200,
-                chunk_time: 1123456789,
-                min_time: 11234567777,
-                max_time: 11234567788,
-            },
-        ];
-        tables_1.insert(table_id_1, parquet_files_1);
-        dbs_1.insert(db_id_1, DatabaseTables { tables: tables_1 });
-
-        // add dbs_1 to snapshot
-        let persisted_snapshot_1 = PersistedSnapshot {
-            node_id: host.to_string(),
-            next_file_id: ParquetFileId::from(0),
-            snapshot_sequence_number: SnapshotSequenceNumber::new(124),
-            wal_file_sequence_number: WalFileSequenceNumber::new(100),
-            catalog_sequence_number: CatalogSequenceNumber::new(100),
-            databases: dbs_1,
-            min_time: 0,
-            max_time: 1,
-            row_count: 0,
-            parquet_size_bytes: 0,
-            removed_files: SerdeVecMap::new(),
-        };
-
-        // db 2 setup
-        let db_id_2 = DbId::from(2);
-        let mut dbs_2 = SerdeVecMap::new();
-        let table_id_2 = TableId::from(2);
-        let mut tables_2 = SerdeVecMap::new();
-        let parquet_files_2 = vec![
-            ParquetFile {
-                id: ParquetFileId::from(4),
-                path: "some_path".to_string(),
-                size_bytes: 100_000,
-                row_count: 200,
-                chunk_time: 1123456789,
-                min_time: 11234567777,
-                max_time: 11234567788,
-            },
-            ParquetFile {
-                id: ParquetFileId::from(5),
-                path: "some_path".to_string(),
-                size_bytes: 100_000,
-                row_count: 200,
-                chunk_time: 1123456789,
-                min_time: 11234567777,
-                max_time: 11234567788,
-            },
-        ];
-        tables_2.insert(table_id_2, parquet_files_2);
-        dbs_2.insert(db_id_2, DatabaseTables { tables: tables_2 });
-
-        // add dbs_2 to snapshot
-        let persisted_snapshot_2 = PersistedSnapshot {
-            node_id: host.to_string(),
-            next_file_id: ParquetFileId::from(5),
-            snapshot_sequence_number: SnapshotSequenceNumber::new(124),
-            wal_file_sequence_number: WalFileSequenceNumber::new(100),
-            catalog_sequence_number: CatalogSequenceNumber::new(100),
-            databases: dbs_2,
-            min_time: 0,
-            max_time: 1,
-            row_count: 0,
-            parquet_size_bytes: 0,
-            removed_files: SerdeVecMap::new(),
-        };
-
-        let overall_counts = PersistedSnapshot::overall_db_table_file_counts(&[
-            persisted_snapshot_1,
-            persisted_snapshot_2,
-        ]);
-        assert_eq!((2, 2, 4), overall_counts);
-    }
-
-    #[test]
-    fn test_overall_counts_zero() {
-        // db 1 setup
-        let db_id_1 = DbId::from(0);
-        let mut dbs_1 = SerdeVecMap::new();
-        let table_id_1 = TableId::from(0);
-        let mut tables_1 = SerdeVecMap::new();
-        let parquet_files_1 = vec![
-            ParquetFile {
-                id: ParquetFileId::from(1),
-                path: "some_path".to_string(),
-                size_bytes: 100_000,
-                row_count: 200,
-                chunk_time: 1123456789,
-                min_time: 11234567777,
-                max_time: 11234567788,
-            },
-            ParquetFile {
-                id: ParquetFileId::from(2),
-                path: "some_path".to_string(),
-                size_bytes: 100_000,
-                row_count: 200,
-                chunk_time: 1123456789,
-                min_time: 11234567777,
-                max_time: 11234567788,
-            },
-        ];
-        tables_1.insert(table_id_1, parquet_files_1);
-        dbs_1.insert(db_id_1, DatabaseTables { tables: tables_1 });
-
-        // db 2 setup
-        let db_id_2 = DbId::from(2);
-        let mut dbs_2 = SerdeVecMap::new();
-        let table_id_2 = TableId::from(2);
-        let mut tables_2 = SerdeVecMap::new();
-        let parquet_files_2 = vec![
-            ParquetFile {
-                id: ParquetFileId::from(4),
-                path: "some_path".to_string(),
-                size_bytes: 100_000,
-                row_count: 200,
-                chunk_time: 1123456789,
-                min_time: 11234567777,
-                max_time: 11234567788,
-            },
-            ParquetFile {
-                id: ParquetFileId::from(5),
-                path: "some_path".to_string(),
-                size_bytes: 100_000,
-                row_count: 200,
-                chunk_time: 1123456789,
-                min_time: 11234567777,
-                max_time: 11234567788,
-            },
-        ];
-        tables_2.insert(table_id_2, parquet_files_2);
-        dbs_2.insert(db_id_2, DatabaseTables { tables: tables_2 });
-
-        // add dbs_2 to snapshot
-        let overall_counts = PersistedSnapshot::overall_db_table_file_counts(&[]);
-        assert_eq!((0, 0, 0), overall_counts);
-    }
-}
+pub(crate) mod tests;

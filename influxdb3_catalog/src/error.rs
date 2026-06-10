@@ -4,10 +4,7 @@ use anyhow::anyhow;
 use humantime::Duration;
 use schema::InfluxColumnType;
 
-use crate::{
-    catalog::NUM_TAG_COLUMNS_LIMIT, channel::SubscriptionError,
-    object_store::ObjectStoreCatalogError,
-};
+use crate::{channel::SubscriptionError, object_store::ObjectStoreCatalogError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -17,11 +14,11 @@ pub enum CatalogError {
     #[error("attempted to create a resource that already exists")]
     AlreadyExists,
 
-    #[error("the requested resource was not found")]
-    NotFound,
+    #[error("the requested resource was not found: {0}")]
+    NotFound(String),
 
-    #[error("attempted to delete resource that was already deleted")]
-    AlreadyDeleted,
+    #[error("attempted to modify resource that was already deleted: {0}")]
+    AlreadyDeleted(String),
 
     #[error("invalid configuration provided: {message}")]
     InvalidConfiguration { message: Box<str> },
@@ -45,23 +42,33 @@ pub enum CatalogError {
         got: InfluxColumnType,
     },
 
+    #[error("'{0}' is a reserved column")]
+    ReservedColumn(Arc<str>),
+
     #[error("invalid node registration")]
     InvalidNodeRegistration,
 
     #[error("Update to schema would exceed number of columns per table limit of {0} columns")]
     TooManyColumns(usize),
 
-    #[error(
-        "Update to schema would exceed number of tag columns per table limit of {} columns",
-        NUM_TAG_COLUMNS_LIMIT
-    )]
-    TooManyTagColumns,
+    #[error("Update to schema would exceed number of tag columns per table limit of {0} columns")]
+    TooManyTagColumns(usize),
 
-    #[error("Update to schema would exceed number of tables limit of {0} tables")]
-    TooManyTables(usize),
+    #[error(
+        "Update to schema would exceed number of tables limit: attempted to create table but already have {current} table(s) (limit: {limit})"
+    )]
+    TooManyTables { current: usize, limit: usize },
 
     #[error("Adding a new database would exceed limit of {0} databases")]
     TooManyDbs(usize),
+
+    #[error(
+        "Update to schema would exceed the field limit ({limit}) for field family '{field_family}'"
+    )]
+    TooManyFields { field_family: String, limit: usize },
+
+    #[error("Database not found {}", db_name)]
+    DatabaseNotFound { db_name: Arc<str> },
 
     #[error("Table {} not in DB schema for {}", table_name, db_name)]
     TableNotFound {
@@ -188,6 +195,12 @@ pub enum CatalogError {
         level: u8,
         existing: Duration,
         attempted: Duration,
+    },
+
+    #[error("cannot add column {name} because it already exists with type {existing}")]
+    DuplicateColumn {
+        name: Arc<str>,
+        existing: InfluxColumnType,
     },
 }
 

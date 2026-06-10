@@ -1,11 +1,18 @@
 use async_trait::async_trait;
+use datafusion::arrow::array::{Array, BooleanArray, RecordBatch, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::memory::MemoryStream;
 use influxdb_influxql_parser::statement::Statement;
+use influxdb3_catalog::catalog::Catalog;
 use iox_query::query_log::QueryLogEntries;
 use iox_query::{QueryDatabase, QueryNamespace};
+use iox_query_influxql::show_databases::{InfluxQlShowDatabases, generate_metadata};
+use iox_query_influxql::show_retention_policies::InfluxQlShowRetentionPolicies;
 use iox_query_params::StatementParams;
+use schema::INFLUXQL_MEASUREMENT_COLUMN_NAME;
 use std::fmt::Debug;
 use std::sync::Arc;
 use trace::ctx::SpanContext;
@@ -82,9 +89,130 @@ pub trait QueryExecutor: QueryDatabase + Debug + Send + Sync + 'static {
         span_ctx: Option<SpanContext>,
     ) -> Result<SendableRecordBatchStream, QueryExecutorError>;
 
-    fn upcast(&self) -> Arc<(dyn QueryDatabase + 'static)>;
+    fn upcast(&self) -> Arc<dyn QueryDatabase + 'static>;
 }
 
+#[derive(Debug)]
+pub struct ShowDatabases(Arc<Catalog>);
+
+impl ShowDatabases {
+    pub fn new(catalog: Arc<Catalog>) -> Arc<Self> {
+        Arc::new(Self(catalog))
+    }
+}
+
+#[async_trait::async_trait]
+impl InfluxQlShowDatabases for ShowDatabases {
+    /// Produce the Arrow schema for the `SHOW DATABASES` InfluxQL query
+    fn schema(&self) -> SchemaRef {
+        Arc::new(
+            Schema::new(vec![
+                Field::new(INFLUXQL_MEASUREMENT_COLUMN_NAME, DataType::Utf8, false),
+                Field::new("name", DataType::Utf8, false),
+            ])
+            .with_metadata(generate_metadata(0)),
+        )
+    }
+
+    /// Produce a record batch stream containing the results for the `SHOW DATABASES` query
+    async fn show_databases(
+        &self,
+        database_names: Vec<String>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        let databases = self
+            .0
+            .db_names()
+            .into_iter()
+            .filter(|db| database_names.contains(db))
+            .collect::<Vec<_>>();
+        let measurement_array: StringArray = vec!["databases"; databases.len()].into();
+        let names_array: StringArray = databases.into();
+        let arrays = vec![
+            Arc::new(measurement_array) as Arc<dyn Array>,
+            Arc::new(names_array) as Arc<dyn Array>,
+        ];
+        let batch = RecordBatch::try_new(self.schema(), arrays)?;
+        Ok(Box::pin(MemoryStream::try_new(
+            vec![batch],
+            self.schema(),
+            None,
+        )?))
+    }
+}
+
+#[cfg(test)]
+mod show_databases_tests;
+#[derive(Debug)]
+pub struct ShowRetentionPolicies(Arc<Catalog>);
+
+impl ShowRetentionPolicies {
+    pub fn new(catalog: Arc<Catalog>) -> Arc<Self> {
+        Arc::new(Self(catalog))
+    }
+}
+
+/// Implementation of `SHOW RETENTION POLICIES` for the `/query` API.
+///
+/// # Note
+///
+/// The original v1 /query API reports the following fields:
+///
+/// - `shardGroupDuration`
+/// - `replicaN`
+/// - `futureWriteLimit`
+/// - `pastWriteLimit`
+///
+/// These are not reported in this implementation since they do not represent anything in the
+/// underlying database in v3.
+#[async_trait::async_trait]
+impl InfluxQlShowRetentionPolicies for ShowRetentionPolicies {
+    fn schema(&self) -> SchemaRef {
+        Arc::new(
+            Schema::new(vec![
+                Field::new(INFLUXQL_MEASUREMENT_COLUMN_NAME, DataType::Utf8, false),
+                Field::new("name", DataType::Utf8, false),
+                // NOTE(tjh): duration is allowed to be nullable for databases that have `Indefinite`
+                // retention periods.
+                Field::new("duration", DataType::Utf8, true),
+                Field::new("default", DataType::Boolean, false),
+            ])
+            .with_metadata(generate_metadata(0)),
+        )
+    }
+
+    async fn show_retention_policies(
+        &self,
+        db_name: String,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        let Some(db) = self.0.db_schema(&db_name) else {
+            return Err(DataFusionError::Plan(format!(
+                "database not found: {db_name}"
+            )));
+        };
+        let measurement_array: StringArray = vec!["retention_policies"].into();
+        let names_array: StringArray = vec![db.name().as_ref()].into();
+        let rp = db.retention_period.format_v1();
+        let durations_array = StringArray::from(vec![rp.as_ref()]);
+        let default_array: BooleanArray = vec![true].into();
+
+        let arrays = vec![
+            Arc::new(measurement_array) as Arc<dyn Array>,
+            Arc::new(names_array) as Arc<dyn Array>,
+            Arc::new(durations_array) as Arc<dyn Array>,
+            Arc::new(default_array) as Arc<dyn Array>,
+        ];
+
+        let batch = RecordBatch::try_new(self.schema(), arrays)?;
+        Ok(Box::pin(MemoryStream::try_new(
+            vec![batch],
+            self.schema(),
+            None,
+        )?))
+    }
+}
+
+#[cfg(test)]
+mod show_retention_policies_tests;
 #[derive(Debug, Copy, Clone)]
 pub struct UnimplementedQueryExecutor;
 
@@ -153,7 +281,7 @@ impl QueryExecutor for UnimplementedQueryExecutor {
         ))
     }
 
-    fn upcast(&self) -> Arc<(dyn QueryDatabase + 'static)> {
+    fn upcast(&self) -> Arc<dyn QueryDatabase + 'static> {
         Arc::new(UnimplementedQueryExecutor) as _
     }
 }
