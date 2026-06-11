@@ -207,13 +207,16 @@ impl CompactionService {
         let mut completed_jobs = 0;
         let max_concurrent = std::cmp::min(jobs.len(), 4); // Limit concurrent compactions
 
-        for job in jobs.into_iter().take(self.config.max_files_per_run) {
+        for job in jobs {
             if set.len() >= max_concurrent {
                 if let Some(result) = set.join_next().await {
                     match result {
                         Ok(Ok(_)) => completed_jobs += 1,
-                        Ok(Err(e)) => error!("Compaction job failed: {}", e),
-                        Err(e) => error!("Compaction task failed: {}", e),
+                        // `{:#}` prints the full anyhow context chain; the top
+                        // context alone ("failed to execute compaction") hides
+                        // the root cause.
+                        Ok(Err(e)) => error!("Compaction job failed: {:#}", e),
+                        Err(e) => error!("Compaction task failed: {:#}", e),
                     }
                 }
             }
@@ -226,8 +229,8 @@ impl CompactionService {
         while let Some(result) = set.join_next().await {
             match result {
                 Ok(Ok(_)) => completed_jobs += 1,
-                Ok(Err(e)) => error!("Compaction job failed: {}", e),
-                Err(e) => error!("Compaction task failed: {}", e),
+                Ok(Err(e)) => error!("Compaction job failed: {:#}", e),
+                Err(e) => error!("Compaction task failed: {:#}", e),
             }
         }
 
@@ -345,17 +348,22 @@ impl CompactionService {
                         {
                             // Check if files span the target duration
                             if self.can_compact_to_generation(files, *target_duration) {
-                                jobs.push(CompactionJob {
-                                    database_id: db_schema.id,
-                                    database_name: Arc::clone(&db_schema.name),
-                                    table_id: table_def.table_id,
-                                    table_name: Arc::clone(&table_def.table_name),
-                                    source_generation: *current_gen,
-                                    target_generation: next_gen,
-                                    files: files.clone(),
-                                    schema: table_def.schema.clone(),
-                                    sort_key: table_def.sort_key.clone(),
-                                });
+                                for chunk in chunk_files_for_jobs(
+                                    files.clone(),
+                                    self.config.max_files_per_run,
+                                ) {
+                                    jobs.push(CompactionJob {
+                                        database_id: db_schema.id,
+                                        database_name: Arc::clone(&db_schema.name),
+                                        table_id: table_def.table_id,
+                                        table_name: Arc::clone(&table_def.table_name),
+                                        source_generation: *current_gen,
+                                        target_generation: next_gen,
+                                        files: chunk,
+                                        schema: table_def.schema.clone(),
+                                        sort_key: table_def.sort_key.clone(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -443,7 +451,19 @@ impl CompactionService {
 
         // Build chunks and run the compaction plan.
         let chunks = self.create_chunks_from_files(&job.files, &job.schema).await?;
-        let ctx = self.executor.new_context();
+        // The iox_query default `max_parquet_fanout` (40) is far below a
+        // bounded job's input count, which forces a full re-sort of every
+        // input. Raise it to the job size so the pre-sorted parquet path
+        // stays available. (The `--datafusion-max-parquet-fanout` CLI flag
+        // only reaches the HTTP query executor, not this context.)
+        let ctx = self
+            .executor
+            .new_session_config()
+            .with_config_option(
+                "iox.max_parquet_fanout",
+                &job.files.len().max(40).to_string(),
+            )
+            .build();
 
         let logical_plan = ReorgPlanner::new()
             .compact_plan(
@@ -895,11 +915,54 @@ fn chunk_time_for_duration(min_time: i64, target_duration: Duration) -> i64 {
     }
 }
 
+/// Split an eligible generation's files into per-job input batches of at
+/// most `max_files` each, oldest first, so a large backlog becomes several
+/// bounded jobs instead of one DataFusion plan over thousands of files.
+fn chunk_files_for_jobs(mut files: Vec<ParquetFile>, max_files: usize) -> Vec<Vec<ParquetFile>> {
+    files.sort_by_key(|f| f.min_time);
+    files
+        .chunks(max_files.max(1))
+        .map(<[ParquetFile]>::to_vec)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
     use std::time::Duration;
+
+    #[test]
+    fn chunk_files_for_jobs_bounds_job_size_oldest_first() {
+        let file = |id: u64, min_time: i64| ParquetFile {
+            id: crate::ParquetFileId::from(id),
+            path: format!("gen1/{id}.parquet"),
+            size_bytes: 1,
+            row_count: 1,
+            chunk_time: min_time,
+            min_time,
+            max_time: min_time + 1,
+        };
+        // 25 files, newest first on purpose — chunking must re-sort.
+        let files: Vec<ParquetFile> = (0..25u64).rev().map(|i| file(i, i as i64 * 60)).collect();
+
+        let chunks = chunk_files_for_jobs(files, 10);
+
+        assert_eq!(
+            chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![10, 10, 5],
+            "25 files with max 10 per job should yield jobs of 10/10/5"
+        );
+        let flat: Vec<i64> = chunks.iter().flatten().map(|f| f.min_time).collect();
+        let mut sorted = flat.clone();
+        sorted.sort_unstable();
+        assert_eq!(flat, sorted, "jobs must drain the backlog oldest-first");
+
+        // Degenerate config must not panic or produce empty chunks.
+        let one = chunk_files_for_jobs(vec![file(1, 0)], 0);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].len(), 1);
+    }
 
     #[test]
     fn test_compaction_config_default() {
