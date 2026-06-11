@@ -532,7 +532,10 @@ fn as_mb(bytes: u64) -> f64 {
 /// When `initial_load=true` (startup): appends without deduplication.
 /// When `initial_load=false` (runtime): filters duplicates before appending.
 ///
-/// Also processes `snapshot.removed_files`, removing matching files by ID.
+/// Also processes `snapshot.removed_files`, removing matching files by path.
+/// Path is the only cross-node identity: `ParquetFileId` is a process-local
+/// counter, so files persisted by different nodes (e.g. writer gen1 inputs
+/// and compactor outputs) can share an id within the same table.
 fn update_persisted_files_with_snapshot(
     initial_load: bool,
     persisted_snapshot: &PersistedSnapshot,
@@ -599,7 +602,7 @@ fn update_persisted_files_with_snapshot(
                         return;
                     };
                     for file in remove_parquet_files {
-                        if let Some(idx) = table_files.iter().position(|f| f.id == file.id) {
+                        if let Some(idx) = table_files.iter().position(|f| f.path == file.path) {
                             let file = table_files.swap_remove(idx);
                             file_count = file_count.saturating_sub(1);
                             removed_size += file.size_bytes;

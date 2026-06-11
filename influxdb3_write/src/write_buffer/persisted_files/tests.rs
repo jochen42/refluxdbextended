@@ -81,6 +81,108 @@ fn test_get_metrics_after_update_with_duplicate_file() {
     assert_eq!(150, row_count);
 }
 
+/// `ParquetFileId`s are process-local counters, so files persisted by
+/// different nodes (writer gen1 inputs vs. compactor outputs) can share an
+/// id within the same table. Removal must therefore match by path: matching
+/// by id removed whichever file happened to sit first in the table vec —
+/// in production the compactor output, leaving a stale ref to the deleted
+/// gen1 input behind.
+#[test_log::test(test)]
+fn test_removed_files_match_by_path_across_node_id_collision() {
+    let colliding_id = ParquetFileId::from(239);
+    let compactor_output = ParquetFile {
+        id: colliding_id,
+        path: "main-compactor-0/dbs/db-31/t-0/gen4/2025-04-24/00-00/out.parquet".to_owned(),
+        size_bytes: 100,
+        row_count: 10,
+        chunk_time: 0,
+        min_time: 0,
+        max_time: 100,
+    };
+    let gen1_input = ParquetFile {
+        id: colliding_id,
+        path: "main-writer-0/dbs/31/0/2025-04-24/22-25/0000000359.parquet".to_owned(),
+        size_bytes: 50,
+        row_count: 5,
+        chunk_time: 0,
+        min_time: 0,
+        max_time: 100,
+    };
+
+    // Boot fold order: checkpoint (compactor output) first, WAL re-add of the
+    // gen1 input second, compaction removal manifest last.
+    let checkpoint = build_snapshot(vec![compactor_output.clone()], 1, 1, 1);
+    let wal = build_snapshot(vec![gen1_input.clone()], 2, 2, 2);
+    let mut removal = build_snapshot(vec![], 3, 3, 3);
+    let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
+    removed
+        .entry(DbId::from(0))
+        .or_default()
+        .tables
+        .entry(TableId::from(0))
+        .or_default()
+        .push(gen1_input.clone());
+    removal.removed_files = removed;
+
+    let persisted_files = PersistedFiles::new_from_persisted_snapshots(
+        None,
+        Arc::new(vec![checkpoint, wal, removal]),
+    );
+
+    let files = persisted_files.get_files(DbId::from(0), TableId::from(0));
+    assert_eq!(1, files.len());
+    assert_eq!(compactor_output.path, files[0].path);
+}
+
+/// Same collision as above, but the removal arrives at runtime through
+/// `add_persisted_snapshot_files` (the inventory-poller path on queriers).
+#[test_log::test(test)]
+fn test_removed_files_match_by_path_at_runtime() {
+    let colliding_id = ParquetFileId::from(3);
+    let compactor_output = ParquetFile {
+        id: colliding_id,
+        path: "main-compactor-0/dbs/db-2/t-1/gen2/2026-06-11/20-00/out.parquet".to_owned(),
+        size_bytes: 100,
+        row_count: 10,
+        chunk_time: 0,
+        min_time: 0,
+        max_time: 100,
+    };
+    let gen1_input = ParquetFile {
+        id: colliding_id,
+        path: "main-writer-0/dbs/2/1/2026-06-11/20-18/0000000120.parquet".to_owned(),
+        size_bytes: 50,
+        row_count: 5,
+        chunk_time: 0,
+        min_time: 0,
+        max_time: 100,
+    };
+
+    let persisted_files = PersistedFiles::new_from_persisted_snapshots(
+        None,
+        Arc::new(vec![
+            build_snapshot(vec![compactor_output.clone()], 1, 1, 1),
+            build_snapshot(vec![gen1_input.clone()], 2, 2, 2),
+        ]),
+    );
+
+    let mut removal = build_snapshot(vec![], 3, 3, 3);
+    let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
+    removed
+        .entry(DbId::from(0))
+        .or_default()
+        .tables
+        .entry(TableId::from(0))
+        .or_default()
+        .push(gen1_input.clone());
+    removal.removed_files = removed;
+    persisted_files.add_persisted_snapshot_files(removal);
+
+    let files = persisted_files.get_files(DbId::from(0), TableId::from(0));
+    assert_eq!(1, files.len());
+    assert_eq!(compactor_output.path, files[0].path);
+}
+
 #[test]
 fn test_get_files_with_filters() {
     let parquet_files = (0..100)
