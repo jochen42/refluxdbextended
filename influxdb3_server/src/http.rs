@@ -2769,8 +2769,17 @@ async fn perform_routing(
     }
 
     // admin token creation should be allowed without authentication
-    // and any endpoints that are disabled
-    if path == all_paths::API_V3_CONFIGURE_ADMIN_TOKEN || paths_without_authz.contains(&path) {
+    // and any endpoints that are disabled.
+    //
+    // `/api/v3/internal/*` paths are exempt because they are intra-cluster
+    // RPCs (Layer B hot-chunks fetch from querier to writer). The mode
+    // enforcement below (`allow_internal_rpc`) already ensures these only
+    // serve on nodes that opt in, and these endpoints are expected to live
+    // on a private network, not the public ingress.
+    if path == all_paths::API_V3_CONFIGURE_ADMIN_TOKEN
+        || path.starts_with("/api/v3/internal/")
+        || paths_without_authz.contains(&path)
+    {
         trace!(?uri, "not authenticating request");
     } else {
         trace!(?uri, "authenticating request");
