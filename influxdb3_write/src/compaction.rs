@@ -203,33 +203,38 @@ impl CompactionService {
 
         info!("Identified {} compaction jobs", jobs.len());
 
+        // Group jobs by claim path: chunked jobs for the same
+        // (db, table, src->dst) tuple share one claim, so they must run
+        // sequentially under a single acquisition — concurrent siblings
+        // would race each other's claim create/delete. Distinct tables
+        // still run in parallel.
+        let mut groups: BTreeMap<ObjPath, Vec<CompactionJob>> = BTreeMap::new();
+        for job in jobs {
+            groups.entry(self.claim_path(&job)).or_default().push(job);
+        }
+
         let mut set = JoinSet::new();
         let mut completed_jobs = 0;
-        let max_concurrent = std::cmp::min(jobs.len(), 4); // Limit concurrent compactions
+        let max_concurrent = std::cmp::min(groups.len(), 4); // Limit concurrent compactions
 
-        for job in jobs {
+        for (claim_path, group) in groups {
             if set.len() >= max_concurrent {
                 if let Some(result) = set.join_next().await {
                     match result {
-                        Ok(Ok(_)) => completed_jobs += 1,
-                        // `{:#}` prints the full anyhow context chain; the top
-                        // context alone ("failed to execute compaction") hides
-                        // the root cause.
-                        Ok(Err(e)) => error!("Compaction job failed: {:#}", e),
+                        Ok(n) => completed_jobs += n,
                         Err(e) => error!("Compaction task failed: {:#}", e),
                     }
                 }
             }
 
             let service = Arc::clone(self);
-            set.spawn(async move { service.execute_compaction_job(job).await });
+            set.spawn(async move { service.execute_claim_group(claim_path, group).await });
         }
 
-        // Wait for remaining jobs
+        // Wait for remaining groups
         while let Some(result) = set.join_next().await {
             match result {
-                Ok(Ok(_)) => completed_jobs += 1,
-                Ok(Err(e)) => error!("Compaction job failed: {:#}", e),
+                Ok(n) => completed_jobs += n,
                 Err(e) => error!("Compaction task failed: {:#}", e),
             }
         }
@@ -374,7 +379,58 @@ impl CompactionService {
         Ok(jobs)
     }
 
-    /// Execute a single compaction job.
+    /// Run a set of jobs that share one claim path sequentially under a
+    /// single claim acquisition. Returns the number of completed jobs.
+    ///
+    /// Per-table claim: only one compactor process at a time may work on
+    /// this exact (db, table, src_gen, dst_gen) tuple. Other concurrent
+    /// compactors targeting OTHER tables continue in parallel.
+    async fn execute_claim_group(
+        self: Arc<Self>,
+        claim_path: ObjPath,
+        jobs: Vec<CompactionJob>,
+    ) -> u64 {
+        match self.acquire_claim(&claim_path).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    "compaction claim {} held by another worker; skipping {} jobs",
+                    claim_path,
+                    jobs.len()
+                );
+                return 0;
+            }
+            Err(e) => {
+                error!(
+                    "Compaction claim acquisition failed for {}: {:#}",
+                    claim_path, e
+                );
+                return 0;
+            }
+        }
+
+        // Defer release until the whole group exits (success OR failure).
+        // A guard so panics within DataFusion don't leak the claim.
+        let _claim_guard = ClaimGuard {
+            store: Arc::clone(&self.object_store),
+            path: claim_path,
+        };
+
+        let mut completed = 0;
+        for job in jobs {
+            match self.execute_compaction_job(job).await {
+                Ok(_) => completed += 1,
+                // `{:#}` prints the full anyhow context chain; the top
+                // context alone ("failed to execute compaction") hides
+                // the root cause.
+                Err(e) => error!("Compaction job failed: {:#}", e),
+            }
+        }
+        completed
+    }
+
+    /// Execute a single compaction job. The caller must hold the job's
+    /// claim (see [`Self::execute_claim_group`]).
     ///
     /// Compaction is publish-then-delete:
     /// 1. Sort/dedupe inputs through DataFusion.
@@ -407,44 +463,6 @@ impl CompactionService {
                 job.table_name
             ));
         }
-
-        // Per-table claim: only one compactor process at a time may work on
-        // this exact (db, table, src_gen, dst_gen) tuple. Other concurrent
-        // compactors targeting OTHER tables continue in parallel.
-        let claim_path = self.claim_path(&job);
-        if !self.acquire_claim(&claim_path).await? {
-            debug!(
-                "compaction claim {} held by another worker; skipping",
-                claim_path
-            );
-            return Ok(CompactionResult {
-                compacted_files: vec![],
-                deleted_files: vec![],
-                total_size_reduction: 0,
-                total_rows_compacted: 0,
-            });
-        }
-
-        // Defer release until the job exits (success OR failure). Use a guard
-        // so panics within DataFusion don't leak the claim.
-        struct ClaimGuard<'a> {
-            store: &'a Arc<dyn ObjectStore>,
-            path: ObjPath,
-        }
-        impl Drop for ClaimGuard<'_> {
-            fn drop(&mut self) {
-                // tokio::spawn since Drop can't be async; best-effort.
-                let store = Arc::clone(self.store);
-                let path = self.path.clone();
-                tokio::spawn(async move {
-                    let _ = store.delete(&path).await;
-                });
-            }
-        }
-        let _claim_guard = ClaimGuard {
-            store: &self.object_store,
-            path: claim_path.clone(),
-        };
 
         let start_time = std::time::Instant::now();
         let total_input_size: u64 = job.files.iter().map(|f| f.size_bytes).sum();
@@ -809,65 +827,92 @@ impl CompactionService {
         };
         let payload = serde_json::to_vec(&body).context("serialize claim body")?;
 
-        match self
-            .object_store
-            .put_opts(
-                path,
-                Bytes::from(payload.clone()).into(),
-                PutOptions::from(PutMode::Create),
-            )
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::AlreadyExists { .. }) => {
-                // Inspect existing claim. Take over only if stale.
-                let bytes = self
-                    .object_store
-                    .get(path)
-                    .await
-                    .context("get existing claim")?
-                    .bytes()
-                    .await
-                    .context("read claim body")?;
-                let existing: ClaimBody = serde_json::from_slice(&bytes)
-                    .context("parse existing claim body")?;
-                let age_ms = (now_ms - existing.acquired_at_unix_ms).max(0) as u128;
-                if age_ms < self.config.claim_ttl.as_millis() {
-                    return Ok(false);
+        // Two attempts: the holder can release (delete) the claim between our
+        // failed Create and the GET below — the claim is free again, so retry
+        // the Create instead of failing the job on the 404.
+        for _ in 0..2 {
+            match self
+                .object_store
+                .put_opts(
+                    path,
+                    Bytes::from(payload.clone()).into(),
+                    PutOptions::from(PutMode::Create),
+                )
+                .await
+            {
+                Ok(_) => return Ok(true),
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    // Inspect existing claim. Take over only if stale.
+                    let bytes = match self.object_store.get(path).await {
+                        Ok(resp) => resp.bytes().await.context("read claim body")?,
+                        Err(object_store::Error::NotFound { .. }) => {
+                            // Released between our Create and this GET.
+                            continue;
+                        }
+                        Err(e) => return Err(e).context("get existing claim"),
+                    };
+                    let existing: ClaimBody = serde_json::from_slice(&bytes)
+                        .context("parse existing claim body")?;
+                    let age_ms = (now_ms - existing.acquired_at_unix_ms).max(0) as u128;
+                    if age_ms < self.config.claim_ttl.as_millis() {
+                        return Ok(false);
+                    }
+                    // Stale claim — overwrite. Race window: two takeover attempts
+                    // collide. Acceptable since duplicate compaction is recoverable
+                    // (manifest publishes are idempotent and PersistedFiles dedupes
+                    // removals by path).
+                    self.object_store
+                        .put(path, Bytes::from(payload).into())
+                        .await
+                        .context("overwrite stale claim")?;
+                    return Ok(true);
                 }
-                // Stale claim — overwrite. Race window: two takeover attempts
-                // collide. Acceptable since duplicate compaction is recoverable
-                // (manifest publishes are idempotent and PersistedFiles dedupes
-                // by file id).
-                self.object_store
-                    .put(path, Bytes::from(payload).into())
-                    .await
-                    .context("overwrite stale claim")?;
-                Ok(true)
+                Err(object_store::Error::NotSupported { .. }) => {
+                    // Backend without conditional puts. Fall back to non-atomic
+                    // "look then leap" with a brief sleep to reduce collision
+                    // probability. Production deployments must use a backend
+                    // with `If-None-Match` support.
+                    warn!(
+                        "object store does not support PutMode::Create; \
+                         compaction claims will not be atomic"
+                    );
+                    self.object_store
+                        .put(path, Bytes::from(payload).into())
+                        .await
+                        .context("write claim without atomic guard")?;
+                    return Ok(true);
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(object_store::Error::NotSupported { .. }) => {
-                // Backend without conditional puts. Fall back to non-atomic
-                // "look then leap" with a brief sleep to reduce collision
-                // probability. Production deployments must use a backend
-                // with `If-None-Match` support.
-                warn!(
-                    "object store does not support PutMode::Create; \
-                     compaction claims will not be atomic"
-                );
-                self.object_store
-                    .put(path, Bytes::from(payload).into())
-                    .await
-                    .context("write claim without atomic guard")?;
-                Ok(true)
-            }
-            Err(e) => Err(e.into()),
         }
+        // The claim vanished twice in a row — heavy contention; treat as held
+        // and let the next cycle retry.
+        Ok(false)
     }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ClaimBody {
     acquired_at_unix_ms: i64,
+}
+
+/// Deletes the claim object on drop, so the claim is released on success,
+/// failure, or panic. Drop can't be async, so the delete is spawned and
+/// best-effort: if the process dies before it runs, the claim leaks until
+/// `claim_ttl` allows takeover.
+struct ClaimGuard {
+    store: Arc<dyn ObjectStore>,
+    path: ObjPath,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        let store = Arc::clone(&self.store);
+        let path = self.path.clone();
+        tokio::spawn(async move {
+            let _ = store.delete(&path).await;
+        });
+    }
 }
 
 fn batches_time_range_and_rows(
