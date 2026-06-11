@@ -31,7 +31,7 @@ use influxdb3_authz::AuthProvider;
 use influxdb3_catalog::catalog::Catalog;
 use influxdb3_process::build_version_string;
 use influxdb3_telemetry::store::TelemetryStore;
-use observability_deps::tracing::{error, info, trace, warn};
+use observability_deps::tracing::{debug, error, info, trace, warn};
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -212,6 +212,26 @@ impl<'a> Server<'a> {
     }
 }
 
+/// True when a connection-serving error is just the peer going away
+/// (LB health probes RST-closing the socket, clients aborting requests) —
+/// routine in orchestrated deployments, not a server fault.
+fn is_client_disconnect(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut e = Some(err);
+    while let Some(cur) = e {
+        if let Some(io) = cur.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            );
+        }
+        e = cur.source();
+    }
+    false
+}
+
 pub async fn serve_admin_token_recovery_endpoint(
     server: Server<'_>,
     shutdown: CancellationToken,
@@ -289,7 +309,11 @@ pub async fn serve_admin_token_recovery_endpoint(
                             .serve_connection(io, service)
                             .await
                         {
-                            error!("Error serving connection: {:?}", err);
+                            if is_client_disconnect(err.as_ref()) {
+                                debug!("client disconnected during connection serving: {:?}", err);
+                            } else {
+                                error!("Error serving connection: {:?}", err);
+                            }
                         }
                     });
                 }
@@ -339,7 +363,11 @@ pub async fn serve_admin_token_recovery_endpoint(
                             .serve_connection(io, service)
                             .await
                         {
-                            error!("Error serving connection: {:?}", err);
+                            if is_client_disconnect(err.as_ref()) {
+                                debug!("client disconnected during connection serving: {:?}", err);
+                            } else {
+                                error!("Error serving connection: {:?}", err);
+                            }
                         }
                     });
                 }
@@ -525,7 +553,11 @@ pub async fn serve(
 
                         // Handle connection
                         if let Err(e) = conn.await {
-                            error!("Error serving connection: {:?}", e);
+                            if is_client_disconnect(e.as_ref()) {
+                                debug!("client disconnected during connection serving: {:?}", e);
+                            } else {
+                                error!("Error serving connection: {:?}", e);
+                            }
                         }
                     });
                 }
