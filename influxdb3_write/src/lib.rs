@@ -11,6 +11,7 @@ pub mod composite_write_buffer;
 pub mod deleter;
 pub mod inventory_poller;
 pub mod leases;
+pub mod ref_validator;
 pub mod remote_write_buffer;
 pub mod paths;
 pub mod persister;

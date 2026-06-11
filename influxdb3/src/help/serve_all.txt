@@ -184,6 +184,8 @@ Examples:
                                                  [env: INFLUXDB3_WRITER_LEASE_TTL=]
   --inventory-poll-interval <INTERVAL>         Reader-side poll of _inventory/* [default: 2s]
                                                  [env: INFLUXDB3_INVENTORY_POLL_INTERVAL=]
+  --ref-validation-interval <INTERVAL>         Evict parquet refs missing from object store [default: 1h]
+                                                 [env: INFLUXDB3_REF_VALIDATION_INTERVAL=]
   --writer-urls <URLS>                         Writer HTTP base URLs for hot reads (Layer B)
                                                  [env: INFLUXDB3_WRITER_URLS=]
   --remote-hot-timeout <DURATION>              Timeout for remote hot-chunk fetches [default: 250ms]

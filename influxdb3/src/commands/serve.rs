@@ -423,6 +423,19 @@ pub struct Config {
     )]
     pub inventory_poll_interval: humantime::Duration,
 
+    /// How often parquet references in the in-memory view are validated
+    /// against the object store; references whose objects do not exist are
+    /// evicted (defends against phantom refs from corrupted manifests).
+    /// Runs once at startup and then at this interval. Costs one recursive
+    /// LIST per node prefix per pass. Set to `0s` to disable.
+    #[clap(
+        long = "ref-validation-interval",
+        env = "INFLUXDB3_REF_VALIDATION_INTERVAL",
+        default_value = "1h",
+        action
+    )]
+    pub ref_validation_interval: humantime::Duration,
+
     /// Writer HTTP base URLs the querier will hit for hot in-memory rows
     /// (Layer B). Comma-separated; empty disables Layer B. Required for
     /// sub-second freshness in `--mode=querier`. Wire-format:
@@ -1396,6 +1409,24 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     .map_err(|e| Error::WriteBufferInit(e.into()))?;
 
     let persisted_files = write_buffer_impl.persisted_files();
+
+    // Parquet ref validation: evict in-memory references whose objects do
+    // not exist (phantom refs from corrupted manifests). Runs at boot and
+    // periodically; on the compactor the next inventory checkpoint then
+    // propagates the cleaned view durably.
+    let ref_validation_interval: Duration = config.ref_validation_interval.into();
+    if !ref_validation_interval.is_zero() {
+        info!(
+            interval = ?ref_validation_interval,
+            "spawning parquet ref validator"
+        );
+        influxdb3_write::ref_validator::spawn(influxdb3_write::ref_validator::RefValidatorArgs {
+            object_store: Arc::clone(&object_store),
+            persisted_files: Arc::clone(&persisted_files),
+            interval: ref_validation_interval,
+            shutdown: shutdown_manager.register(),
+        });
+    }
 
     // Construct WAL tail (Layer C) here — earlier than where the composite
     // wraps the WriteBufferImpl — so the inventory poller can notify it of
