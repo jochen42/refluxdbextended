@@ -406,6 +406,19 @@ pub struct Config {
     #[clap(long = "multi-writer", env = "INFLUXDB3_MULTI_WRITER", action)]
     pub multi_writer: bool,
 
+    /// How often the compactor scans for orphaned WAL — flushed but
+    /// unsnapshotted WAL files under a node prefix whose writer lease is
+    /// free (the writer died and never came back). Found WAL is replayed,
+    /// snapshotted, and published so its rows stay queryable. Compactor
+    /// mode only; `0s` disables.
+    #[clap(
+        long = "wal-reaper-interval",
+        env = "INFLUXDB3_WAL_REAPER_INTERVAL",
+        default_value = "1m",
+        action
+    )]
+    pub wal_reaper_interval: humantime::Duration,
+
     /// Open the catalog under the global `_catalog/` prefix so every node in
     /// a multi-node deployment sees a single source of truth for schema,
     /// retention, and tables. Requires an object store backend that supports
@@ -1729,6 +1742,30 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         let compaction_service = Arc::new(compaction_service);
         compaction_service.start();
         info!("compaction service started");
+
+        // Orphan-WAL reaper: adopts dead writers' unsnapshotted WAL so
+        // their buffered rows become queryable instead of silently lost.
+        // Runs alongside compaction — the compactor is the cluster's
+        // janitorial singleton. Only meaningful against a shared inventory.
+        let reaper_interval: Duration = config.wal_reaper_interval.into();
+        if matches!(config.mode, NodeMode::Compactor) && !reaper_interval.is_zero() {
+            if let Some(inv) = &shared_inventory {
+                influxdb3_write::wal_reaper::spawn(influxdb3_write::wal_reaper::WalReaperArgs {
+                    object_store: Arc::clone(&object_store),
+                    inventory: inv.clone(),
+                    executor: Arc::clone(&write_path_executor),
+                    time_provider: Arc::clone(&time_provider) as _,
+                    wal_config,
+                    lease_ttl: config.writer_lease_ttl.into(),
+                    interval: reaper_interval,
+                    own_node_id: node_id.as_str().to_string(),
+                    shutdown: shutdown_manager.register(),
+                    metric_registry: Arc::clone(&metrics),
+                    wal_replay_concurrency_limit: config.wal_replay_concurrency_limit,
+                    parquet_snapshot_concurrency_limit: config.parquet_snapshot_concurrency_limit,
+                });
+            }
+        }
     } else if !config.mode.runs_compaction() {
         info!(
             "compaction service disabled (mode={:?} does not run compaction)",

@@ -19,6 +19,7 @@ pub mod retention_period_handler;
 pub mod shared_inventory;
 pub mod table_index;
 pub mod table_index_cache;
+pub mod wal_reaper;
 pub mod wal_tail;
 pub mod write_buffer;
 

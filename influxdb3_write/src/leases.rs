@@ -217,7 +217,7 @@ impl Lease {
             .object_store
             .put_opts(
                 &self.config.path,
-                Bytes::from(payload).into(),
+                Bytes::from(payload.clone()).into(),
                 PutOptions::from(PutMode::Update(version)),
             )
             .await
@@ -231,6 +231,17 @@ impl Lease {
                 Ok(true)
             }
             Err(ObjStoreError::Precondition { .. }) => Ok(false),
+            Err(ObjStoreError::NotSupported { .. } | ObjStoreError::NotImplemented { .. }) => {
+                // Backend lacks etag-conditional Update (e.g. LocalFileSystem).
+                // Same best-effort downgrade as the Create path above.
+                warn!(
+                    "object store does not support conditional update; lease {} \
+                     takeover will be non-atomic and may briefly run duplicate \
+                     holders under contention",
+                    self.config.path
+                );
+                self.acquire_non_atomic(new_doc, payload, now_unix_ms).await
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -256,7 +267,7 @@ impl Lease {
             .object_store
             .put_opts(
                 &self.config.path,
-                Bytes::from(payload).into(),
+                Bytes::from(payload.clone()).into(),
                 PutOptions::from(PutMode::Update(version)),
             )
             .await
@@ -272,6 +283,11 @@ impl Lease {
                     self.config.path
                 );
                 Ok(false)
+            }
+            Err(ObjStoreError::NotSupported { .. } | ObjStoreError::NotImplemented { .. }) => {
+                // Backend lacks etag-conditional Update (e.g. LocalFileSystem).
+                // Same best-effort downgrade as acquisition.
+                self.acquire_non_atomic(new_doc, payload, now_unix_ms).await
             }
             Err(e) => Err(e.into()),
         }
