@@ -825,10 +825,16 @@ async fn catalog_snapshots_only_if_updated() {
     verify_snapshot_count(3, &write_buffer.persister).await;
 }
 
+/// Serializes tests that store and assert exact values of the process-global
+/// `NEXT_FILE_ID` counter — run concurrently they observe each other's
+/// `set_next_id` calls and fail intermittently.
+static FILE_ID_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Check that when a WriteBuffer is initialized with existing snapshot files, that newly
 /// generated snapshot files use the next sequence number.
 #[tokio::test]
 async fn new_snapshots_use_correct_sequence() {
+    let _file_id_guard = FILE_ID_LOCK.lock().await;
     // set up a local file system object store:
     let object_store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap());
@@ -937,6 +943,7 @@ async fn new_snapshots_use_correct_sequence() {
 
 #[tokio::test]
 async fn next_id_is_correct_number() {
+    let _file_id_guard = FILE_ID_LOCK.lock().await;
     // set up a local file system object store:
     let object_store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap());

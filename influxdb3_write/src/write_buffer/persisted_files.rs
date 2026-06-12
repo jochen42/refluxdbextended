@@ -385,20 +385,20 @@ impl Inner {
             snapshot_count = persisted_snapshots.len(),
             "new_from_persisted_snapshots: starting"
         );
-        let mut file_count = 0;
+        let mut file_count: u64 = 0;
         let mut size_in_mb = 0.0;
-        let mut row_count = 0;
+        let mut row_count: u64 = 0;
 
         let files = persisted_snapshots.iter().fold(
             hashbrown::HashMap::new(),
             |mut files, persisted_snapshot| {
-                size_in_mb += as_mb(persisted_snapshot.parquet_size_bytes);
-                row_count += persisted_snapshot.row_count;
-                let (parquet_files_added, removed_size, removed_row_count) =
-                    update_persisted_files_with_snapshot(true, persisted_snapshot, &mut files);
-                file_count += parquet_files_added;
-                size_in_mb -= as_mb(removed_size);
-                row_count = row_count.saturating_sub(removed_row_count);
+                let delta = update_persisted_files_with_snapshot(persisted_snapshot, &mut files);
+                file_count += delta.added_count;
+                file_count = file_count.saturating_sub(delta.removed_count);
+                size_in_mb += as_mb(delta.added_size_bytes);
+                size_in_mb -= as_mb(delta.removed_size_bytes);
+                row_count += delta.added_row_count;
+                row_count = row_count.saturating_sub(delta.removed_row_count);
                 files
             },
         );
@@ -458,15 +458,17 @@ impl Inner {
     ///
     /// Deduplicates incoming files. Called at runtime (not during initial load).
     pub(crate) fn add_persisted_snapshot(&mut self, persisted_snapshot: PersistedSnapshot) {
-        self.parquet_files_row_count += persisted_snapshot.row_count;
-        self.parquet_files_size_mb += as_mb(persisted_snapshot.parquet_size_bytes);
-        let (file_count, removed_file_size, removed_row_count) =
-            update_persisted_files_with_snapshot(false, &persisted_snapshot, &mut self.files);
+        let delta = update_persisted_files_with_snapshot(&persisted_snapshot, &mut self.files);
+        self.parquet_files_count += delta.added_count;
+        self.parquet_files_count = self
+            .parquet_files_count
+            .saturating_sub(delta.removed_count);
+        self.parquet_files_row_count += delta.added_row_count;
         self.parquet_files_row_count = self
             .parquet_files_row_count
-            .saturating_sub(removed_row_count);
-        self.parquet_files_size_mb -= as_mb(removed_file_size);
-        self.parquet_files_count += file_count;
+            .saturating_sub(delta.removed_row_count);
+        self.parquet_files_size_mb += as_mb(delta.added_size_bytes);
+        self.parquet_files_size_mb -= as_mb(delta.removed_size_bytes);
     }
 
     /// Adds a single parquet file to the specified database and table.
@@ -525,23 +527,36 @@ fn as_mb(bytes: u64) -> f64 {
     bytes as f64 / factor
 }
 
+/// Accumulated deltas from folding one [`PersistedSnapshot`] into the
+/// db/table hierarchy. Only files actually added / actually present count,
+/// so metrics stay consistent under deduplication.
+#[derive(Debug, Default)]
+struct SnapshotFoldDelta {
+    added_count: u64,
+    added_size_bytes: u64,
+    added_row_count: u64,
+    removed_count: u64,
+    removed_size_bytes: u64,
+    removed_row_count: u64,
+}
+
 /// Merges parquet files from a [`PersistedSnapshot`] into the db/table hierarchy.
 ///
-/// Returns `(file_count_delta, removed_size_bytes, removed_row_count)`.
+/// Files are identified by their object-store path everywhere: `ParquetFileId`
+/// is a process-local counter, so files persisted by different nodes (e.g.
+/// writer gen1 inputs and compactor outputs) can share an id within the same
+/// table, and the same file can arrive from different sources with different
+/// ids (a checkpoint and a WAL manifest both carry it).
 ///
-/// When `initial_load=true` (startup): appends without deduplication.
-/// When `initial_load=false` (runtime): filters duplicates before appending.
-///
-/// Also processes `snapshot.removed_files`, removing matching files by path.
-/// Path is the only cross-node identity: `ParquetFileId` is a process-local
-/// counter, so files persisted by different nodes (e.g. writer gen1 inputs
-/// and compactor outputs) can share an id within the same table.
+/// Adds are deduplicated by path; removals drop every copy with a matching
+/// path. Anything weaker corrupts multi-node state: un-deduplicated boot
+/// folds let checkpoint + WAL copies accumulate across restarts, and a
+/// single-copy removal then leaves stale duplicates behind.
 fn update_persisted_files_with_snapshot(
-    initial_load: bool,
     persisted_snapshot: &PersistedSnapshot,
     db_to_tables: &mut HashMap<DbId, HashMap<TableId, Vec<ParquetFile>>>,
-) -> (u64, u64, u64) {
-    let (mut file_count, mut removed_size, mut removed_row_count): (u64, u64, u64) = (0, 0, 0);
+) -> SnapshotFoldDelta {
+    let mut delta = SnapshotFoldDelta::default();
     persisted_snapshot
         .databases
         .iter()
@@ -557,17 +572,15 @@ fn update_persisted_files_with_snapshot(
                     let table_files = db_tables
                         .entry(*table_id)
                         .or_insert_with(|| Vec::with_capacity(new_parquet_files.len()));
-                    if initial_load {
-                        file_count += new_parquet_files.len() as u64;
-                        table_files.extend(new_parquet_files.iter().cloned());
-                    } else {
-                        let mut filtered_files: Vec<ParquetFile> = new_parquet_files
-                            .iter()
-                            .filter(|file| !table_files.contains(file))
-                            .cloned()
-                            .collect();
-                        file_count += filtered_files.len() as u64;
-                        table_files.append(&mut filtered_files);
+                    let mut seen_paths: HashSet<String> =
+                        table_files.iter().map(|f| f.path.clone()).collect();
+                    for file in new_parquet_files {
+                        if seen_paths.insert(file.path.clone()) {
+                            delta.added_count += 1;
+                            delta.added_size_bytes += file.size_bytes;
+                            delta.added_row_count += file.row_count;
+                            table_files.push(file.clone());
+                        }
                     }
                 });
         });
@@ -601,18 +614,24 @@ fn update_persisted_files_with_snapshot(
                         );
                         return;
                     };
-                    for file in remove_parquet_files {
-                        if let Some(idx) = table_files.iter().position(|f| f.path == file.path) {
-                            let file = table_files.swap_remove(idx);
-                            file_count = file_count.saturating_sub(1);
-                            removed_size += file.size_bytes;
-                            removed_row_count += file.row_count;
+                    let remove_paths: HashSet<&str> = remove_parquet_files
+                        .iter()
+                        .map(|f| f.path.as_str())
+                        .collect();
+                    table_files.retain(|f| {
+                        if remove_paths.contains(f.path.as_str()) {
+                            delta.removed_count += 1;
+                            delta.removed_size_bytes += f.size_bytes;
+                            delta.removed_row_count += f.row_count;
+                            false
+                        } else {
+                            true
                         }
-                    }
+                    });
                 });
         });
 
-    (file_count, removed_size, removed_row_count)
+    delta
 }
 
 #[cfg(test)]

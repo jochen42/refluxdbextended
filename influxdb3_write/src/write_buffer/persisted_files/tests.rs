@@ -13,6 +13,8 @@ use super::*;
 
 #[test_log::test(test)]
 fn test_get_metrics_after_initial_load() {
+    // build_persisted_snapshots produces two snapshots carrying the same 5
+    // paths — the boot fold dedupes by path, so only 5 files survive.
     let all_persisted_snapshot_files = build_persisted_snapshots();
     let persisted_file =
         PersistedFiles::new_from_persisted_snapshots(None, Arc::new(all_persisted_snapshot_files));
@@ -20,9 +22,9 @@ fn test_get_metrics_after_initial_load() {
     let (file_count, size_in_mb, row_count) = persisted_file.get_metrics();
 
     info!(metrics = ?persisted_file.get_metrics(), "All files metrics");
-    assert_eq!(10, file_count);
-    assert_eq!(0.5, size_in_mb);
-    assert_eq!(100, row_count);
+    assert_eq!(5, file_count);
+    assert_eq!(0.25, size_in_mb);
+    assert_eq!(50, row_count);
 }
 
 #[test_log::test(test)]
@@ -30,16 +32,16 @@ fn test_get_metrics_after_update() {
     let all_persisted_snapshot_files = build_persisted_snapshots();
     let persisted_file =
         PersistedFiles::new_from_persisted_snapshots(None, Arc::new(all_persisted_snapshot_files));
-    let parquet_files = build_parquet_files("file_", 5);
+    let parquet_files = build_parquet_files("update_", 5);
     let new_snapshot = build_snapshot(parquet_files, 1, 1, 1);
     persisted_file.add_persisted_snapshot_files(new_snapshot);
 
     let (file_count, size_in_mb, row_count) = persisted_file.get_metrics();
 
     info!(metrics = ?persisted_file.get_metrics(), "All files metrics");
-    assert_eq!(15, file_count);
-    assert_eq!(0.75, size_in_mb);
-    assert_eq!(150, row_count);
+    assert_eq!(10, file_count);
+    assert_eq!(0.5, size_in_mb);
+    assert_eq!(100, row_count);
 }
 
 #[test_log::test(test)]
@@ -60,6 +62,8 @@ fn test_get_metrics_after_update_with_duplicate_file() {
 
     let persisted_file =
         PersistedFiles::new_from_persisted_snapshots(None, Arc::new(all_persisted_snapshot_files));
+    // 4 files whose paths match already-loaded ones, plus a literal clone of
+    // an existing file — every one of them dedupes away, metrics unchanged.
     let mut parquet_files = build_parquet_files("file_", 4);
     info!(all_persisted_files = ?persisted_file, "Full persisted file");
     info!(already_existing_file = ?already_existing_file, "Existing file");
@@ -72,13 +76,63 @@ fn test_get_metrics_after_update_with_duplicate_file() {
     info!(all_persisted_files = ?persisted_file, "Full persisted file after");
 
     info!(metrics = ?persisted_file.get_metrics(), "All files metrics");
-    assert_eq!(14, file_count);
-    // TODO: Just tying in TODO within build_snapshot function below. Even though
-    //       there are only 14 files added to persisted_file the below 2 metrics
-    //       are for 15 files because of using `add_parquet_file` directly which
-    //       doesn't check for duplicates
-    assert_eq!(0.75, size_in_mb);
-    assert_eq!(150, row_count);
+    assert_eq!(5, file_count);
+    assert_eq!(0.25, size_in_mb);
+    assert_eq!(50, row_count);
+}
+
+/// Production incident: a checkpoint and a WAL manifest both carried the same
+/// file (with different process-local ids), and restart-amplified checkpoints
+/// carried it many times over. The querier ended up with 18 copies of one
+/// ref, and a compaction removal only dropped one of them — queries then
+/// 404'd on the deleted object. Fold must collapse duplicates by path and a
+/// removal must drop every copy.
+#[test_log::test(test)]
+fn test_duplicate_refs_collapse_and_removal_drops_all_copies() {
+    let path = "main-writer-0/dbs/3/1/2025-12-20/11-00/0000017361.parquet";
+    let file = ParquetFile {
+        id: ParquetFileId::from(7),
+        path: path.to_owned(),
+        size_bytes: 50_000,
+        row_count: 10,
+        chunk_time: 10,
+        min_time: 10,
+        max_time: 200,
+    };
+    let same_file_other_id = ParquetFile {
+        id: ParquetFileId::from(99),
+        ..file.clone()
+    };
+
+    // Checkpoint carries the file twice (restart amplification), the WAL
+    // manifest re-adds it under a different id.
+    let checkpoint = build_snapshot(vec![file.clone(), file.clone()], 1, 1, 1);
+    let wal = build_snapshot(vec![same_file_other_id], 2, 2, 2);
+    let persisted_file =
+        PersistedFiles::new_from_persisted_snapshots(None, Arc::new(vec![checkpoint, wal]));
+
+    let files = persisted_file.get_files(DbId::from(0), TableId::from(0));
+    assert_eq!(1, files.len());
+
+    let mut removal = build_snapshot(vec![], 3, 3, 3);
+    let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
+    removed
+        .entry(DbId::from(0))
+        .or_default()
+        .tables
+        .entry(TableId::from(0))
+        .or_default()
+        .push(file.clone());
+    removal.removed_files = removed;
+    persisted_file.add_persisted_snapshot_files(removal);
+
+    assert!(
+        persisted_file
+            .get_files(DbId::from(0), TableId::from(0))
+            .is_empty()
+    );
+    let (file_count, _, _) = persisted_file.get_metrics();
+    assert_eq!(0, file_count);
 }
 
 /// `ParquetFileId`s are process-local counters, so files persisted by
