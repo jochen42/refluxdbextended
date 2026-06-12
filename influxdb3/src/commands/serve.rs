@@ -27,6 +27,7 @@ use influxdb3_processing_engine::plugins::ProcessingEngineEnvironmentManager;
 use influxdb3_processing_engine::virtualenv::find_python;
 use influxdb3_query_executor::{CreateQueryExecutorArgs, QueryExecutorImpl};
 use influxdb3_server::http::HttpApi;
+use influxdb3_server::startup_probe::StartupProbe;
 use influxdb3_server::{
     CommonServerState, CreateServerArgs, Server, serve, serve_admin_token_recovery_endpoint,
 };
@@ -1035,6 +1036,24 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         (Some(_), Some(_)) | (None, None) => {}
     }
 
+    // Bind the API address and answer health probes right away. The
+    // startup work below (catalog load, WAL replay) can take minutes
+    // against an object store; with the port closed that whole time,
+    // orchestrator health checks (load balancers, MIG autohealing, docker
+    // healthchecks) declare the node dead and kill it mid-replay — and
+    // the replacement starts over with an even larger WAL backlog. The
+    // probe returns 200 on the health/ping paths and 503 + Retry-After
+    // everywhere else until the real server takes the listener over.
+    let startup_probe = StartupProbe::spawn(
+        TcpListener::bind(*config.http_bind_address)
+            .await
+            .map_err(Error::BindAddress)?,
+        config.cert_file.as_ref(),
+        config.key_file.as_ref(),
+        (&config.tls_minimum_version).into(),
+    )
+    .map_err(Error::Server)?;
+
     let startup_timer = Instant::now();
     let num_cpus = num_cpus::get();
     let build_malloc_conf = build_malloc_conf();
@@ -1370,16 +1389,41 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             ),
             Arc::clone(&object_store),
         ));
-        let acquired = writer_lease
-            .try_acquire(time_provider.now().timestamp_millis())
-            .await
-            .map_err(|e| Error::WriteBufferInit(anyhow::anyhow!(
-                "failed to acquire writer lease: {e}"
-            )))?;
-        if !acquired {
-            return Err(Error::WriteBufferInit(anyhow::anyhow!(
-                "writer lease already held by another process; refusing to start"
-            )));
+        // A hard-killed predecessor (OOM, autohealing) never releases its
+        // lease; the file only ages out over one TTL. Exiting immediately
+        // would just crash-loop under a process supervisor until the TTL
+        // passes, so wait it out here instead. A *live* holder keeps
+        // refreshing, so its lease never expires and the deadline still
+        // refuses a genuine duplicate writer.
+        let deadline = Instant::now() + writer_lease_ttl + Duration::from_secs(5);
+        loop {
+            match writer_lease
+                .try_acquire(time_provider.now().timestamp_millis())
+                .await
+            {
+                Ok(true) => break,
+                Ok(false) => {
+                    if Instant::now() >= deadline {
+                        return Err(Error::WriteBufferInit(anyhow::anyhow!(
+                            "writer lease still held by a live process after waiting \
+                             one TTL ({writer_lease_ttl:?}); refusing to start"
+                        )));
+                    }
+                    info!(
+                        ttl = ?writer_lease_ttl,
+                        "writer lease held by a previous process; waiting for it to expire"
+                    );
+                }
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        return Err(Error::WriteBufferInit(anyhow::anyhow!(
+                            "failed to acquire writer lease: {e}"
+                        )));
+                    }
+                    warn!(error = %e, "error acquiring writer lease; retrying");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
         influxdb3_write::leases::run(
             writer_lease,
@@ -1695,9 +1739,9 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         processing_engine: None,
     }));
 
-    let listener = TcpListener::bind(*config.http_bind_address)
-        .await
-        .map_err(Error::BindAddress)?;
+    // Take the listener back from the startup probe — same socket, so the
+    // port (including an OS-assigned `:0`) never changes across handover.
+    let listener = startup_probe.into_listener().await.map_err(Error::Server)?;
 
     // Only create recovery listener if explicitly enabled
     let admin_token_recovery_listener = if let Some(addr) = config.admin_token_recovery_bind_address

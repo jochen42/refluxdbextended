@@ -14,6 +14,7 @@ clippy::future_not_send
 pub mod all_paths;
 mod grpc;
 pub mod http;
+pub mod startup_probe;
 mod unified_service;
 
 use crate::grpc::make_flight_server;
