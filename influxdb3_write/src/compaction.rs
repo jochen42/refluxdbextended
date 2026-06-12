@@ -1092,11 +1092,19 @@ fn batches_time_range_and_rows(
         if time_array.is_empty() {
             continue;
         }
-        // ReorgPlanner emits sorted time order, so first/last suffice.
-        let first = time_array.value(0);
-        let last = time_array.value(time_array.len() - 1);
-        min_time = min_time.min(first.min(last));
-        max_time = max_time.max(first.max(last));
+        // The compaction plan sorts by the table sort key, which is
+        // `[tag columns…, time]` (time LAST). So `time` is only monotonic
+        // *within* a series, not across the batch — first/last rows belong to
+        // different series and under-report the true span. A too-narrow
+        // min/max makes the query-side overlap test skip this file, dropping
+        // data from any window that misses the reported range. Scan the whole
+        // column for the real min/max.
+        if let Some(batch_min) = arrow::compute::kernels::aggregate::min(time_array) {
+            min_time = min_time.min(batch_min);
+        }
+        if let Some(batch_max) = arrow::compute::kernels::aggregate::max(time_array) {
+            max_time = max_time.max(batch_max);
+        }
         total_rows += batch.num_rows() as u64;
     }
 
@@ -1216,6 +1224,31 @@ mod tests {
         assert_eq!(config.interval, Duration::from_secs(3600));
         assert_eq!(config.max_files_per_run, 100);
         assert_eq!(config.min_files_for_compaction, 10);
+    }
+
+    #[test]
+    fn batches_time_range_scans_all_rows_not_just_endpoints() {
+        use arrow::array::TimestampNanosecondArray;
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+
+        // Compaction output is sorted by [tags, time], so `time` is NOT
+        // globally monotonic. Simulate two series concatenated: series A spans
+        // [30, 100], series B spans [0, 45]. First row = 30, last row = 45 —
+        // neither is the true min (0) or max (100). The old first/last shortcut
+        // would report [30, 45] and lose data on queries outside that window.
+        let times = TimestampNanosecondArray::from(vec![30, 60, 100, 0, 20, 45]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(times)]).unwrap();
+
+        let (min_time, max_time, rows) = batches_time_range_and_rows(&[batch]).unwrap();
+        assert_eq!(min_time, 0, "min must be the global min, not the first row");
+        assert_eq!(max_time, 100, "max must be the global max, not the last row");
+        assert_eq!(rows, 6);
     }
 
     #[test]
