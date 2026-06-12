@@ -764,6 +764,7 @@ mod update_all_from_object_store {
             snapshot_sequence_number: seq,
             files: files.into_iter().map(|arc| (*arc).clone()).collect(),
             removed_files: HashSet::new(),
+            removed_file_paths: HashSet::new(),
             metadata: IndexMetadata {
                 parquet_size_bytes: 1000,
                 row_count: 100,
@@ -1358,6 +1359,7 @@ mod split_and_update_indices {
             snapshot_sequence_number: seq,
             files,
             removed_files: HashSet::new(),
+            removed_file_paths: HashSet::new(),
             metadata: IndexMetadata {
                 parquet_size_bytes: 1000,
                 row_count: 100,
@@ -2845,6 +2847,7 @@ mod purge {
             snapshot_sequence_number: seq,
             files,
             removed_files: HashSet::new(),
+            removed_file_paths: HashSet::new(),
             metadata: crate::table_index::IndexMetadata::empty(),
         };
 

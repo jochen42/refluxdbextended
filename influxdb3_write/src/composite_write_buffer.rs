@@ -8,10 +8,15 @@
 //!
 //! Chunk-order policy (highest wins, IOx ReorgPlanner dedupes by primary
 //! key + time):
-//! - Persisted (Layer A): chunk's own `ChunkOrder` derived from gen+chunk_time
+//! - Persisted (Layer A): provenance-banded order from
+//!   `chunk::persisted_chunk_order` (generation band + WAL sequence)
 //! - WAL tail (Layer C): `i64::MAX - 2`
 //! - Remote hot (Layer B): `i64::MAX - 1`
 //! - Local hot (writer / all): `i64::MAX`
+//!
+//! All sources share the per-table partition id from
+//! `chunk::table_partition_id`, so overlapping rows dedupe across sources
+//! and across writers.
 
 use std::sync::Arc;
 
@@ -146,6 +151,14 @@ impl ChunkContainer for CompositeWriteBuffer {
 
         let mut remote_count = 0;
         let mut remote_reachable = false;
+        // Which writers' WAL tails still need to be consulted. `None` means
+        // "all of them" (no remote layer, or every writer unreachable);
+        // `Some(excluded)` lists writers whose hot rows Layer B already
+        // delivered. With legacy unmapped configs (`--writer-urls` without
+        // node ids) any Layer B success skips the tail entirely, preserving
+        // the old all-or-nothing semantics.
+        let mut tail_excluded: Option<std::collections::HashSet<String>> = None;
+        let mut skip_tail = false;
         if let Some(remote) = &self.remote {
             // Block the current task on the remote fetch. `block_in_place`
             // ensures we don't starve the runtime; the surrounding
@@ -163,14 +176,21 @@ impl ChunkContainer for CompositeWriteBuffer {
                         .await
                 })
             });
-            if let Some(batches) = result {
+            if let Some(fetch) = result {
                 remote_reachable = true;
-                if !batches.is_empty() {
+                if fetch.fully_mapped {
+                    tail_excluded = Some(fetch.reachable_node_ids);
+                } else {
+                    skip_tail = true;
+                }
+                if !fetch.batches.is_empty() {
                     let influx_schema = table_def.influx_schema().clone();
                     let remote_chunks = batches_to_buffer_chunks(
-                        batches,
+                        fetch.batches,
                         influx_schema,
                         CHUNK_ORDER_REMOTE_HOT,
+                        db_schema.id,
+                        table_def.table_id,
                     );
                     remote_count = remote_chunks.len();
                     chunks.extend(remote_chunks);
@@ -178,18 +198,21 @@ impl ChunkContainer for CompositeWriteBuffer {
             }
         }
 
-        // Layer C (WAL tail) is the fallback for writer-unreachable scenarios.
-        // When Layer B succeeded the writer is authoritative for "what's
-        // fresh", so re-reading the WAL prefix is wasted work — both
-        // expensive (one BufferState per WAL file) and redundant. Skip it.
+        // Layer C (WAL tail) is the fallback for writer-unreachable
+        // scenarios. A writer that answered Layer B is authoritative for
+        // its own fresh rows, so re-reading that writer's WAL prefix is
+        // wasted work — but with several writers, the ones that did NOT
+        // answer must still be served from their tails or their fresh
+        // rows silently vanish from results.
         let mut tail_count = 0;
         if let Some(tail) = &self.tail {
-            if !remote_reachable {
+            if !skip_tail {
                 let tail_chunks = tail.get_table_chunks(
                     Arc::clone(&db_schema),
                     Arc::clone(&table_def),
                     filter,
                     CHUNK_ORDER_WAL_TAIL,
+                    tail_excluded.as_ref(),
                 )?;
                 tail_count = tail_chunks.len();
                 chunks.extend(tail_chunks);

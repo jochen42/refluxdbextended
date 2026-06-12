@@ -2,11 +2,15 @@
 #
 # Topology (matches the multi-node modes documented in the top-level README):
 #
-#   minio  ──┬── writer    (--mode writer, ingest only)
+#   minio  ──┬── writer-1  (--mode writer --multi-writer, ingest only)
+#            ├── writer-2  (--mode writer --multi-writer, ingest only)
 #            ├── compactor (--mode compactor, gated by `compactor` profile)
-#            └── querier   (--mode querier, read-only)
+#            ├── querier-1 (--mode querier, read-only)
+#            └── querier-2 (--mode querier, read-only)
 #
-# All three influxdb3 services share the same S3 bucket on the local MinIO.
+# The generator sprays batches round-robin across both writers; the bench
+# alternates query runs across both queriers. All services share the same
+# S3 bucket on the local MinIO.
 #
 # `gen` and `bench` are one-shot helper containers driven by the orchestrator
 # script (`run-bench.sh`). They are only started explicitly via `docker compose
@@ -73,9 +77,9 @@ services:
         mc mb --ignore-existing "local/${BUCKET:-influxdb3-bench}"
         echo "bucket ready"
 
-  writer:
+  writer-1:
     <<: *influxdb3-common
-    environment:
+    environment: &writer-env
       INFLUXDB3_BUCKET: ${BUCKET:-influxdb3-bench}
       INFLUXDB3_HTTP_BIND_ADDR: 0.0.0.0:8181
       AWS_ACCESS_KEY_ID: minioadmin
@@ -97,20 +101,36 @@ services:
       - serve
       - --object-store=s3
       - --mode=writer
+      - --multi-writer
       - --node-id=writer-1
       - --gen1-duration=${GEN1:-1m}
       - --without-auth
     ports:
       - "${WRITER_PORT:-8181}:8181"
-    healthcheck:
+    healthcheck: &influxdb3-healthcheck
       test: ["CMD", "curl", "-fsS", "http://localhost:8181/health"]
       interval: 2s
       timeout: 2s
       retries: 60
 
-  querier:
+  writer-2:
     <<: *influxdb3-common
-    environment:
+    environment: *writer-env
+    command:
+      - serve
+      - --object-store=s3
+      - --mode=writer
+      - --multi-writer
+      - --node-id=writer-2
+      - --gen1-duration=${GEN1:-1m}
+      - --without-auth
+    ports:
+      - "${WRITER2_PORT:-8182}:8181"
+    healthcheck: *influxdb3-healthcheck
+
+  querier-1:
+    <<: *influxdb3-common
+    environment: &querier-env
       INFLUXDB3_BUCKET: ${BUCKET:-influxdb3-bench}
       INFLUXDB3_HTTP_BIND_ADDR: 0.0.0.0:8181
       AWS_ACCESS_KEY_ID: minioadmin
@@ -122,13 +142,19 @@ services:
       INFLUXDB3_ENABLE_COMPACTION: "false"
       # Layer A: shared-inventory poll cadence
       INFLUXDB3_INVENTORY_POLL_INTERVAL: ${INVENTORY_POLL_INTERVAL:-1s}
-      # Layer B: writer URL(s) for live hot-chunk fetches. Comma-separated.
-      INFLUXDB3_WRITER_URLS: ${WRITER_URLS:-http://writer:8181}
+      # Layers B+C: node-id=url pairs tie each hot-chunks endpoint to its
+      # WAL prefix so the tail covers exactly the writers that don't answer.
+      INFLUXDB3_WRITERS: ${WRITERS:-writer-1=http://writer-1:8181,writer-2=http://writer-2:8181}
       INFLUXDB3_REMOTE_HOT_TIMEOUT: ${REMOTE_HOT_TIMEOUT:-250ms}
-      # Layer C: WAL-tail prefixes (node ids, not hosts).
-      INFLUXDB3_WRITER_NODE_IDS: ${WRITER_NODE_IDS:-writer-1}
       INFLUXDB3_WAL_TAIL_POLL_INTERVAL: ${WAL_TAIL_POLL_INTERVAL:-1s}
       INFLUXDB3_WAL_TAIL_MAX_FILES: ${WAL_TAIL_MAX_FILES:-4}
+      # Both flags default to 20% of TOTAL memory, which they interpret
+      # against the docker VM, not a per-container share. Two queriers
+      # concurrently scanning a few hundred thousand uncompacted gen1
+      # files OOM-kill the VM's weakest container. Hard caps keep the
+      # whole stack inside the VM.
+      INFLUXDB3_EXEC_MEM_POOL_BYTES: ${QUERIER_EXEC_MEM_MB:-2048}
+      INFLUXDB3_PARQUET_MEM_CACHE_SIZE: ${QUERIER_PARQUET_CACHE_MB:-1024}
     command:
       - serve
       - --object-store=s3
@@ -140,18 +166,36 @@ services:
       # fewer files so the limit doesn't matter there.
       - --query-file-limit=${QUERY_FILE_LIMIT:-100000}
       - --without-auth
-    depends_on:
+    depends_on: &querier-deps
       minio-setup:
         condition: service_completed_successfully
-      writer:
+      writer-1:
         condition: service_healthy
+      writer-2:
+        condition: service_healthy
+    # cgroup ceiling: a runaway query OOM-kills THIS container (exit 137,
+    # inspectable) instead of letting VM-level memory pressure destroy an
+    # arbitrary victim with no trace.
+    mem_limit: ${QUERIER_MEM_LIMIT:-3500m}
     ports:
       - "${QUERIER_PORT:-8281}:8181"
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8181/health"]
-      interval: 2s
-      timeout: 2s
-      retries: 60
+    healthcheck: *influxdb3-healthcheck
+
+  querier-2:
+    <<: *influxdb3-common
+    environment: *querier-env
+    command:
+      - serve
+      - --object-store=s3
+      - --mode=querier
+      - --node-id=querier-2
+      - --query-file-limit=${QUERY_FILE_LIMIT:-100000}
+      - --without-auth
+    depends_on: *querier-deps
+    mem_limit: ${QUERIER_MEM_LIMIT:-3500m}
+    ports:
+      - "${QUERIER2_PORT:-8282}:8181"
+    healthcheck: *influxdb3-healthcheck
 
   # Started only when `--profile compactor` is passed, so the harness can run
   # the uncompacted baseline first.
@@ -189,25 +233,29 @@ services:
 
   # One-shot generator. Driven via `docker compose run --rm gen ...`.
   gen:
-    image: python:3.12-alpine
+    image: python:3.12-slim
     profiles: ["tools"]
     depends_on:
-      writer:
+      writer-1:
+        condition: service_healthy
+      writer-2:
         condition: service_healthy
     volumes:
       - ./generate.py:/work/generate.py:ro
     working_dir: /work
     environment:
-      WRITER_URL: http://writer:8181
+      WRITER_URLS: http://writer-1:8181,http://writer-2:8181
       DB: ${DB:-bench}
     entrypoint: ["python", "/work/generate.py"]
 
   # One-shot benchmark. Driven via `docker compose run --rm bench ...`.
   bench:
-    image: python:3.12-alpine
+    image: python:3.12-slim
     profiles: ["tools"]
     depends_on:
-      querier:
+      querier-1:
+        condition: service_healthy
+      querier-2:
         condition: service_healthy
     volumes:
       - ./benchmark.py:/work/benchmark.py:ro
@@ -215,7 +263,7 @@ services:
       - ./results:/work/results
     working_dir: /work
     environment:
-      QUERIER_URL: http://querier:8181
+      QUERIER_URLS: http://querier-1:8181,http://querier-2:8181
       DB: ${DB:-bench}
       RUNS_PER_QUERY: ${RUNS_PER_QUERY:-5}
     entrypoint: ["python", "/work/benchmark.py"]

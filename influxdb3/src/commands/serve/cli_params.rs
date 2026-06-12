@@ -22,6 +22,7 @@ const SENSITIVE_PARAMS: &[&str] = &[
     "without-auth",
     // Multi-node: internal writer endpoints (same treatment as aws-endpoint)
     "writer-urls",
+    "writers",
 ];
 
 /// List of all known non-sensitive CLI parameters - only used in test but declared at module level
@@ -83,6 +84,8 @@ const NON_SENSITIVE_PARAMS: &[&str] = &[
     "shared-catalog",
     "compactor-lease-ttl",
     "writer-lease-ttl",
+    "multi-writer",
+    "wal-reaper-interval",
     "inventory-poll-interval",
     "ref-validation-interval",
     "writer-node-ids",

@@ -31,9 +31,31 @@ struct RemoteMetrics {
     duration: metric::DurationHistogram,
 }
 
+/// One writer endpoint, optionally tied to its WAL node id. The node id is
+/// what lets the composite fall back to the WAL tail for exactly the
+/// writers that did not answer Layer B; without it (legacy `--writer-urls`
+/// config) the fallback stays all-or-nothing.
+#[derive(Debug, Clone)]
+pub struct RemoteWriterTarget {
+    pub node_id: Option<String>,
+    pub url: String,
+}
+
+/// Result of fanning a hot-chunks fetch out to every configured writer.
+#[derive(Debug)]
+pub struct HotChunksFetch {
+    pub batches: Vec<RecordBatch>,
+    /// Node ids of writers that answered successfully (only writers with a
+    /// known node id appear here).
+    pub reachable_node_ids: std::collections::HashSet<String>,
+    /// True when every configured writer carries a node id, i.e. the
+    /// caller can reason per-writer about who still needs the WAL tail.
+    pub fully_mapped: bool,
+}
+
 #[derive(Debug)]
 pub struct RemoteWriteBuffer {
-    writer_urls: Vec<String>,
+    writers: Vec<RemoteWriterTarget>,
     client: reqwest::Client,
     request_timeout: Duration,
     /// Tracks per-URL warning suppression so a wedged writer doesn't flood
@@ -44,13 +66,24 @@ pub struct RemoteWriteBuffer {
 }
 
 impl RemoteWriteBuffer {
+    /// Legacy constructor: URLs without node-id mapping.
     pub fn new(writer_urls: Vec<String>, request_timeout: Duration) -> Self {
+        Self::with_targets(
+            writer_urls
+                .into_iter()
+                .map(|url| RemoteWriterTarget { node_id: None, url })
+                .collect(),
+            request_timeout,
+        )
+    }
+
+    pub fn with_targets(writers: Vec<RemoteWriterTarget>, request_timeout: Duration) -> Self {
         let client = reqwest::Client::builder()
             .timeout(request_timeout)
             .build()
             .expect("reqwest client construction is infallible without TLS root setup");
         Self {
-            writer_urls,
+            writers,
             client,
             request_timeout,
             last_warn: Mutex::new(HashMap::new()),
@@ -76,33 +109,36 @@ impl RemoteWriteBuffer {
         self
     }
 
-    pub fn writer_urls(&self) -> &[String] {
-        &self.writer_urls
+    pub fn writer_targets(&self) -> &[RemoteWriterTarget] {
+        &self.writers
     }
 
     /// Fetch in-memory hot rows for (db, table) from every configured writer
     /// in the time window `[time_min_ns, time_max_ns]` (each side optional).
-    /// Returns `Some(batches)` when at least one writer responded successfully
-    /// — that signal lets the composite short-circuit Layer C, since the
-    /// authoritative writer has already reported what's fresh. Returns
-    /// `None` when every writer is unreachable, so the composite falls
-    /// through to the WAL tail.
+    /// Returns `Some(fetch)` when at least one writer responded successfully;
+    /// `fetch.reachable_node_ids` tells the composite which writers' WAL
+    /// tails are redundant. Returns `None` when every writer is unreachable,
+    /// so the composite falls through to the WAL tail for all of them.
     pub async fn fetch_hot_chunks(
         &self,
         db_id: DbId,
         table_id: TableId,
         time_min_ns: Option<i64>,
         time_max_ns: Option<i64>,
-    ) -> Option<Vec<RecordBatch>> {
-        if self.writer_urls.is_empty() {
+    ) -> Option<HotChunksFetch> {
+        if self.writers.is_empty() {
             return None;
         }
-        let mut out: Vec<RecordBatch> = Vec::new();
+        let mut fetch = HotChunksFetch {
+            batches: Vec::new(),
+            reachable_node_ids: Default::default(),
+            fully_mapped: self.writers.iter().all(|w| w.node_id.is_some()),
+        };
         let mut any_success = false;
-        for url in &self.writer_urls {
+        for writer in &self.writers {
             let start = std::time::Instant::now();
             let outcome = self
-                .fetch_from(url, db_id, table_id, time_min_ns, time_max_ns)
+                .fetch_from(&writer.url, db_id, table_id, time_min_ns, time_max_ns)
                 .await;
             if let Some(m) = &self.metrics {
                 m.duration.record(start.elapsed());
@@ -116,12 +152,15 @@ impl RemoteWriteBuffer {
             match outcome {
                 Ok(batches) => {
                     any_success = true;
-                    out.extend(batches);
+                    if let Some(node_id) = &writer.node_id {
+                        fetch.reachable_node_ids.insert(node_id.clone());
+                    }
+                    fetch.batches.extend(batches);
                 }
-                Err(e) => self.warn_once(url, &e),
+                Err(e) => self.warn_once(&writer.url, &e),
             }
         }
-        if any_success { Some(out) } else { None }
+        if any_success { Some(fetch) } else { None }
     }
 
     async fn fetch_from(
@@ -221,9 +260,11 @@ pub fn batches_to_buffer_chunks(
     batches: Vec<RecordBatch>,
     influx_schema: schema::Schema,
     chunk_order: i64,
+    db_id: DbId,
+    table_id: TableId,
 ) -> Vec<Arc<dyn iox_query::QueryChunk>> {
     use crate::chunk::BufferChunk;
-    use data_types::{ChunkId, ChunkOrder, PartitionHashId, PartitionKey};
+    use data_types::{ChunkId, ChunkOrder};
     use iox_query::chunk_statistics::{NoColumnRanges, create_chunk_statistics};
 
     if batches.is_empty() {
@@ -238,10 +279,9 @@ pub fn batches_to_buffer_chunks(
         batches,
         schema: influx_schema,
         stats: Arc::new(stats),
-        partition_id: PartitionHashId::new(
-            data_types::TableId::new(0),
-            &PartitionKey::from("remote-hot".to_string()),
-        ),
+        // Same per-table partition as every other chunk source so the
+        // dedupe layer sees overlapping rows from other writers/sources.
+        partition_id: crate::chunk::table_partition_id(db_id, table_id),
         sort_key: None,
         id: ChunkId::new(),
         chunk_order: ChunkOrder::new(chunk_order),

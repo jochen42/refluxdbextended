@@ -23,7 +23,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_types::{
-    ChunkId, ChunkOrder, ColumnType, NamespaceName, NamespaceNameError, PartitionHashId,
+    ChunkId, ColumnType, NamespaceName, NamespaceNameError,
 };
 use datafusion::{
     catalog::Session, common::DataFusionError, datasource::object_store::ObjectStoreUrl,
@@ -655,13 +655,14 @@ impl WriteBufferImpl {
         // and whether these files are recent enough
         cache_parquet_files(self.parquet_cache.clone(), &parquet_files);
 
-        for (chunk_order, parquet_file) in (chunks.len() as i64..).zip(parquet_files.iter()) {
+        for parquet_file in parquet_files.iter() {
             let parquet_chunk = parquet_chunk_from_file(
                 parquet_file,
                 &table_def.schema,
                 self.persister.object_store_url().clone(),
                 self.persister.object_store(),
-                chunk_order,
+                db_schema.id,
+                table_def.table_id,
             );
 
             chunks.push(Arc::new(parquet_chunk));
@@ -719,10 +720,11 @@ pub fn parquet_chunk_from_file(
     table_schema: &Schema,
     object_store_url: ObjectStoreUrl,
     object_store: Arc<dyn ObjectStore>,
-    chunk_order: i64,
+    db_id: DbId,
+    table_id: TableId,
 ) -> ParquetChunk {
-    let partition_key = data_types::PartitionKey::from(parquet_file.chunk_time.to_string());
-    let partition_id = PartitionHashId::new(data_types::TableId::new(0), &partition_key);
+    let partition_id = crate::chunk::table_partition_id(db_id, table_id);
+    let chunk_order = crate::chunk::persisted_chunk_order(parquet_file);
 
     let chunk_stats = create_chunk_statistics(
         Some(parquet_file.row_count as usize),
@@ -751,7 +753,7 @@ pub fn parquet_chunk_from_file(
         partition_id,
         sort_key: None,
         id: ChunkId::new(),
-        chunk_order: ChunkOrder::new(chunk_order),
+        chunk_order,
         parquet_exec,
     }
 }

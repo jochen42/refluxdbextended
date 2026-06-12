@@ -40,7 +40,7 @@ use influxdb3_telemetry::{
 use influxdb3_wal::{Gen1Duration, WalConfig};
 use influxdb3_write::table_index_cache::TableIndexCache;
 use influxdb3_write::{
-    WriteBuffer, deleter,
+    DistinctCacheManager, LastCacheManager, WriteBuffer, deleter,
     persister::Persister,
     retention_period_handler::RetentionPeriodHandler,
     table_index_cache::TableIndexCacheConfig,
@@ -396,6 +396,29 @@ pub struct Config {
     )]
     pub writer_lease_ttl: humantime::Duration,
 
+    /// Allow multiple concurrent writers against this bucket. By default a
+    /// writer also holds the singleton `_locks/writer.lease`, capping the
+    /// cluster at one writer (and keeping rolling upgrades safe). With this
+    /// flag only the per-node lease `_locks/writer-{node-id}.lease` is
+    /// held — it guards the node's WAL prefix, not writer cardinality.
+    /// Queriers should then be configured with `--writers` so freshness
+    /// fallback works per writer.
+    #[clap(long = "multi-writer", env = "INFLUXDB3_MULTI_WRITER", action)]
+    pub multi_writer: bool,
+
+    /// How often the compactor scans for orphaned WAL — flushed but
+    /// unsnapshotted WAL files under a node prefix whose writer lease is
+    /// free (the writer died and never came back). Found WAL is replayed,
+    /// snapshotted, and published so its rows stay queryable. Compactor
+    /// mode only; `0s` disables.
+    #[clap(
+        long = "wal-reaper-interval",
+        env = "INFLUXDB3_WAL_REAPER_INTERVAL",
+        default_value = "1m",
+        action
+    )]
+    pub wal_reaper_interval: humantime::Duration,
+
     /// Open the catalog under the global `_catalog/` prefix so every node in
     /// a multi-node deployment sees a single source of truth for schema,
     /// retention, and tables. Requires an object store backend that supports
@@ -437,10 +460,28 @@ pub struct Config {
     )]
     pub ref_validation_interval: humantime::Duration,
 
+    /// Writers as `node-id=url` pairs, comma-separated. Configures Layer B
+    /// (hot-chunks RPC) and Layer C (WAL tail) together and ties each URL
+    /// to its WAL prefix, so when only SOME writers answer Layer B the
+    /// querier falls back to the WAL tail for exactly the others — required
+    /// for correct freshness with multiple writers. Supersedes
+    /// `--writer-urls` and `--writer-node-ids` when set. Example:
+    /// `writer-0=http://writer-0:8181,writer-1=http://writer-1:8181`.
+    #[clap(
+        long = "writers",
+        env = "INFLUXDB3_WRITERS",
+        value_delimiter = ',',
+        default_value = "",
+        action
+    )]
+    pub writers: Vec<String>,
+
     /// Writer HTTP base URLs the querier will hit for hot in-memory rows
     /// (Layer B). Comma-separated; empty disables Layer B. Required for
     /// sub-second freshness in `--mode=querier`. Wire-format:
     /// `http://writer-1:8181,http://writer-2:8181`.
+    /// Deprecated in favor of `--writers`: without the node-id mapping,
+    /// Layer C is skipped whenever ANY writer answers Layer B.
     #[clap(
         long = "writer-urls",
         env = "INFLUXDB3_WRITER_URLS",
@@ -1374,65 +1415,83 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         None
     };
 
-    // Writer lease: ensure no other process is also accepting writes against
-    // this bucket. Acquired before WAL replay so a stale predecessor can't
-    // race the WAL writer.
+    // Writer leases, acquired before WAL replay so a stale predecessor
+    // can't race the WAL writer:
+    //
+    // - the per-node lease `_locks/writer-{node_id}.lease` guards this
+    //   node's WAL prefix — two processes sharing one prefix would corrupt
+    //   each other's WAL regardless of how many writers the cluster runs
+    // - the legacy singleton `_locks/writer.lease` caps the cluster at one
+    //   writer; skipped with `--multi-writer`. Holding BOTH by default
+    //   keeps rolling upgrades safe: an old binary still on the singleton
+    //   lease blocks a new one until it actually exits.
     let writer_lease_ttl: Duration = config.writer_lease_ttl.into();
     if matches!(config.mode, NodeMode::Writer) && !writer_lease_ttl.is_zero() {
-        info!("acquiring writer lease (ttl={:?})", writer_lease_ttl);
         let owner = format!("{}-{}", node_id.as_str(), *PROCESS_UUID_STR);
-        let writer_lease = Arc::new(influxdb3_write::leases::Lease::new(
-            influxdb3_write::leases::LeaseConfig::new(
-                object_store::path::Path::from("_locks/writer.lease"),
-                owner,
-                writer_lease_ttl,
-            ),
-            Arc::clone(&object_store),
-        ));
-        // A hard-killed predecessor (OOM, autohealing) never releases its
-        // lease; the file only ages out over one TTL. Exiting immediately
-        // would just crash-loop under a process supervisor until the TTL
-        // passes, so wait it out here instead. A *live* holder keeps
-        // refreshing, so its lease never expires and the deadline still
-        // refuses a genuine duplicate writer.
-        let deadline = Instant::now() + writer_lease_ttl + Duration::from_secs(5);
-        loop {
-            match writer_lease
-                .try_acquire(time_provider.now().timestamp_millis())
-                .await
-            {
-                Ok(true) => break,
-                Ok(false) => {
-                    if Instant::now() >= deadline {
-                        return Err(Error::WriteBufferInit(anyhow::anyhow!(
-                            "writer lease still held by a live process after waiting \
-                             one TTL ({writer_lease_ttl:?}); refusing to start"
-                        )));
-                    }
-                    info!(
-                        ttl = ?writer_lease_ttl,
-                        "writer lease held by a previous process; waiting for it to expire"
-                    );
-                }
-                Err(e) => {
-                    if Instant::now() >= deadline {
-                        return Err(Error::WriteBufferInit(anyhow::anyhow!(
-                            "failed to acquire writer lease: {e}"
-                        )));
-                    }
-                    warn!(error = %e, "error acquiring writer lease; retrying");
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut lease_paths = vec![(
+            format!("_locks/writer-{}.lease", node_id.as_str()),
+            "writer",
+        )];
+        if !config.multi_writer {
+            lease_paths.push(("_locks/writer.lease".to_string(), "writer_singleton"));
         }
-        influxdb3_write::leases::run(
-            writer_lease,
-            Arc::clone(&time_provider) as _,
-            shutdown_manager.register(),
-            Some(influxdb3_write::leases::LeaseMetrics::new(
-                &metrics, "writer",
-            )),
-        );
+        for (lease_path, lease_metric_name) in lease_paths {
+            info!(path = %lease_path, "acquiring writer lease (ttl={:?})", writer_lease_ttl);
+            let writer_lease = Arc::new(influxdb3_write::leases::Lease::new(
+                influxdb3_write::leases::LeaseConfig::new(
+                    object_store::path::Path::from(lease_path.as_str()),
+                    owner.clone(),
+                    writer_lease_ttl,
+                ),
+                Arc::clone(&object_store),
+            ));
+            // A hard-killed predecessor (OOM, autohealing) never releases its
+            // lease; the file only ages out over one TTL. Exiting immediately
+            // would just crash-loop under a process supervisor until the TTL
+            // passes, so wait it out here instead. A *live* holder keeps
+            // refreshing, so its lease never expires and the deadline still
+            // refuses a genuine duplicate writer.
+            let deadline = Instant::now() + writer_lease_ttl + Duration::from_secs(5);
+            loop {
+                match writer_lease
+                    .try_acquire(time_provider.now().timestamp_millis())
+                    .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => {
+                        if Instant::now() >= deadline {
+                            return Err(Error::WriteBufferInit(anyhow::anyhow!(
+                                "writer lease {lease_path} still held by a live process \
+                                 after waiting one TTL ({writer_lease_ttl:?}); refusing to start"
+                            )));
+                        }
+                        info!(
+                            path = %lease_path,
+                            ttl = ?writer_lease_ttl,
+                            "writer lease held by a previous process; waiting for it to expire"
+                        );
+                    }
+                    Err(e) => {
+                        if Instant::now() >= deadline {
+                            return Err(Error::WriteBufferInit(anyhow::anyhow!(
+                                "failed to acquire writer lease {lease_path}: {e}"
+                            )));
+                        }
+                        warn!(error = %e, path = %lease_path, "error acquiring writer lease; retrying");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            influxdb3_write::leases::run(
+                writer_lease,
+                Arc::clone(&time_provider) as _,
+                shutdown_manager.register(),
+                Some(influxdb3_write::leases::LeaseMetrics::new(
+                    &metrics,
+                    lease_metric_name,
+                )),
+            );
+        }
     }
 
     let write_buffer_impl = WriteBufferImpl::new(WriteBufferImplArgs {
@@ -1477,16 +1536,43 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         });
     }
 
+    // `--writers` (node-id=url) supersedes the legacy `--writer-urls` /
+    // `--writer-node-ids` pair and ties Layer B endpoints to Layer C WAL
+    // prefixes for per-writer fallback.
+    let writer_targets: Vec<influxdb3_write::remote_write_buffer::RemoteWriterTarget> = config
+        .writers
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|entry| {
+            let (node_id, url) = entry.split_once('=').ok_or_else(|| {
+                Error::WriteBufferInit(anyhow::anyhow!(
+                    "invalid --writers entry {entry:?}: expected node-id=url"
+                ))
+            })?;
+            Ok(influxdb3_write::remote_write_buffer::RemoteWriterTarget {
+                node_id: Some(node_id.trim().to_string()),
+                url: url.trim().to_string(),
+            })
+        })
+        .collect::<Result<_, Error>>()?;
+
     // Construct WAL tail (Layer C) here — earlier than where the composite
     // wraps the WriteBufferImpl — so the inventory poller can notify it of
     // covered-through WAL sequences and the tail can drop redundant entries.
     let wal_tail_buffer = if matches!(config.mode, NodeMode::Querier) {
-        let writer_node_ids: Vec<String> = config
-            .writer_node_ids
-            .iter()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string())
-            .collect();
+        let writer_node_ids: Vec<String> = if writer_targets.is_empty() {
+            config
+                .writer_node_ids
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string())
+                .collect()
+        } else {
+            writer_targets
+                .iter()
+                .filter_map(|t| t.node_id.clone())
+                .collect()
+        };
         let wal_tail_interval: Duration = config.wal_tail_poll_interval.into();
         if !writer_node_ids.is_empty() && !wal_tail_interval.is_zero() {
             info!(?writer_node_ids, interval = ?wal_tail_interval,
@@ -1496,6 +1582,13 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
                 Arc::clone(&catalog),
                 writer_node_ids,
                 config.wal_tail_max_files,
+            )
+            // The querier's cache providers are otherwise never populated
+            // (local WAL notifications don't fire in read-only mode);
+            // feeding the tail gives them a view merged across all writers.
+            .with_cache_providers(
+                write_buffer_impl.last_cache_provider(),
+                write_buffer_impl.distinct_cache_provider(),
             );
             Arc::clone(&t).spawn(influxdb3_write::wal_tail::WalTailBufferArgs {
                 poll_interval: wal_tail_interval,
@@ -1656,6 +1749,30 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         let compaction_service = Arc::new(compaction_service);
         compaction_service.start();
         info!("compaction service started");
+
+        // Orphan-WAL reaper: adopts dead writers' unsnapshotted WAL so
+        // their buffered rows become queryable instead of silently lost.
+        // Runs alongside compaction — the compactor is the cluster's
+        // janitorial singleton. Only meaningful against a shared inventory.
+        let reaper_interval: Duration = config.wal_reaper_interval.into();
+        if matches!(config.mode, NodeMode::Compactor) && !reaper_interval.is_zero() {
+            if let Some(inv) = &shared_inventory {
+                influxdb3_write::wal_reaper::spawn(influxdb3_write::wal_reaper::WalReaperArgs {
+                    object_store: Arc::clone(&object_store),
+                    inventory: inv.clone(),
+                    executor: Arc::clone(&write_path_executor),
+                    time_provider: Arc::clone(&time_provider) as _,
+                    wal_config,
+                    lease_ttl: config.writer_lease_ttl.into(),
+                    interval: reaper_interval,
+                    own_node_id: node_id.as_str().to_string(),
+                    shutdown: shutdown_manager.register(),
+                    metric_registry: Arc::clone(&metrics),
+                    wal_replay_concurrency_limit: config.wal_replay_concurrency_limit,
+                    parquet_snapshot_concurrency_limit: config.parquet_snapshot_concurrency_limit,
+                });
+            }
+        }
     } else if !config.mode.runs_compaction() {
         info!(
             "compaction service disabled (mode={:?} does not run compaction)",
@@ -1684,17 +1801,25 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     // to the locally-folded inventory (Layer A). Writer / compactor / all
     // pass the WriteBufferImpl through unchanged.
     let write_buffer: Arc<dyn WriteBuffer> = if matches!(config.mode, NodeMode::Querier) {
-        let writer_urls: Vec<String> = config
-            .writer_urls
-            .iter()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string())
-            .collect();
-        let remote = (!writer_urls.is_empty()).then(|| {
-            info!(?writer_urls, "enabling layer B (remote hot chunks)");
+        let remote_targets: Vec<influxdb3_write::remote_write_buffer::RemoteWriterTarget> =
+            if writer_targets.is_empty() {
+                config
+                    .writer_urls
+                    .iter()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| influxdb3_write::remote_write_buffer::RemoteWriterTarget {
+                        node_id: None,
+                        url: s.trim().to_string(),
+                    })
+                    .collect()
+            } else {
+                writer_targets.clone()
+            };
+        let remote = (!remote_targets.is_empty()).then(|| {
+            info!(?remote_targets, "enabling layer B (remote hot chunks)");
             Arc::new(
-                influxdb3_write::remote_write_buffer::RemoteWriteBuffer::new(
-                    writer_urls,
+                influxdb3_write::remote_write_buffer::RemoteWriteBuffer::with_targets(
+                    remote_targets,
                     config.remote_hot_timeout.into(),
                 )
                 .with_metrics(&metrics),

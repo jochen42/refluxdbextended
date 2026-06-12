@@ -121,6 +121,21 @@ impl SharedInventory {
         }
     }
 
+    /// WAL file sequence number covered by the node's newest published
+    /// snapshot, or `None` when the node never published one. Cheap: the
+    /// inverted-stem naming makes the first listed entry the newest, so
+    /// this is one LIST page + one GET.
+    pub async fn latest_covered_wal_seq(&self, node_id: &str) -> Result<Option<u64>> {
+        let dir = ObjPath::from(format!("{SHARED_INVENTORY_PREFIX}/wal/{node_id}"));
+        let mut listing = self.object_store.list(Some(&dir));
+        let Some(first) = listing.next().await else {
+            return Ok(None);
+        };
+        let bytes = self.object_store.get(&first?.location).await?.bytes().await?;
+        let snapshot: PersistedSnapshot = serde_json::from_slice(&bytes)?;
+        Ok(Some(snapshot.wal_file_sequence_number.as_u64()))
+    }
+
     /// Publish a WAL-driven snapshot to the shared namespace under this
     /// node's WAL prefix. Path is derived from `snapshot.snapshot_sequence_number`
     /// so retries are idempotent.
