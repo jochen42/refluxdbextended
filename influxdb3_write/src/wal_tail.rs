@@ -88,6 +88,13 @@ pub struct WalTailBuffer {
     catalog: Arc<Catalog>,
     writer_node_ids: Vec<String>,
     max_files_per_writer: usize,
+    /// When set, tailed WAL contents are also folded into these cache
+    /// providers. On a querier this is the only population path: the
+    /// providers are otherwise fed by local WAL notifications that never
+    /// fire in read-only mode — and it yields a view MERGED across all
+    /// tailed writers, which no single writer's own cache has.
+    last_cache: Option<Arc<influxdb3_cache::last_cache::LastCacheProvider>>,
+    distinct_cache: Option<Arc<influxdb3_cache::distinct_cache::DistinctCacheProvider>>,
     state: RwLock<std::collections::HashMap<String, WriterTail>>,
     /// Per-writer high-water of WAL file sequence numbers known to be
     /// covered by persisted parquet. Tail entries `<= this` are redundant
@@ -109,9 +116,25 @@ impl WalTailBuffer {
             catalog,
             writer_node_ids,
             max_files_per_writer: max_files_per_writer.max(1),
+            last_cache: None,
+            distinct_cache: None,
             state: RwLock::new(std::collections::HashMap::new()),
             persisted_high_water: RwLock::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Also fold tailed WAL contents into the given cache providers. Call
+    /// before [`Self::spawn`]; consumes and re-wraps because the buffer is
+    /// handed out as `Arc`.
+    pub fn with_cache_providers(
+        self: Arc<Self>,
+        last_cache: Arc<influxdb3_cache::last_cache::LastCacheProvider>,
+        distinct_cache: Arc<influxdb3_cache::distinct_cache::DistinctCacheProvider>,
+    ) -> Arc<Self> {
+        let mut me = Arc::try_unwrap(self).expect("with_cache_providers called before sharing");
+        me.last_cache = Some(last_cache);
+        me.distinct_cache = Some(distinct_cache);
+        Arc::new(me)
     }
 
     /// Inventory poller calls this after folding a `PersistedSnapshot`. Tail
@@ -213,6 +236,12 @@ impl WalTailBuffer {
                         continue;
                     }
                 };
+                if let Some(lc) = &self.last_cache {
+                    lc.write_wal_contents_to_cache(&contents);
+                }
+                if let Some(dc) = &self.distinct_cache {
+                    dc.write_wal_contents_to_cache(&contents);
+                }
                 {
                     let mut guard = self.state.write();
                     let tail = guard

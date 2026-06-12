@@ -40,7 +40,7 @@ use influxdb3_telemetry::{
 use influxdb3_wal::{Gen1Duration, WalConfig};
 use influxdb3_write::table_index_cache::TableIndexCache;
 use influxdb3_write::{
-    WriteBuffer, deleter,
+    DistinctCacheManager, LastCacheManager, WriteBuffer, deleter,
     persister::Persister,
     retention_period_handler::RetentionPeriodHandler,
     table_index_cache::TableIndexCacheConfig,
@@ -1536,8 +1536,6 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         });
     }
 
-    // Construct WAL tail (Layer C) here — earlier than where the composite
-    // wraps the WriteBufferImpl — so the inventory poller can notify it of
     // `--writers` (node-id=url) supersedes the legacy `--writer-urls` /
     // `--writer-node-ids` pair and ties Layer B endpoints to Layer C WAL
     // prefixes for per-writer fallback.
@@ -1558,6 +1556,8 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         })
         .collect::<Result<_, Error>>()?;
 
+    // Construct WAL tail (Layer C) here — earlier than where the composite
+    // wraps the WriteBufferImpl — so the inventory poller can notify it of
     // covered-through WAL sequences and the tail can drop redundant entries.
     let wal_tail_buffer = if matches!(config.mode, NodeMode::Querier) {
         let writer_node_ids: Vec<String> = if writer_targets.is_empty() {
@@ -1582,6 +1582,13 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
                 Arc::clone(&catalog),
                 writer_node_ids,
                 config.wal_tail_max_files,
+            )
+            // The querier's cache providers are otherwise never populated
+            // (local WAL notifications don't fire in read-only mode);
+            // feeding the tail gives them a view merged across all writers.
+            .with_cache_providers(
+                write_buffer_impl.last_cache_provider(),
+                write_buffer_impl.distinct_cache_provider(),
             );
             Arc::clone(&t).spawn(influxdb3_write::wal_tail::WalTailBufferArgs {
                 poll_interval: wal_tail_interval,

@@ -57,11 +57,36 @@ freshness layer for sub-second visibility of recent writes.
 - Shared catalog under `_catalog/`, OCC via `PutMode::Create`
 - Shared inventory under `_inventory/` so queriers see writer and compactor
   output cluster-wide; periodic inventory checkpoints bound loader cost
-- Advisory leases at `_locks/writer.lease` and `_locks/compactor.lease`
+- Advisory leases at `_locks/writer-{node-id}.lease` (guards the node's WAL
+  prefix), `_locks/writer.lease` (singleton writer cap, see multi-writer
+  below) and `_locks/compactor.lease`
 - HTTP listener enforcement: writes return `405` on querier/compactor;
   queries return `405` on compactor
 - `influxdb3 migrate catalog --to-shared` to move a single-node catalog
   into the shared layout
+
+### Multiple writers (experimental)
+- `--multi-writer` on each writer skips the singleton `_locks/writer.lease`
+  so any number of writers ingest into the same bucket, each under its own
+  node-id prefix. Spray writes across them with any load balancer.
+- Queriers take `--writers node-id=url,...` (replaces `--writer-urls` +
+  `--writer-node-ids`): ties each hot-chunks endpoint to its WAL prefix so
+  the WAL tail covers exactly the writers that did not answer the RPC.
+- All chunk sources share one partition per table, so the query-time
+  dedupe collapses overlapping rows across writers and freshness layers.
+- The compactor runs an orphan-WAL reaper (`--wal-reaper-interval`,
+  default `1m`): a hard-killed writer's flushed-but-unsnapshotted WAL is
+  adopted under its lease, replayed, snapshotted, and published — no data
+  stranded when an instance never comes back.
+- Semantics: last-write-wins is exact per writer but approximate across
+  writers — when the same series+timestamp is overwritten through two
+  different writers concurrently, which value wins is deterministic per
+  query but not wall-clock ordered. Idempotent retries of identical lines
+  dedupe cleanly.
+- Caveat: processing-engine *schedule* (cron) triggers fire on every
+  writer; gate side-effectful scheduled plugins externally or run them on
+  a single designated writer. Per-write triggers fire once, on the writer
+  that received the line.
 
 ### Read-your-writes freshness (A/B/C layers)
 - Sub-second visibility of recent writes on the querier without waiting for
