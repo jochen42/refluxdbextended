@@ -396,6 +396,16 @@ pub struct Config {
     )]
     pub writer_lease_ttl: humantime::Duration,
 
+    /// Allow multiple concurrent writers against this bucket. By default a
+    /// writer also holds the singleton `_locks/writer.lease`, capping the
+    /// cluster at one writer (and keeping rolling upgrades safe). With this
+    /// flag only the per-node lease `_locks/writer-{node-id}.lease` is
+    /// held — it guards the node's WAL prefix, not writer cardinality.
+    /// Queriers should then be configured with `--writers` so freshness
+    /// fallback works per writer.
+    #[clap(long = "multi-writer", env = "INFLUXDB3_MULTI_WRITER", action)]
+    pub multi_writer: bool,
+
     /// Open the catalog under the global `_catalog/` prefix so every node in
     /// a multi-node deployment sees a single source of truth for schema,
     /// retention, and tables. Requires an object store backend that supports
@@ -1392,65 +1402,83 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         None
     };
 
-    // Writer lease: ensure no other process is also accepting writes against
-    // this bucket. Acquired before WAL replay so a stale predecessor can't
-    // race the WAL writer.
+    // Writer leases, acquired before WAL replay so a stale predecessor
+    // can't race the WAL writer:
+    //
+    // - the per-node lease `_locks/writer-{node_id}.lease` guards this
+    //   node's WAL prefix — two processes sharing one prefix would corrupt
+    //   each other's WAL regardless of how many writers the cluster runs
+    // - the legacy singleton `_locks/writer.lease` caps the cluster at one
+    //   writer; skipped with `--multi-writer`. Holding BOTH by default
+    //   keeps rolling upgrades safe: an old binary still on the singleton
+    //   lease blocks a new one until it actually exits.
     let writer_lease_ttl: Duration = config.writer_lease_ttl.into();
     if matches!(config.mode, NodeMode::Writer) && !writer_lease_ttl.is_zero() {
-        info!("acquiring writer lease (ttl={:?})", writer_lease_ttl);
         let owner = format!("{}-{}", node_id.as_str(), *PROCESS_UUID_STR);
-        let writer_lease = Arc::new(influxdb3_write::leases::Lease::new(
-            influxdb3_write::leases::LeaseConfig::new(
-                object_store::path::Path::from("_locks/writer.lease"),
-                owner,
-                writer_lease_ttl,
-            ),
-            Arc::clone(&object_store),
-        ));
-        // A hard-killed predecessor (OOM, autohealing) never releases its
-        // lease; the file only ages out over one TTL. Exiting immediately
-        // would just crash-loop under a process supervisor until the TTL
-        // passes, so wait it out here instead. A *live* holder keeps
-        // refreshing, so its lease never expires and the deadline still
-        // refuses a genuine duplicate writer.
-        let deadline = Instant::now() + writer_lease_ttl + Duration::from_secs(5);
-        loop {
-            match writer_lease
-                .try_acquire(time_provider.now().timestamp_millis())
-                .await
-            {
-                Ok(true) => break,
-                Ok(false) => {
-                    if Instant::now() >= deadline {
-                        return Err(Error::WriteBufferInit(anyhow::anyhow!(
-                            "writer lease still held by a live process after waiting \
-                             one TTL ({writer_lease_ttl:?}); refusing to start"
-                        )));
-                    }
-                    info!(
-                        ttl = ?writer_lease_ttl,
-                        "writer lease held by a previous process; waiting for it to expire"
-                    );
-                }
-                Err(e) => {
-                    if Instant::now() >= deadline {
-                        return Err(Error::WriteBufferInit(anyhow::anyhow!(
-                            "failed to acquire writer lease: {e}"
-                        )));
-                    }
-                    warn!(error = %e, "error acquiring writer lease; retrying");
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut lease_paths = vec![(
+            format!("_locks/writer-{}.lease", node_id.as_str()),
+            "writer",
+        )];
+        if !config.multi_writer {
+            lease_paths.push(("_locks/writer.lease".to_string(), "writer_singleton"));
         }
-        influxdb3_write::leases::run(
-            writer_lease,
-            Arc::clone(&time_provider) as _,
-            shutdown_manager.register(),
-            Some(influxdb3_write::leases::LeaseMetrics::new(
-                &metrics, "writer",
-            )),
-        );
+        for (lease_path, lease_metric_name) in lease_paths {
+            info!(path = %lease_path, "acquiring writer lease (ttl={:?})", writer_lease_ttl);
+            let writer_lease = Arc::new(influxdb3_write::leases::Lease::new(
+                influxdb3_write::leases::LeaseConfig::new(
+                    object_store::path::Path::from(lease_path.as_str()),
+                    owner.clone(),
+                    writer_lease_ttl,
+                ),
+                Arc::clone(&object_store),
+            ));
+            // A hard-killed predecessor (OOM, autohealing) never releases its
+            // lease; the file only ages out over one TTL. Exiting immediately
+            // would just crash-loop under a process supervisor until the TTL
+            // passes, so wait it out here instead. A *live* holder keeps
+            // refreshing, so its lease never expires and the deadline still
+            // refuses a genuine duplicate writer.
+            let deadline = Instant::now() + writer_lease_ttl + Duration::from_secs(5);
+            loop {
+                match writer_lease
+                    .try_acquire(time_provider.now().timestamp_millis())
+                    .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => {
+                        if Instant::now() >= deadline {
+                            return Err(Error::WriteBufferInit(anyhow::anyhow!(
+                                "writer lease {lease_path} still held by a live process \
+                                 after waiting one TTL ({writer_lease_ttl:?}); refusing to start"
+                            )));
+                        }
+                        info!(
+                            path = %lease_path,
+                            ttl = ?writer_lease_ttl,
+                            "writer lease held by a previous process; waiting for it to expire"
+                        );
+                    }
+                    Err(e) => {
+                        if Instant::now() >= deadline {
+                            return Err(Error::WriteBufferInit(anyhow::anyhow!(
+                                "failed to acquire writer lease {lease_path}: {e}"
+                            )));
+                        }
+                        warn!(error = %e, path = %lease_path, "error acquiring writer lease; retrying");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            influxdb3_write::leases::run(
+                writer_lease,
+                Arc::clone(&time_provider) as _,
+                shutdown_manager.register(),
+                Some(influxdb3_write::leases::LeaseMetrics::new(
+                    &metrics,
+                    lease_metric_name,
+                )),
+            );
+        }
     }
 
     let write_buffer_impl = WriteBufferImpl::new(WriteBufferImplArgs {

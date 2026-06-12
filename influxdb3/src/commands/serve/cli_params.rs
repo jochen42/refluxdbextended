@@ -84,6 +84,7 @@ const NON_SENSITIVE_PARAMS: &[&str] = &[
     "shared-catalog",
     "compactor-lease-ttl",
     "writer-lease-ttl",
+    "multi-writer",
     "inventory-poll-interval",
     "ref-validation-interval",
     "writer-node-ids",
