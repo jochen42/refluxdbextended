@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use data_types::{ChunkId, ChunkOrder, PartitionHashId, PartitionKey};
+use data_types::{ChunkId, ChunkOrder};
 use datafusion::common::DataFusionError;
 use influxdb3_catalog::catalog::{Catalog, DatabaseSchema, TableDefinition};
 use influxdb3_shutdown::ShutdownToken;
@@ -231,17 +231,24 @@ impl WalTailBuffer {
         Ok(applied)
     }
 
+    /// `exclude_writers`: node ids whose fresh rows were already served by
+    /// a hot-chunks RPC this query — their tail data is redundant. `None`
+    /// serves every tailed writer.
     pub fn get_table_chunks(
         &self,
         db_schema: Arc<DatabaseSchema>,
         table_def: Arc<TableDefinition>,
         filter: &ChunkFilter<'_>,
         chunk_order: i64,
+        exclude_writers: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError> {
         let influx_schema = table_def.influx_schema();
         let mut out: Vec<Arc<dyn QueryChunk>> = Vec::new();
         let guard = self.state.read();
-        for (_writer, tail) in guard.iter() {
+        for (writer, tail) in guard.iter() {
+            if exclude_writers.is_some_and(|excluded| excluded.contains(writer)) {
+                continue;
+            }
             for (_seq, state) in tail.files.iter() {
                 let Some(db_buffer) = state.db_to_table.get(&db_schema.id) else {
                     continue;
@@ -269,9 +276,9 @@ impl WalTailBuffer {
                         batches,
                         schema: influx_schema.clone(),
                         stats: Arc::new(stats),
-                        partition_id: PartitionHashId::new(
-                            data_types::TableId::new(0),
-                            &PartitionKey::from("wal-tail".to_string()),
+                        partition_id: crate::chunk::table_partition_id(
+                            db_schema.id,
+                            table_def.table_id,
                         ),
                         sort_key: None,
                         id: ChunkId::new(),

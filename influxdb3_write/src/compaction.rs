@@ -580,7 +580,9 @@ impl CompactionService {
         let total_input_size: u64 = job.files.iter().map(|f| f.size_bytes).sum();
 
         // Build chunks and run the compaction plan.
-        let chunks = self.create_chunks_from_files(&job.files, &job.schema).await?;
+        let chunks = self
+            .create_chunks_from_files(&job.files, &job.schema, job.database_id, job.table_id)
+            .await?;
         // The iox_query default `max_parquet_fanout` (40) is far below a
         // bounded job's input count, which forces a full re-sort of every
         // input. Raise it to the job size so the pre-sorted parquet path
@@ -598,7 +600,7 @@ impl CompactionService {
         let logical_plan = ReorgPlanner::new()
             .compact_plan(
                 data_types::TableId::new(0),
-                job.table_name.clone(),
+                Arc::clone(&job.table_name),
                 &job.schema,
                 chunks,
                 job.sort_key.clone(),
@@ -697,16 +699,22 @@ impl CompactionService {
         &self,
         files: &[ParquetFile],
         schema: &Schema,
+        db_id: DbId,
+        table_id: TableId,
     ) -> Result<Vec<Arc<dyn iox_query::QueryChunk>>> {
         let mut chunks = Vec::with_capacity(files.len());
 
-        for (i, file) in files.iter().enumerate() {
+        for file in files {
+            // The provenance-based chunk order lets the dedupe in the
+            // compaction plan keep the newest value when inputs (possibly
+            // from several writer prefixes) overlap on a primary key.
             let chunk = crate::write_buffer::parquet_chunk_from_file(
                 file,
                 schema,
                 self.persister.object_store_url().clone(),
                 Arc::clone(&self.object_store),
-                i as i64,
+                db_id,
+                table_id,
             );
             chunks.push(Arc::new(chunk) as Arc<dyn iox_query::QueryChunk>);
         }

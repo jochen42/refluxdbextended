@@ -437,10 +437,28 @@ pub struct Config {
     )]
     pub ref_validation_interval: humantime::Duration,
 
+    /// Writers as `node-id=url` pairs, comma-separated. Configures Layer B
+    /// (hot-chunks RPC) and Layer C (WAL tail) together and ties each URL
+    /// to its WAL prefix, so when only SOME writers answer Layer B the
+    /// querier falls back to the WAL tail for exactly the others — required
+    /// for correct freshness with multiple writers. Supersedes
+    /// `--writer-urls` and `--writer-node-ids` when set. Example:
+    /// `writer-0=http://writer-0:8181,writer-1=http://writer-1:8181`.
+    #[clap(
+        long = "writers",
+        env = "INFLUXDB3_WRITERS",
+        value_delimiter = ',',
+        default_value = "",
+        action
+    )]
+    pub writers: Vec<String>,
+
     /// Writer HTTP base URLs the querier will hit for hot in-memory rows
     /// (Layer B). Comma-separated; empty disables Layer B. Required for
     /// sub-second freshness in `--mode=querier`. Wire-format:
     /// `http://writer-1:8181,http://writer-2:8181`.
+    /// Deprecated in favor of `--writers`: without the node-id mapping,
+    /// Layer C is skipped whenever ANY writer answers Layer B.
     #[clap(
         long = "writer-urls",
         env = "INFLUXDB3_WRITER_URLS",
@@ -1479,14 +1497,41 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
 
     // Construct WAL tail (Layer C) here — earlier than where the composite
     // wraps the WriteBufferImpl — so the inventory poller can notify it of
+    // `--writers` (node-id=url) supersedes the legacy `--writer-urls` /
+    // `--writer-node-ids` pair and ties Layer B endpoints to Layer C WAL
+    // prefixes for per-writer fallback.
+    let writer_targets: Vec<influxdb3_write::remote_write_buffer::RemoteWriterTarget> = config
+        .writers
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|entry| {
+            let (node_id, url) = entry.split_once('=').ok_or_else(|| {
+                Error::WriteBufferInit(anyhow::anyhow!(
+                    "invalid --writers entry {entry:?}: expected node-id=url"
+                ))
+            })?;
+            Ok(influxdb3_write::remote_write_buffer::RemoteWriterTarget {
+                node_id: Some(node_id.trim().to_string()),
+                url: url.trim().to_string(),
+            })
+        })
+        .collect::<Result<_, Error>>()?;
+
     // covered-through WAL sequences and the tail can drop redundant entries.
     let wal_tail_buffer = if matches!(config.mode, NodeMode::Querier) {
-        let writer_node_ids: Vec<String> = config
-            .writer_node_ids
-            .iter()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string())
-            .collect();
+        let writer_node_ids: Vec<String> = if writer_targets.is_empty() {
+            config
+                .writer_node_ids
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string())
+                .collect()
+        } else {
+            writer_targets
+                .iter()
+                .filter_map(|t| t.node_id.clone())
+                .collect()
+        };
         let wal_tail_interval: Duration = config.wal_tail_poll_interval.into();
         if !writer_node_ids.is_empty() && !wal_tail_interval.is_zero() {
             info!(?writer_node_ids, interval = ?wal_tail_interval,
@@ -1684,17 +1729,25 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     // to the locally-folded inventory (Layer A). Writer / compactor / all
     // pass the WriteBufferImpl through unchanged.
     let write_buffer: Arc<dyn WriteBuffer> = if matches!(config.mode, NodeMode::Querier) {
-        let writer_urls: Vec<String> = config
-            .writer_urls
-            .iter()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string())
-            .collect();
-        let remote = (!writer_urls.is_empty()).then(|| {
-            info!(?writer_urls, "enabling layer B (remote hot chunks)");
+        let remote_targets: Vec<influxdb3_write::remote_write_buffer::RemoteWriterTarget> =
+            if writer_targets.is_empty() {
+                config
+                    .writer_urls
+                    .iter()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| influxdb3_write::remote_write_buffer::RemoteWriterTarget {
+                        node_id: None,
+                        url: s.trim().to_string(),
+                    })
+                    .collect()
+            } else {
+                writer_targets.clone()
+            };
+        let remote = (!remote_targets.is_empty()).then(|| {
+            info!(?remote_targets, "enabling layer B (remote hot chunks)");
             Arc::new(
-                influxdb3_write::remote_write_buffer::RemoteWriteBuffer::new(
-                    writer_urls,
+                influxdb3_write::remote_write_buffer::RemoteWriteBuffer::with_targets(
+                    remote_targets,
                     config.remote_hot_timeout.into(),
                 )
                 .with_metrics(&metrics),
