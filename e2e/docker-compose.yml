@@ -221,7 +221,7 @@ services:
 
   # One-shot generator. Driven via `docker compose run --rm gen ...`.
   gen:
-    image: python:3.12-alpine
+    image: python:3.12-slim
     profiles: ["tools"]
     depends_on:
       writer-1:
@@ -238,7 +238,7 @@ services:
 
   # One-shot benchmark. Driven via `docker compose run --rm bench ...`.
   bench:
-    image: python:3.12-alpine
+    image: python:3.12-slim
     profiles: ["tools"]
     depends_on:
       querier-1:
