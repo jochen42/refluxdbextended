@@ -484,13 +484,19 @@ pub struct Config {
     )]
     pub wal_tail_poll_interval: humantime::Duration,
 
-    /// Upper bound on retained WAL files per writer in the tail buffer.
-    /// Older files get evicted; their rows are already in `PersistedFiles`
-    /// by the time we drop them.
+    /// Upper bound on retained WAL files per writer in the querier's tail
+    /// buffer. This is an OOM backstop, not routine trimming: a snapshot
+    /// publication drops the files it covers immediately. For the tail to
+    /// bridge the gap with no query-visible hole, this must exceed the
+    /// writer's unpersisted window — the writer keeps the most recent
+    /// `--wal-snapshot-size` WAL periods buffered (up to 3x that before
+    /// force-snapshot) times `--wal-flush-interval`. With the defaults
+    /// (snapshot-size 600, flush 1s) the writer can hold up to ~1800
+    /// unpersisted files, so keep this comfortably above that.
     #[clap(
         long = "wal-tail-max-files",
         env = "INFLUXDB3_WAL_TAIL_MAX_FILES",
-        default_value = "64",
+        default_value = "2000",
         action
     )]
     pub wal_tail_max_files: usize,

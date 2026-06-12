@@ -4,12 +4,21 @@
 //! readable seconds after ingest — bridging the gap between in-flight writes
 //! and the next snapshot/inventory cycle.
 //!
-//! v0 eviction model: bounded by `max_files` per writer. We don't coordinate
-//! with the inventory poller to drop files at the precise covered-through
-//! sequence; instead we keep the most recent N WAL files per writer. Once
-//! older files are evicted, the same rows are already in `PersistedFiles`
-//! (because they only exit the WAL tail's window after enough flush cycles
-//! to have been snapshotted + published). ReorgPlanner dedupes any overlap.
+//! Eviction model: the inventory poller calls `evict_up_to` the instant a
+//! snapshot publishes, dropping every tail file that snapshot covers. That is
+//! the routine trimming path, and it only ever drops files already proven
+//! redundant with `PersistedFiles`. The per-writer `max_files` cap is a
+//! secondary OOM backstop — NOT the routine mechanism.
+//!
+//! The subtle, load-bearing consequence: because `evict_up_to` has already
+//! removed everything persisted, every file the `max_files` cap could drop is
+//! still UN-persisted. So the cap must stay larger than the writer's
+//! unpersisted window or it punches a query-visible hole — rows that have left
+//! the tail but whose parquet has not been published yet. The writer keeps the
+//! most recent `--wal-snapshot-size` WAL periods buffered (up to 3x that before
+//! force-snapshot), so the cap must comfortably exceed `--wal-snapshot-size`.
+//! `add_file` warns loudly if the cap ever evicts an un-persisted file rather
+//! than lose data silently. ReorgPlanner dedupes any tail/persisted overlap.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -55,12 +64,19 @@ impl WriterTail {
         }
     }
 
+    /// Add a replayed WAL file, evicting the oldest once the per-writer cap is
+    /// exceeded. The cap is an OOM backstop; `evict_up_to` does the routine,
+    /// correctness-safe trimming. Any file still present here is therefore not
+    /// yet known to be in `PersistedFiles`, so a cap eviction whose victim sits
+    /// above `high_water` risks a query-visible hole and is warned about — it
+    /// means the cap is smaller than the writer's unpersisted window.
     fn add_file(
         &mut self,
         seq: WalFileSequenceNumber,
         ops: &[influxdb3_wal::WalOp],
         catalog: Arc<Catalog>,
         max_files: usize,
+        high_water: u64,
     ) {
         let mut state = BufferState::new(catalog);
         state.buffer_write_ops(ops);
@@ -69,6 +85,18 @@ impl WriterTail {
             let Some((&oldest, _)) = self.files.iter().next() else {
                 break;
             };
+            if oldest.as_u64() > high_water {
+                warn!(
+                    evicted_seq = oldest.as_u64(),
+                    persisted_high_water = high_water,
+                    max_files,
+                    "wal tail cap evicting an un-persisted WAL file: its rows are \
+                     not yet in PersistedFiles, so recent queries will miss them \
+                     until the writer's snapshot publishes. Raise \
+                     --wal-tail-max-files above the writer's unpersisted window \
+                     (comfortably over --wal-snapshot-size)."
+                );
+            }
             self.files.remove(&oldest);
         }
     }
@@ -223,6 +251,7 @@ impl WalTailBuffer {
                         &contents.ops,
                         Arc::clone(&self.catalog),
                         self.max_files_per_writer,
+                        high_water,
                     );
                 }
                 applied += 1;
@@ -302,6 +331,32 @@ mod tests {
         let p = ObjPath::from("writer-1/wal/00000000042.wal");
         let s = parse_wal_seq(&p).unwrap();
         assert_eq!(s.as_u64(), 42);
+    }
+
+    #[tokio::test]
+    async fn cap_evicts_oldest_keeping_most_recent() {
+        // Regression for the WAL-tail vs snapshot-window hole: the cap is an
+        // OOM backstop that drops the OLDEST files. With a cap below the
+        // writer's unpersisted window, the dropped files are still
+        // un-persisted (seq > high_water) — exactly the silent data-loss case
+        // add_file now warns about. Here we lock the eviction semantics: only
+        // the most recent `max_files` survive.
+        let catalog = Arc::new(Catalog::new_in_memory("t").await.unwrap());
+        let mut tail = WriterTail::new();
+        // high_water = 0 → every file is un-persisted, so each eviction is the
+        // hole-punching case.
+        for seq in 1..=3u64 {
+            tail.add_file(
+                WalFileSequenceNumber::new(seq),
+                &[],
+                Arc::clone(&catalog),
+                2,
+                0,
+            );
+        }
+        let kept: Vec<u64> = tail.files.keys().map(|k| k.as_u64()).collect();
+        assert_eq!(kept, vec![2, 3], "cap must keep the most recent files");
+        assert_eq!(tail.cursor().as_u64(), 3);
     }
 
     #[tokio::test]
