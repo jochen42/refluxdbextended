@@ -33,7 +33,7 @@ cd "$(dirname "$0")"
 # settle window. Without enough WAL periods, the snapshot tracker won't
 # emit a parquet at all (it needs >= snapshot_size + snapshot_size/2 periods).
 : "${BATCH_SIZE:=1000}"
-: "${PARALLEL:=1}"
+: "${PARALLEL:=2}"
 : "${RUNS_PER_QUERY:=5}"
 : "${COMPACTION_SETTLE_MAX_SEC:=180}"
 : "${COMPACTION_SETTLE_POLL_SEC:=10}"
@@ -52,7 +52,7 @@ cleanup() {
     # — they live in the daemon and disappear with --remove-orphans.
     log "capturing container logs"
     mkdir -p results/logs
-    for svc in minio writer querier compactor; do
+    for svc in minio writer-1 writer-2 querier-1 querier-2 compactor; do
         compose logs --no-color --timestamps "${svc}" \
             >"results/logs/${svc}.log" 2>/dev/null || true
     done
@@ -62,8 +62,8 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Phase 0: warm baseline ----------------------------------------------------
-log "phase 0: starting writer + querier (no compactor)"
-compose up -d --wait minio writer querier
+log "phase 0: starting 2 writers + 2 queriers (no compactor)"
+compose up -d --wait minio writer-1 writer-2 querier-1 querier-2
 
 # --- Phase 1: ingest -----------------------------------------------------------
 log "phase 1: generating data (hours=${HOURS} hosts=${HOSTS} \

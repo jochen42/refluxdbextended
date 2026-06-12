@@ -16,6 +16,7 @@ single positional flag set. Run from inside the compose `gen` service:
 """
 
 import argparse
+import itertools
 import math
 import os
 import random
@@ -26,10 +27,20 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-WRITER_URL = os.environ.get("WRITER_URL", "http://writer:8181")
+# Comma-separated list sprays batches round-robin across writers
+# (multi-writer mode). Single URL keeps legacy behavior.
+WRITER_URLS = [
+    u.strip()
+    for u in os.environ.get(
+        "WRITER_URLS", os.environ.get("WRITER_URL", "http://writer:8181")
+    ).split(",")
+    if u.strip()
+]
 DB = os.environ.get("DB", "bench")
 
 REGIONS = ["us-east", "us-west", "eu-central", "ap-south"]
+
+_writer_rr = itertools.count()
 
 
 def write_lp(payload: bytes) -> None:
@@ -38,9 +49,13 @@ def write_lp(payload: bytes) -> None:
     # write itself does succeed on the next attempt.
     attempts = 8
     backoff = 0.5
+    # Pin the batch to one writer across retries: a retry after an
+    # ambiguous failure then overwrites the same primary keys on the same
+    # node instead of duplicating them onto a peer.
+    writer_url = WRITER_URLS[next(_writer_rr) % len(WRITER_URLS)]
     for i in range(attempts):
         req = urllib.request.Request(
-            f"{WRITER_URL}/api/v2/write?bucket={DB}&precision=ns",
+            f"{writer_url}/api/v2/write?bucket={DB}&precision=ns",
             data=payload,
             method="POST",
         )

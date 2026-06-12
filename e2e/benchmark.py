@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import glob
+import itertools
 import json
 import os
 import statistics
@@ -19,15 +20,26 @@ import time
 import urllib.parse
 import urllib.request
 
-QUERIER_URL = os.environ.get("QUERIER_URL", "http://querier:8181")
+# Comma-separated list alternates query runs round-robin across queriers
+# (multi-querier mode). Single URL keeps legacy behavior.
+QUERIER_URLS = [
+    u.strip()
+    for u in os.environ.get(
+        "QUERIER_URLS", os.environ.get("QUERIER_URL", "http://querier:8181")
+    ).split(",")
+    if u.strip()
+]
 DB = os.environ.get("DB", "bench")
 RUNS_PER_QUERY = int(os.environ.get("RUNS_PER_QUERY", "5"))
+
+_querier_rr = itertools.count()
 
 
 def run_query(sql: str) -> tuple[float, int]:
     """Returns (elapsed_seconds, response_bytes)."""
     params = urllib.parse.urlencode({"db": DB, "q": sql, "format": "csv"})
-    url = f"{QUERIER_URL}/api/v3/query_sql?{params}"
+    querier_url = QUERIER_URLS[next(_querier_rr) % len(QUERIER_URLS)]
+    url = f"{querier_url}/api/v3/query_sql?{params}"
     req = urllib.request.Request(url, method="GET")
     t0 = time.monotonic()
     with urllib.request.urlopen(req, timeout=600) as resp:
