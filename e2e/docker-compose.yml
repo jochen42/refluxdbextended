@@ -173,6 +173,10 @@ services:
         condition: service_healthy
       writer-2:
         condition: service_healthy
+    # cgroup ceiling: a runaway query OOM-kills THIS container (exit 137,
+    # inspectable) instead of letting VM-level memory pressure destroy an
+    # arbitrary victim with no trace.
+    mem_limit: ${QUERIER_MEM_LIMIT:-3500m}
     ports:
       - "${QUERIER_PORT:-8281}:8181"
     healthcheck: *influxdb3-healthcheck
@@ -188,6 +192,7 @@ services:
       - --query-file-limit=${QUERY_FILE_LIMIT:-100000}
       - --without-auth
     depends_on: *querier-deps
+    mem_limit: ${QUERIER_MEM_LIMIT:-3500m}
     ports:
       - "${QUERIER2_PORT:-8282}:8181"
     healthcheck: *influxdb3-healthcheck
