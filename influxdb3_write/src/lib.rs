@@ -585,14 +585,19 @@ impl PersistedSnapshotCheckpoint {
 
     /// Remove a file from the checkpoint and adjust metrics.
     /// Returns true if the file was found and removed.
-    pub fn remove_file(&mut self, db_id: DbId, table_id: TableId, file_id: ParquetFileId) -> bool {
+    ///
+    /// Matches by object-store path, not [`ParquetFileId`]: file ids are
+    /// process-local counters, so a removal announced by one process (e.g.
+    /// the compactor) carries an id that means nothing in another process'
+    /// checkpoint. The path is the only cross-process identity.
+    pub fn remove_file(&mut self, db_id: DbId, table_id: TableId, path: &str) -> bool {
         let Some(db_tables) = self.databases.get_mut(&db_id) else {
             return false;
         };
         let Some(table_files) = db_tables.tables.get_mut(&table_id) else {
             return false;
         };
-        let Some(pos) = table_files.iter().position(|f| f.id == file_id) else {
+        let Some(pos) = table_files.iter().position(|f| f.path == path) else {
             return false;
         };
 
@@ -675,7 +680,9 @@ impl PersistedSnapshotCheckpoint {
                 };
 
                 for file in files_to_remove {
-                    if let Some(idx) = self_table_files.iter().position(|f| f.id == file.id) {
+                    // Path-based: ids are process-local and collide across
+                    // writer/compactor processes (see remove_file).
+                    if let Some(idx) = self_table_files.iter().position(|f| f.path == file.path) {
                         let removed = self_table_files.remove(idx);
                         self.parquet_size_bytes =
                             self.parquet_size_bytes.saturating_sub(removed.size_bytes);

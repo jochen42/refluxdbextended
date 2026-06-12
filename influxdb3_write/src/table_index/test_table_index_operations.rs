@@ -145,6 +145,7 @@ impl TableIndexSnapshotBuilder {
             snapshot_sequence_number: self.sequence,
             files,
             removed_files,
+            removed_file_paths: HashSet::new(),
             metadata,
         }
     }

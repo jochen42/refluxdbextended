@@ -95,10 +95,34 @@ pub struct TableIndexSnapshot {
     pub snapshot_sequence_number: SnapshotSequenceNumber,
 
     pub files: HashSet<ParquetFile>,
+    /// Legacy removal markers keyed by process-local file id. Only reliable
+    /// when producer and consumer are the same process; kept so indexes
+    /// written by older binaries still apply their removals.
+    #[serde(default)]
     pub removed_files: HashSet<ParquetFileId>,
+    /// Removal markers keyed by object-store path — the only file identity
+    /// that holds across processes (writer vs compactor allocate ids
+    /// independently). Written alongside `removed_files` so older binaries
+    /// can still read new snapshots.
+    #[serde(default)]
+    pub removed_file_paths: HashSet<String>,
 
     #[serde(flatten)]
     pub metadata: IndexMetadata,
+}
+
+/// Removal markers collected from table index snapshots: legacy ids from old
+/// producers plus cross-process-safe paths from current ones.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RemovedFileSet {
+    pub ids: HashSet<ParquetFileId>,
+    pub paths: HashSet<String>,
+}
+
+impl RemovedFileSet {
+    fn contains(&self, file: &ParquetFile) -> bool {
+        self.paths.contains(&file.path) || self.ids.contains(&file.id)
+    }
 }
 
 impl From<PersistedSnapshotVersion> for Vec<TableIndexSnapshot> {
@@ -123,6 +147,7 @@ impl From<PersistedSnapshot> for Vec<TableIndexSnapshot> {
                 snapshot_sequence_number,
                 files: Default::default(),
                 removed_files: Default::default(),
+                removed_file_paths: Default::default(),
                 metadata: IndexMetadata::empty(),
             }
         };
@@ -136,6 +161,7 @@ impl From<PersistedSnapshot> for Vec<TableIndexSnapshot> {
                     tis.metadata.parquet_size_bytes -= file.size_bytes as i64;
                     tis.metadata.row_count -= file.row_count as i64;
                     tis.removed_files.insert(file.id);
+                    tis.removed_file_paths.insert(file.path.clone());
                 }
             }
         }
@@ -511,10 +537,10 @@ impl CoreTableIndex {
         Ok(())
     }
 
-    pub(crate) fn prune_removed(&mut self, removed: &HashSet<ParquetFileId>) {
+    pub(crate) fn prune_removed(&mut self, removed: &RemovedFileSet) {
         let mut new_metadata = IndexMetadata::empty();
         self.files.retain(|item| {
-            if removed.contains(&item.id) {
+            if removed.contains(item.as_ref()) {
                 false
             } else {
                 new_metadata.merge_from_parquet_file(item.as_ref());
@@ -527,8 +553,8 @@ impl CoreTableIndex {
     pub(crate) fn from_snapshots(
         id: &TableIndexId,
         snapshots: Vec<TableIndexSnapshot>,
-    ) -> Result<(Self, HashSet<ParquetFileId>)> {
-        let mut removed: HashSet<ParquetFileId> = HashSet::new();
+    ) -> Result<(Self, RemovedFileSet)> {
+        let mut removed = RemovedFileSet::default();
         let mut latest_snapshot_seq = SnapshotSequenceNumber::new(0);
 
         for snapshot in &snapshots {
@@ -539,14 +565,17 @@ impl CoreTableIndex {
                     actual: snapshot.id.clone(),
                 });
             }
-            removed.extend(&snapshot.removed_files);
+            removed.ids.extend(&snapshot.removed_files);
+            removed
+                .paths
+                .extend(snapshot.removed_file_paths.iter().cloned());
             latest_snapshot_seq = latest_snapshot_seq.max(snapshot.snapshot_sequence_number);
         }
 
         let mut metadata = IndexMetadata::empty();
         let files = snapshots
             .into_iter()
-            .flat_map(|s| s.files.into_iter().filter(|f| !removed.contains(&f.id)))
+            .flat_map(|s| s.files.into_iter().filter(|f| !removed.contains(f)))
             .map(|file| {
                 metadata.merge_from_parquet_file(&file);
                 Arc::new(file)

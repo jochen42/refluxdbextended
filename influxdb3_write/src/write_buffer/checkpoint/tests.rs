@@ -4,10 +4,14 @@ use influxdb3_catalog::catalog::CatalogSequenceNumber;
 use influxdb3_id::ParquetFileId;
 use influxdb3_wal::{SnapshotSequenceNumber, WalFileSequenceNumber};
 
+fn test_path(id: ParquetFileId) -> String {
+    format!("test/{id:?}.parquet")
+}
+
 fn create_test_file(id: ParquetFileId, size_bytes: u64, row_count: u64) -> ParquetFile {
     ParquetFile {
         id,
-        path: format!("test/{:?}.parquet", id),
+        path: test_path(id),
         size_bytes,
         row_count,
         chunk_time: 0,
@@ -64,7 +68,7 @@ fn test_add_snapshot_files_to_checkpoint() {
     assert_eq!(checkpoint.parquet_size_bytes, 1024);
     assert_eq!(checkpoint.row_count, 100);
     assert!(checkpoint.databases.contains_key(&db_id));
-    assert!(file_index.contains_key(&file_id));
+    assert!(file_index.contains_key(&test_path(file_id)));
 }
 
 #[test]
@@ -104,8 +108,8 @@ fn test_add_files_to_existing_checkpoint() {
     assert_eq!(files.len(), 2);
 
     // File index should have both files
-    assert!(file_index.contains_key(&file_id1));
-    assert!(file_index.contains_key(&file_id2));
+    assert!(file_index.contains_key(&test_path(file_id1)));
+    assert!(file_index.contains_key(&test_path(file_id2)));
 }
 
 #[test]
@@ -131,7 +135,7 @@ fn test_process_removed_files_removes_from_checkpoint() {
 
     // Verify file was added
     assert_eq!(checkpoint.parquet_size_bytes, 1024);
-    assert!(file_index.contains_key(&file_id));
+    assert!(file_index.contains_key(&test_path(file_id)));
 
     // Second: process a removal for that file
     let mut removed_files = SerdeVecMap::new();
@@ -147,7 +151,69 @@ fn test_process_removed_files_removes_from_checkpoint() {
     assert_eq!(checkpoint.parquet_size_bytes, 0);
     assert_eq!(checkpoint.row_count, 0);
     assert!(checkpoint.pending_removed_files.is_empty());
-    assert!(!file_index.contains_key(&file_id));
+    assert!(!file_index.contains_key(&test_path(file_id)));
+}
+
+#[test]
+fn test_removal_matches_by_path_not_process_local_id() {
+    let db_id = DbId::new(1);
+    let table_id = TableId::new(1);
+
+    // A file as persisted by one process.
+    let kept = ParquetFile {
+        id: ParquetFileId::from(7),
+        path: "writer-1/dbs/1/1/file.parquet".to_string(),
+        size_bytes: 1024,
+        row_count: 100,
+        chunk_time: 0,
+        min_time: 100,
+        max_time: 200,
+    };
+    let mut databases = SerdeVecMap::new();
+    let mut db_tables = DatabaseTables::default();
+    db_tables.tables.insert(table_id, vec![kept.clone()]);
+    databases.insert(db_id, db_tables);
+
+    let year_month = YearMonth::new_unchecked(2025, 1);
+    let mut checkpoint = PersistedSnapshotCheckpoint::new("test-node".to_string(), year_month);
+    let mut file_index = HashMap::new();
+    add_snapshot_files(&mut checkpoint, &mut file_index, databases);
+
+    // A removal from ANOTHER process whose local counter happened to assign
+    // the same id to a different file. Must NOT remove `kept`.
+    let imposter = ParquetFile {
+        id: ParquetFileId::from(7),
+        path: "writer-2/dbs/1/1/other.parquet".to_string(),
+        size_bytes: 512,
+        row_count: 50,
+        chunk_time: 0,
+        min_time: 100,
+        max_time: 200,
+    };
+    let mut removed_files = SerdeVecMap::new();
+    let mut rm_db_tables = DatabaseTables::default();
+    rm_db_tables.tables.insert(table_id, vec![imposter]);
+    removed_files.insert(db_id, rm_db_tables);
+    process_removed_files(&mut checkpoint, &mut file_index, removed_files);
+
+    assert_eq!(checkpoint.parquet_size_bytes, 1024, "kept file must survive");
+    assert!(file_index.contains_key(&kept.path));
+    // The unmatched removal lands in pending instead.
+    assert!(!checkpoint.pending_removed_files.is_empty());
+
+    // A removal with a DIFFERENT id but the matching path must remove it.
+    let same_path_other_id = ParquetFile {
+        id: ParquetFileId::from(9999),
+        ..kept.clone()
+    };
+    let mut removed_files = SerdeVecMap::new();
+    let mut rm_db_tables = DatabaseTables::default();
+    rm_db_tables.tables.insert(table_id, vec![same_path_other_id]);
+    removed_files.insert(db_id, rm_db_tables);
+    process_removed_files(&mut checkpoint, &mut file_index, removed_files);
+
+    assert_eq!(checkpoint.parquet_size_bytes, 0);
+    assert!(!file_index.contains_key(&kept.path));
 }
 
 #[test]

@@ -1110,12 +1110,30 @@ fn chunk_time_for_duration(min_time: i64, target_duration: Duration) -> i64 {
 /// Split an eligible generation's files into per-job input batches of at
 /// most `max_files` each, oldest first, so a large backlog becomes several
 /// bounded jobs instead of one DataFusion plan over thousands of files.
+///
+/// Files sharing a `chunk_time` are never split across jobs: with multiple
+/// writers, files from different node prefixes can cover the same window
+/// and overlap in time — splitting them would leave duplicate rows in the
+/// outputs until a later pass merges them. A job may therefore exceed
+/// `max_files` when a single window alone does.
 fn chunk_files_for_jobs(mut files: Vec<ParquetFile>, max_files: usize) -> Vec<Vec<ParquetFile>> {
-    files.sort_by_key(|f| f.min_time);
-    files
-        .chunks(max_files.max(1))
-        .map(<[ParquetFile]>::to_vec)
-        .collect()
+    let max_files = max_files.max(1);
+    files.sort_by_key(|f| (f.chunk_time, f.min_time));
+    let mut jobs: Vec<Vec<ParquetFile>> = Vec::new();
+    let mut current: Vec<ParquetFile> = Vec::new();
+    for file in files {
+        let same_window = current
+            .last()
+            .is_some_and(|last| last.chunk_time == file.chunk_time);
+        if current.len() >= max_files && !same_window {
+            jobs.push(std::mem::take(&mut current));
+        }
+        current.push(file);
+    }
+    if !current.is_empty() {
+        jobs.push(current);
+    }
+    jobs
 }
 
 #[cfg(test)]
@@ -1154,6 +1172,33 @@ mod tests {
         let one = chunk_files_for_jobs(vec![file(1, 0)], 0);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].len(), 1);
+    }
+
+    #[test]
+    fn chunk_files_for_jobs_keeps_shared_chunk_time_in_one_job() {
+        let file = |id: u64, chunk_time: i64| ParquetFile {
+            id: crate::ParquetFileId::from(id),
+            path: format!("writer-{}/gen1/{id}.parquet", id % 2),
+            size_bytes: 1,
+            row_count: 1,
+            chunk_time,
+            min_time: chunk_time,
+            max_time: chunk_time + 1,
+        };
+        // Three windows with 4 files each (e.g. two writers, two files each).
+        // max_files=5 lands mid-window; the window must not be split.
+        let files: Vec<ParquetFile> = (0..12u64).map(|i| file(i, (i as i64 / 4) * 60)).collect();
+
+        let chunks = chunk_files_for_jobs(files, 5);
+
+        for job in &chunks {
+            let windows: std::collections::HashSet<i64> =
+                job.iter().map(|f| f.chunk_time).collect();
+            for w in windows {
+                let in_job = job.iter().filter(|f| f.chunk_time == w).count();
+                assert_eq!(in_job, 4, "window {w} split across jobs: {chunks:?}");
+            }
+        }
     }
 
     #[test]

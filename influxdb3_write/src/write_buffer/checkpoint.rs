@@ -6,21 +6,25 @@
 use std::collections::HashMap;
 
 use chrono::{Datelike, TimeZone, Utc};
-use influxdb3_id::{DbId, ParquetFileId, SerdeVecMap, TableId};
+use influxdb3_id::{DbId, SerdeVecMap, TableId};
 
 use crate::{DatabaseTables, PersistedSnapshot, PersistedSnapshotCheckpoint, YearMonth};
 
-/// Index mapping file IDs to their database and table location.
+/// Index mapping object-store paths to their database and table location.
 /// Used for efficient file lookup during checkpoint updates.
-pub type FileIndex = HashMap<ParquetFileId, (DbId, TableId)>;
+///
+/// Keyed by path, not `ParquetFileId`: ids are process-local counters and
+/// collide across writer/compactor processes; the path is the only identity
+/// that holds across the cluster.
+pub type FileIndex = HashMap<String, (DbId, TableId)>;
 
-/// Build an index of file IDs to their (db_id, table_id) location.
+/// Build an index of file paths to their (db_id, table_id) location.
 pub fn build_file_index(databases: &SerdeVecMap<DbId, DatabaseTables>) -> FileIndex {
     let mut index = HashMap::new();
     for (db_id, db_tables) in databases {
         for (table_id, files) in &db_tables.tables {
             for file in files {
-                index.insert(file.id, (*db_id, *table_id));
+                index.insert(file.path.clone(), (*db_id, *table_id));
             }
         }
     }
@@ -36,7 +40,7 @@ pub fn add_snapshot_files(
     for (db_id, db_tables) in databases {
         for (table_id, files) in db_tables.tables {
             for file in files {
-                file_index.insert(file.id, (db_id, table_id));
+                file_index.insert(file.path.clone(), (db_id, table_id));
                 checkpoint.add_file(db_id, table_id, file);
             }
         }
@@ -56,8 +60,8 @@ pub fn process_removed_files(
     for (db_id, db_tables) in removed_files {
         for (table_id, files) in db_tables.tables {
             for file in files {
-                if let Some((existing_db, existing_table)) = file_index.remove(&file.id) {
-                    checkpoint.remove_file(existing_db, existing_table, file.id);
+                if let Some((existing_db, existing_table)) = file_index.remove(&file.path) {
+                    checkpoint.remove_file(existing_db, existing_table, &file.path);
                     any_removed = true;
                 } else {
                     checkpoint.add_pending_removed(db_id, table_id, file);
