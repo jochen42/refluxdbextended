@@ -148,6 +148,13 @@ services:
       INFLUXDB3_REMOTE_HOT_TIMEOUT: ${REMOTE_HOT_TIMEOUT:-250ms}
       INFLUXDB3_WAL_TAIL_POLL_INTERVAL: ${WAL_TAIL_POLL_INTERVAL:-1s}
       INFLUXDB3_WAL_TAIL_MAX_FILES: ${WAL_TAIL_MAX_FILES:-4}
+      # Both flags default to 20% of TOTAL memory, which they interpret
+      # against the docker VM, not a per-container share. Two queriers
+      # concurrently scanning a few hundred thousand uncompacted gen1
+      # files OOM-kill the VM's weakest container. Hard caps keep the
+      # whole stack inside the VM.
+      INFLUXDB3_EXEC_MEM_POOL_BYTES: ${QUERIER_EXEC_MEM_MB:-2048}
+      INFLUXDB3_PARQUET_MEM_CACHE_SIZE: ${QUERIER_PARQUET_CACHE_MB:-1024}
     command:
       - serve
       - --object-store=s3
