@@ -1,0 +1,66 @@
+{
+  "tag": "uncompacted",
+  "runs_per_query": 5,
+  "results": {
+    "full_scan": {
+      "sql": "-- Full-range aggregation across every host and every point. Forces a scan of\n-- every parquet file the querier knows about. Most-uncompacted-friendly:\n-- many small gen1 files = many small reads.\nSELECT region, AVG(temp) AS avg_temp, MAX(humidity) AS max_humid, COUNT(*) AS n\nFROM sensors\nGROUP BY region",
+      "times_s": [
+        6.848874377988977,
+        7.150980586011428,
+        6.211536836010055,
+        6.083335502000409,
+        5.977406712001539
+      ],
+      "min_s": 5.977406712001539,
+      "median_s": 6.211536836010055,
+      "max_s": 7.150980586011428,
+      "mean_s": 6.454426802802482,
+      "response_bytes": 184
+    },
+    "high_card_filter": {
+      "sql": "-- High-cardinality predicate: per-host extremes across a 4-week window.\n-- Benchmarks the per-file pruning path. Compaction should improve this\n-- materially when many gen1 files cover overlapping host sets.\nSELECT host, MAX(pressure) AS max_p, MIN(pressure) AS min_p\nFROM sensors\nWHERE time > now() - INTERVAL '4 weeks'\nGROUP BY host\nORDER BY max_p DESC\nLIMIT 50",
+      "times_s": [
+        7.615648003004026,
+        7.08520087900979,
+        7.740741754008923,
+        6.883219878000091,
+        6.621611544993357
+      ],
+      "min_s": 6.621611544993357,
+      "median_s": 7.08520087900979,
+      "max_s": 7.740741754008923,
+      "mean_s": 7.1892844118032375,
+      "response_bytes": 1382
+    },
+    "hour_buckets": {
+      "sql": "-- 6-hour downsampling over an 8-week window. Touches most parquet files\n-- since timestamps span the entire generated range; aggregation work is\n-- dominated by group-by and merge across many files. 6h bins keep result\n-- cardinality manageable while still exercising the full date range.\nSELECT\n    DATE_BIN(INTERVAL '6 hours', time) AS bucket,\n    region,\n    AVG(temp) AS avg_temp,\n    APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity\nFROM sensors\nWHERE time > now() - INTERVAL '8 weeks'\nGROUP BY bucket, region\nORDER BY bucket, region",
+      "times_s": [
+        7.5017371290014125,
+        7.052634419989772,
+        6.963132545002736,
+        7.129682211991167,
+        6.715152961012791
+      ],
+      "min_s": 6.715152961012791,
+      "median_s": 7.052634419989772,
+      "max_s": 7.5017371290014125,
+      "mean_s": 7.0724678533995755,
+      "response_bytes": 814
+    },
+    "narrow_window": {
+      "sql": "-- 1-week recent window \u2014 exercises the gen1-heavy tail. Most recent data\n-- still sits in many small gen1 files; compaction should already be\n-- promoting older portions of this window to gen2/3.\nSELECT region, AVG(temp), COUNT(*)\nFROM sensors\nWHERE time > now() - INTERVAL '1 week'\nGROUP BY region",
+      "times_s": [
+        7.281550002997392,
+        7.273453920992324,
+        6.62840004399186,
+        6.650430502995732,
+        6.71077383600641
+      ],
+      "min_s": 6.62840004399186,
+      "median_s": 6.71077383600641,
+      "max_s": 7.281550002997392,
+      "mean_s": 6.908921661396744,
+      "response_bytes": 170
+    }
+  }
+}
