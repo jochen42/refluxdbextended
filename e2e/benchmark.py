@@ -40,15 +40,34 @@ def run_query(sql: str) -> tuple[float, int]:
     params = urllib.parse.urlencode({"db": DB, "q": sql, "format": "csv"})
     querier_url = QUERIER_URLS[next(_querier_rr) % len(QUERIER_URLS)]
     url = f"{querier_url}/api/v3/query_sql?{params}"
-    req = urllib.request.Request(url, method="GET")
-    t0 = time.monotonic()
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        body = resp.read()
-        if resp.status >= 300:
-            raise RuntimeError(
-                f"query failed: HTTP {resp.status}: {body.decode()[:500]}"
+    # Retry transient connection-level failures (compose DNS hiccups under
+    # heavy IO, connection resets). Only network errors retry — an HTTP
+    # error status is a real result and must fail the run. Timing starts
+    # fresh per attempt so retries don't pollute the measurement.
+    attempts = 5
+    backoff = 1.0
+    for i in range(attempts):
+        req = urllib.request.Request(url, method="GET")
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                body = resp.read()
+                if resp.status >= 300:
+                    raise RuntimeError(
+                        f"query failed: HTTP {resp.status}: {body.decode()[:500]}"
+                    )
+            return (time.monotonic() - t0, len(body))
+        except (urllib.error.URLError, ConnectionResetError, TimeoutError, OSError) as e:
+            if isinstance(e, urllib.error.HTTPError) or i == attempts - 1:
+                raise
+            print(
+                f"    [retry {i + 1}/{attempts}] {type(e).__name__}: {e}, "
+                f"backing off {backoff:.1f}s",
+                flush=True,
             )
-    return (time.monotonic() - t0, len(body))
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
+    raise RuntimeError("unreachable")
 
 
 def warm_up(sql: str) -> None:
