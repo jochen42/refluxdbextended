@@ -33,6 +33,42 @@ pub struct RefValidatorArgs {
     pub persisted_files: Arc<PersistedFiles>,
     pub interval: Duration,
     pub shutdown: ShutdownToken,
+    pub metric_registry: Arc<metric::Registry>,
+}
+
+#[derive(Debug)]
+struct RefValidatorMetrics {
+    refs: metric::Metric<metric::U64Counter>,
+    duration: metric::DurationHistogram,
+}
+
+impl RefValidatorMetrics {
+    fn new(registry: &metric::Registry) -> Self {
+        let refs = registry.register_metric::<metric::U64Counter>(
+            "influxdb3_ref_validation_refs",
+            "parquet refs checked/evicted/skipped by validation passes",
+        );
+        let duration = registry
+            .register_metric::<metric::DurationHistogram>(
+                "influxdb3_ref_validation_duration",
+                "wall-clock duration of parquet ref validation passes",
+            )
+            .recorder(&[]);
+        Self { refs, duration }
+    }
+
+    fn record_pass(&self, summary: ValidationSummary, elapsed: Duration) {
+        for (result, count) in [
+            ("checked", summary.checked),
+            ("evicted", summary.evicted),
+            ("skipped", summary.skipped),
+        ] {
+            if count > 0 {
+                self.refs.recorder(&[("result", result)]).inc(count as u64);
+            }
+        }
+        self.duration.record(elapsed);
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -55,14 +91,17 @@ async fn run(args: RefValidatorArgs) {
         persisted_files,
         interval,
         shutdown,
+        metric_registry,
     } = args;
 
+    let metrics = RefValidatorMetrics::new(&metric_registry);
     let cancel = shutdown.clone_cancellation_token();
 
     // Boot-time validation, then periodic.
     loop {
         let start = std::time::Instant::now();
         let summary = validate_once(&object_store, &persisted_files).await;
+        metrics.record_pass(summary, start.elapsed());
         if summary.evicted > 0 || summary.skipped > 0 {
             info!(
                 checked = summary.checked,
@@ -241,6 +280,33 @@ mod tests {
         assert_eq!(summary.checked, 3);
         assert_eq!(summary.evicted, 1);
         assert_eq!(persisted.get_files(db, table).len(), 2);
+    }
+
+    #[test]
+    fn record_pass_counts_by_result() {
+        use metric::{Attributes, Metric, U64Counter};
+        let registry = metric::Registry::default();
+        let metrics = RefValidatorMetrics::new(&registry);
+        metrics.record_pass(
+            ValidationSummary {
+                checked: 5,
+                evicted: 2,
+                skipped: 1,
+            },
+            Duration::from_millis(10),
+        );
+
+        let refs = registry
+            .get_instrument::<Metric<U64Counter>>("influxdb3_ref_validation_refs")
+            .unwrap();
+        for (result, expected) in [("checked", 5), ("evicted", 2), ("skipped", 1)] {
+            assert_eq!(
+                expected,
+                refs.get_observer(&Attributes::from(&[("result", result)]))
+                    .unwrap()
+                    .fetch()
+            );
+        }
     }
 
     #[tokio::test]

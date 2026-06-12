@@ -40,6 +40,7 @@ use crate::write_buffer::queryable_buffer::BufferState;
 pub struct WalTailBufferArgs {
     pub poll_interval: Duration,
     pub shutdown: ShutdownToken,
+    pub metric_registry: Arc<metric::Registry>,
 }
 
 #[derive(Debug)]
@@ -143,6 +144,10 @@ impl WalTailBuffer {
     pub fn spawn(self: Arc<Self>, args: WalTailBufferArgs) -> JoinHandle<()> {
         let poll_interval = args.poll_interval;
         let shutdown = args.shutdown;
+        let files_metric = args.metric_registry.register_metric::<metric::U64Counter>(
+            "influxdb3_wal_tail_files",
+            "peer WAL files folded into the tail buffer, and tick errors",
+        );
         let me = Arc::clone(&self);
         tokio::spawn(async move {
             let cancel = shutdown.clone_cancellation_token();
@@ -154,8 +159,15 @@ impl WalTailBuffer {
                     }
                     _ = tokio::time::sleep(poll_interval) => {}
                 }
-                if let Err(e) = me.tick().await {
-                    warn!("wal tail tick failed: {}", e);
+                match me.tick().await {
+                    Ok(n) if n > 0 => {
+                        files_metric.recorder(&[("result", "ok")]).inc(n as u64);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        files_metric.recorder(&[("result", "error")]).inc(1);
+                        warn!("wal tail tick failed: {}", e);
+                    }
                 }
             }
         })

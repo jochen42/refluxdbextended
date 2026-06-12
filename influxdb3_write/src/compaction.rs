@@ -90,6 +90,85 @@ pub struct CompactionResult {
     pub total_rows_compacted: u64,
 }
 
+/// Prometheus metrics for the compaction service. All attributes are
+/// bounded (`result`, `direction`, `kind`) — no per-db/per-table labels.
+#[derive(Debug)]
+struct CompactionMetrics {
+    cycles: metric::Metric<metric::U64Counter>,
+    cycle_duration: metric::DurationHistogram,
+    jobs: metric::Metric<metric::U64Counter>,
+    job_duration: metric::DurationHistogram,
+    bytes: metric::Metric<metric::U64Counter>,
+    files: metric::Metric<metric::U64Counter>,
+    rows: metric::U64Counter,
+    claims: metric::Metric<metric::U64Counter>,
+    checkpoint_writes: metric::Metric<metric::U64Counter>,
+    input_deletes: metric::Metric<metric::U64Counter>,
+}
+
+impl CompactionMetrics {
+    fn new(registry: &metric::Registry) -> Self {
+        Self {
+            cycles: registry.register_metric::<metric::U64Counter>(
+                "influxdb3_compaction_cycles",
+                "compaction cycles by result",
+            ),
+            cycle_duration: registry
+                .register_metric::<metric::DurationHistogram>(
+                    "influxdb3_compaction_cycle_duration",
+                    "wall-clock duration of compaction cycles",
+                )
+                .recorder(&[]),
+            jobs: registry.register_metric::<metric::U64Counter>(
+                "influxdb3_compaction_jobs",
+                "compaction jobs by result",
+            ),
+            job_duration: registry
+                .register_metric::<metric::DurationHistogram>(
+                    "influxdb3_compaction_job_duration",
+                    "wall-clock duration of individual compaction jobs",
+                )
+                .recorder(&[]),
+            bytes: registry.register_metric::<metric::U64Counter>(
+                "influxdb3_compaction_bytes",
+                "bytes read from inputs and written to outputs by compaction jobs",
+            ),
+            files: registry.register_metric::<metric::U64Counter>(
+                "influxdb3_compaction_files",
+                "parquet files consumed and produced by compaction jobs",
+            ),
+            rows: registry
+                .register_metric::<metric::U64Counter>(
+                    "influxdb3_compaction_rows",
+                    "rows written to compacted output files",
+                )
+                .recorder(&[]),
+            claims: registry.register_metric::<metric::U64Counter>(
+                "influxdb3_compaction_claims",
+                "per-table compaction claim attempts by result",
+            ),
+            checkpoint_writes: registry.register_metric::<metric::U64Counter>(
+                "influxdb3_compaction_checkpoint_writes",
+                "inventory checkpoint writes by result",
+            ),
+            input_deletes: registry.register_metric::<metric::U64Counter>(
+                "influxdb3_compaction_input_deletes",
+                "post-grace deletions of compaction input objects by result",
+            ),
+        }
+    }
+
+    fn record_jobs(&self, result: &'static str, count: u64) {
+        if count > 0 {
+            self.jobs.recorder(&[("result", result)]).inc(count);
+        }
+    }
+
+    fn record_claim(&self, result: &'static str) {
+        self.claims.recorder(&[("result", result)]).inc(1);
+    }
+}
+
 #[derive(Debug)]
 pub struct CompactionService {
     config: CompactionConfig,
@@ -110,9 +189,11 @@ pub struct CompactionService {
     cycle_count: std::sync::atomic::AtomicU64,
     time_provider: Arc<dyn iox_time::TimeProvider>,
     shutdown_token: influxdb3_shutdown::ShutdownToken,
+    metrics: CompactionMetrics,
 }
 
 impl CompactionService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: CompactionConfig,
         catalog: Arc<Catalog>,
@@ -122,6 +203,7 @@ impl CompactionService {
         object_store: Arc<dyn ObjectStore>,
         time_provider: Arc<dyn iox_time::TimeProvider>,
         shutdown_token: influxdb3_shutdown::ShutdownToken,
+        metric_registry: Arc<metric::Registry>,
     ) -> Self {
         Self {
             config,
@@ -135,6 +217,7 @@ impl CompactionService {
             cycle_count: std::sync::atomic::AtomicU64::new(0),
             time_provider,
             shutdown_token,
+            metrics: CompactionMetrics::new(&metric_registry),
         }
     }
 
@@ -178,8 +261,15 @@ impl CompactionService {
                                 continue;
                             }
                         }
-                        if let Err(e) = Arc::clone(&self).run_compaction_cycle().await {
-                            error!("Compaction cycle failed: {}", e);
+                        let start = std::time::Instant::now();
+                        let outcome = Arc::clone(&self).run_compaction_cycle().await;
+                        self.metrics.cycle_duration.record(start.elapsed());
+                        match outcome {
+                            Ok(()) => self.metrics.cycles.recorder(&[("result", "ok")]).inc(1),
+                            Err(e) => {
+                                self.metrics.cycles.recorder(&[("result", "error")]).inc(1);
+                                error!("Compaction cycle failed: {}", e);
+                            }
                         }
                     }
                     _ = self.shutdown_token.wait_for_shutdown() => {
@@ -253,8 +343,19 @@ impl CompactionService {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
             if cycle % u64::from(n) == 0 {
-                if let Err(e) = self.write_inventory_checkpoint().await {
-                    warn!(%e, "failed to write inventory checkpoint");
+                match self.write_inventory_checkpoint().await {
+                    Ok(()) => self
+                        .metrics
+                        .checkpoint_writes
+                        .recorder(&[("result", "ok")])
+                        .inc(1),
+                    Err(e) => {
+                        self.metrics
+                            .checkpoint_writes
+                            .recorder(&[("result", "error")])
+                            .inc(1);
+                        warn!(%e, "failed to write inventory checkpoint");
+                    }
                 }
             }
         }
@@ -393,6 +494,9 @@ impl CompactionService {
         match self.acquire_claim(&claim_path).await {
             Ok(true) => {}
             Ok(false) => {
+                self.metrics.record_claim("held");
+                self.metrics
+                    .record_jobs("skipped_claim_held", jobs.len() as u64);
                 debug!(
                     "compaction claim {} held by another worker; skipping {} jobs",
                     claim_path,
@@ -401,6 +505,8 @@ impl CompactionService {
                 return 0;
             }
             Err(e) => {
+                self.metrics.record_claim("error");
+                self.metrics.record_jobs("failed", jobs.len() as u64);
                 error!(
                     "Compaction claim acquisition failed for {}: {:#}",
                     claim_path, e
@@ -419,11 +525,17 @@ impl CompactionService {
         let mut completed = 0;
         for job in jobs {
             match self.execute_compaction_job(job).await {
-                Ok(_) => completed += 1,
+                Ok(_) => {
+                    completed += 1;
+                    self.metrics.record_jobs("completed", 1);
+                }
                 // `{:#}` prints the full anyhow context chain; the top
                 // context alone ("failed to execute compaction") hides
                 // the root cause.
-                Err(e) => error!("Compaction job failed: {:#}", e),
+                Err(e) => {
+                    self.metrics.record_jobs("failed", 1);
+                    error!("Compaction job failed: {:#}", e);
+                }
             }
         }
         completed
@@ -518,6 +630,7 @@ impl CompactionService {
                     "Compaction produced no rows for {}/{}; skipping publish",
                     job.database_name, job.table_name
                 );
+                self.metrics.job_duration.record(start_time.elapsed());
                 return Ok(CompactionResult {
                     compacted_files: vec![],
                     deleted_files: vec![],
@@ -543,6 +656,24 @@ impl CompactionService {
         };
 
         let duration = start_time.elapsed();
+        self.metrics.job_duration.record(duration);
+        self.metrics
+            .bytes
+            .recorder(&[("direction", "input")])
+            .inc(total_input_size);
+        self.metrics
+            .bytes
+            .recorder(&[("direction", "output")])
+            .inc(total_output_size);
+        self.metrics
+            .files
+            .recorder(&[("kind", "input")])
+            .inc(result.deleted_files.len() as u64);
+        self.metrics
+            .files
+            .recorder(&[("kind", "output")])
+            .inc(result.compacted_files.len() as u64);
+        self.metrics.rows.inc(total_output_rows);
         info!(
             "Compaction completed: {} files -> {} files, {} rows, {} bytes -> {} bytes ({}% reduction) in {:?}",
             result.deleted_files.len(),
@@ -708,15 +839,23 @@ impl CompactionService {
         for file in old_files {
             let path = ObjPath::from(file.path.clone());
             let object_store = Arc::clone(&self.object_store);
+            let deletes = self.metrics.input_deletes.clone();
             tokio::spawn(async move {
                 if !grace.is_zero() {
                     tokio::time::sleep(grace).await;
                 }
                 let mut retry = 0u32;
+                let mut deleted = false;
                 while retry <= 5 {
                     match object_store.delete(&path).await {
-                        Ok(()) => break,
-                        Err(object_store::Error::NotFound { .. }) => break,
+                        Ok(()) => {
+                            deleted = true;
+                            break;
+                        }
+                        Err(object_store::Error::NotFound { .. }) => {
+                            deleted = true;
+                            break;
+                        }
                         Err(e) => {
                             retry += 1;
                             warn!(
@@ -728,6 +867,9 @@ impl CompactionService {
                         }
                     }
                 }
+                deletes
+                    .recorder(&[("result", if deleted { "ok" } else { "failed" })])
+                    .inc(1);
             });
         }
 
@@ -840,7 +982,10 @@ impl CompactionService {
                 )
                 .await
             {
-                Ok(_) => return Ok(true),
+                Ok(_) => {
+                    self.metrics.record_claim("acquired");
+                    return Ok(true);
+                }
                 Err(object_store::Error::AlreadyExists { .. }) => {
                     // Inspect existing claim. Take over only if stale.
                     let bytes = match self.object_store.get(path).await {
@@ -865,6 +1010,7 @@ impl CompactionService {
                         .put(path, Bytes::from(payload).into())
                         .await
                         .context("overwrite stale claim")?;
+                    self.metrics.record_claim("taken_over");
                     return Ok(true);
                 }
                 Err(object_store::Error::NotSupported { .. }) => {
@@ -880,6 +1026,7 @@ impl CompactionService {
                         .put(path, Bytes::from(payload).into())
                         .await
                         .context("write claim without atomic guard")?;
+                    self.metrics.record_claim("acquired");
                     return Ok(true);
                 }
                 Err(e) => return Err(e.into()),
@@ -1128,6 +1275,7 @@ mod tests {
             store,
             time_provider,
             ShutdownManager::new_testing().register(),
+            Arc::new(metric::Registry::default()),
         )
     }
 }

@@ -1347,9 +1347,10 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     // from it, the compactor reads from it. `All` keeps legacy single-node
     // behavior unless the operator explicitly opts in.
     let shared_inventory = if config.mode != NodeMode::All {
-        Some(influxdb3_write::shared_inventory::SharedInventory::new(
-            Arc::clone(&object_store),
-        ))
+        Some(
+            influxdb3_write::shared_inventory::SharedInventory::new(Arc::clone(&object_store))
+                .with_metrics(&metrics),
+        )
     } else {
         None
     };
@@ -1384,6 +1385,9 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             writer_lease,
             Arc::clone(&time_provider) as _,
             shutdown_manager.register(),
+            Some(influxdb3_write::leases::LeaseMetrics::new(
+                &metrics, "writer",
+            )),
         );
     }
 
@@ -1425,6 +1429,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             persisted_files: Arc::clone(&persisted_files),
             interval: ref_validation_interval,
             shutdown: shutdown_manager.register(),
+            metric_registry: Arc::clone(&metrics),
         });
     }
 
@@ -1451,6 +1456,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             Arc::clone(&t).spawn(influxdb3_write::wal_tail::WalTailBufferArgs {
                 poll_interval: wal_tail_interval,
                 shutdown: shutdown_manager.register(),
+                metric_registry: Arc::clone(&metrics),
             });
             Some(t)
         } else {
@@ -1483,6 +1489,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
                         .initial_compaction_watermark(),
                     shutdown: shutdown_manager.register(),
                     wal_tail: wal_tail_buffer.clone(),
+                    metric_registry: Arc::clone(&metrics),
                 },
             );
         }
@@ -1570,6 +1577,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             Arc::clone(&object_store),
             Arc::clone(&time_provider),
             shutdown_manager.register(),
+            Arc::clone(&metrics),
         );
         if let Some(inv) = &shared_inventory {
             compaction_service = compaction_service.with_shared_inventory(inv.clone());
@@ -1593,6 +1601,10 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
                 Arc::clone(&lease),
                 Arc::clone(&time_provider) as _,
                 shutdown_manager.register(),
+                Some(influxdb3_write::leases::LeaseMetrics::new(
+                    &metrics,
+                    "compactor",
+                )),
             );
             compaction_service = compaction_service.with_lease(lease);
         }
@@ -1636,10 +1648,13 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             .collect();
         let remote = (!writer_urls.is_empty()).then(|| {
             info!(?writer_urls, "enabling layer B (remote hot chunks)");
-            Arc::new(influxdb3_write::remote_write_buffer::RemoteWriteBuffer::new(
-                writer_urls,
-                config.remote_hot_timeout.into(),
-            ))
+            Arc::new(
+                influxdb3_write::remote_write_buffer::RemoteWriteBuffer::new(
+                    writer_urls,
+                    config.remote_hot_timeout.into(),
+                )
+                .with_metrics(&metrics),
+            )
         });
 
         Arc::new(influxdb3_write::composite_write_buffer::CompositeWriteBuffer::new(

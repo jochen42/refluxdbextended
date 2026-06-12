@@ -60,6 +60,7 @@ async fn compaction_publishes_and_replaces_files() {
     )
     .await
     .unwrap();
+    let metric_registry = Arc::new(Registry::default());
     let write_buffer = WriteBufferImpl::new(WriteBufferImplArgs {
         persister: Arc::clone(&persister),
         catalog: Arc::clone(&catalog),
@@ -69,7 +70,7 @@ async fn compaction_publishes_and_replaces_files() {
         executor: Arc::new(Executor::new_testing()),
         wal_config: WalConfig::test_config(),
         parquet_cache: None,
-        metric_registry: Arc::new(Registry::default()),
+        metric_registry: Arc::clone(&metric_registry),
         snapshotted_wal_files_to_keep: 10,
         query_file_limit: None,
         n_snapshots_to_load_on_start: std::num::NonZeroU64::new(1).unwrap(),
@@ -153,6 +154,7 @@ async fn compaction_publishes_and_replaces_files() {
         Arc::clone(&object_store),
         Arc::clone(&time_provider),
         ShutdownManager::new_testing().register(),
+        Arc::clone(&metric_registry),
     );
 
     let jobs = compaction_service.identify_compaction_jobs().await.unwrap();
@@ -196,6 +198,48 @@ async fn compaction_publishes_and_replaces_files() {
             !after_paths.contains(old),
             "input file {} still in PersistedFiles after compaction",
             old
+        );
+    }
+
+    // Job-level Prometheus metrics recorded against the shared registry.
+    {
+        use metric::{Attributes, Metric, U64Counter};
+        let files = metric_registry
+            .get_instrument::<Metric<U64Counter>>("influxdb3_compaction_files")
+            .unwrap();
+        assert_eq!(
+            input_paths.len() as u64,
+            files
+                .get_observer(&Attributes::from(&[("kind", "input")]))
+                .unwrap()
+                .fetch()
+        );
+        assert_eq!(
+            1,
+            files
+                .get_observer(&Attributes::from(&[("kind", "output")]))
+                .unwrap()
+                .fetch()
+        );
+        let bytes = metric_registry
+            .get_instrument::<Metric<U64Counter>>("influxdb3_compaction_bytes")
+            .unwrap();
+        for direction in ["input", "output"] {
+            assert!(
+                bytes
+                    .get_observer(&Attributes::from(&[("direction", direction)]))
+                    .unwrap()
+                    .fetch()
+                    > 0,
+                "expected {direction} bytes metric to be recorded"
+            );
+        }
+        let rows = metric_registry
+            .get_instrument::<Metric<U64Counter>>("influxdb3_compaction_rows")
+            .unwrap();
+        assert_eq!(
+            input_rows,
+            rows.get_observer(&Attributes::from(&[])).unwrap().fetch()
         );
     }
 

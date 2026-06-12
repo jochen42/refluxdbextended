@@ -18,6 +18,7 @@
 //! without waiting for TTL expiry.
 
 use bytes::Bytes;
+use metric::{Metric, U64Counter, U64Gauge};
 use object_store::path::Path as ObjPath;
 use object_store::{
     Error as ObjStoreError, ObjectStore, PutMode, PutOptions, PutResult, UpdateVersion,
@@ -28,6 +29,45 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+
+/// Prometheus metrics for one lease. Construct with the lease's role name
+/// (`"writer"` / `"compactor"`) and pass to [`run`].
+#[derive(Debug)]
+pub struct LeaseMetrics {
+    is_leader: U64Gauge,
+    operations: Metric<U64Counter>,
+    lease_name: &'static str,
+}
+
+impl LeaseMetrics {
+    pub fn new(registry: &metric::Registry, lease_name: &'static str) -> Self {
+        let is_leader = registry
+            .register_metric::<U64Gauge>(
+                "influxdb3_lease_is_leader",
+                "1 when this process holds the lease, 0 otherwise",
+            )
+            .recorder(&[("lease", lease_name)]);
+        let operations = registry.register_metric::<U64Counter>(
+            "influxdb3_lease_operations",
+            "lease acquire/renew/release attempts by result",
+        );
+        Self {
+            is_leader,
+            operations,
+            lease_name,
+        }
+    }
+
+    fn record(&self, op: &'static str, result: &'static str) {
+        self.operations
+            .recorder(&[("lease", self.lease_name), ("op", op), ("result", result)])
+            .inc(1);
+    }
+
+    fn set_leader(&self, leader: bool) {
+        self.is_leader.set(u64::from(leader));
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum LeaseError {
@@ -306,11 +346,18 @@ pub fn run(
     lease: Arc<Lease>,
     time_provider: Arc<dyn iox_time::TimeProvider>,
     shutdown: influxdb3_shutdown::ShutdownToken,
+    metrics: Option<LeaseMetrics>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let ttl = lease.config.ttl;
         let refresh = lease.config.refresh_interval;
         let standoff = ttl.checked_div(2).unwrap_or(Duration::from_secs(5));
+
+        if let Some(m) = &metrics {
+            // Reflect any leadership established before `run` was spawned
+            // (e.g. the writer's synchronous startup try_acquire).
+            m.set_leader(lease.is_leader(time_provider.now().timestamp_millis()));
+        }
 
         loop {
             let now_ms = time_provider.now().timestamp_millis();
@@ -320,6 +367,10 @@ pub fn run(
                 biased;
                 _ = shutdown.wait_for_shutdown() => {
                     lease.release().await;
+                    if let Some(m) = &metrics {
+                        m.record("release", "ok");
+                        m.set_leader(false);
+                    }
                     return;
                 }
                 _ = tokio::time::sleep(if is_leader { refresh } else { standoff }) => {}
@@ -327,13 +378,41 @@ pub fn run(
 
             let now_ms = time_provider.now().timestamp_millis();
             if lease.is_leader(now_ms) {
-                match lease.refresh(now_ms).await {
+                let outcome = lease.refresh(now_ms).await;
+                if let Some(m) = &metrics {
+                    match &outcome {
+                        Ok(true) => {
+                            m.record("renew", "ok");
+                            m.set_leader(true);
+                        }
+                        Ok(false) => {
+                            m.record("renew", "lost");
+                            m.set_leader(false);
+                        }
+                        Err(_) => m.record("renew", "error"),
+                    }
+                }
+                match outcome {
                     Ok(true) => {}
                     Ok(false) => debug!("lease lost during refresh; will retry acquire"),
                     Err(e) => warn!("lease refresh error: {}", e),
                 }
             } else {
-                match lease.try_acquire(now_ms).await {
+                let outcome = lease.try_acquire(now_ms).await;
+                if let Some(m) = &metrics {
+                    match &outcome {
+                        Ok(true) => {
+                            m.record("acquire", "ok");
+                            m.set_leader(true);
+                        }
+                        Ok(false) => {
+                            m.record("acquire", "conflict");
+                            m.set_leader(false);
+                        }
+                        Err(_) => m.record("acquire", "error"),
+                    }
+                }
+                match outcome {
                     Ok(true) => {}
                     Ok(false) => debug!("lease still held by another process; standing by"),
                     Err(e) => warn!("lease acquire error: {}", e),

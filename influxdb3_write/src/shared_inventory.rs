@@ -69,16 +69,56 @@ fn checkpoint_entry(checkpoint_id: &str) -> ObjPath {
     ))
 }
 
-/// Top-level interface to the shared inventory. Cheap to clone (just an
-/// `Arc<dyn ObjectStore>`).
+/// Prometheus metrics for shared-inventory publishes. A failed publish means
+/// peers won't see the snapshot/manifest — the silent failure mode behind the
+/// phantom-ref incident class — so it must be visible on a dashboard.
+#[derive(Debug)]
+pub struct SharedInventoryMetrics {
+    publishes: metric::Metric<metric::U64Counter>,
+}
+
+impl SharedInventoryMetrics {
+    pub fn new(registry: &metric::Registry) -> Self {
+        let publishes = registry.register_metric::<metric::U64Counter>(
+            "influxdb3_shared_inventory_publish",
+            "shared inventory publishes by kind and result",
+        );
+        Self { publishes }
+    }
+
+    fn record(&self, kind: &'static str, ok: bool) {
+        self.publishes
+            .recorder(&[("kind", kind), ("result", if ok { "ok" } else { "error" })])
+            .inc(1);
+    }
+}
+
+/// Top-level interface to the shared inventory. Cheap to clone (an
+/// `Arc<dyn ObjectStore>` plus an optional `Arc` of metrics).
 #[derive(Debug, Clone)]
 pub struct SharedInventory {
     object_store: Arc<dyn ObjectStore>,
+    metrics: Option<Arc<SharedInventoryMetrics>>,
 }
 
 impl SharedInventory {
     pub fn new(object_store: Arc<dyn ObjectStore>) -> Self {
-        Self { object_store }
+        Self {
+            object_store,
+            metrics: None,
+        }
+    }
+
+    /// Attach publish metrics. Clones share the same recorders.
+    pub fn with_metrics(mut self, registry: &metric::Registry) -> Self {
+        self.metrics = Some(Arc::new(SharedInventoryMetrics::new(registry)));
+        self
+    }
+
+    fn record_publish(&self, kind: &'static str, ok: bool) {
+        if let Some(m) = &self.metrics {
+            m.record(kind, ok);
+        }
     }
 
     /// Publish a WAL-driven snapshot to the shared namespace under this
@@ -90,9 +130,14 @@ impl SharedInventory {
         snapshot: &PersistedSnapshot,
     ) -> Result<()> {
         let path = wal_entry(node_id, snapshot.snapshot_sequence_number.as_u64());
-        let body = serde_json::to_vec_pretty(snapshot)?;
-        self.object_store.put(&path, Bytes::from(body).into()).await?;
-        Ok(())
+        let result: Result<()> = async {
+            let body = serde_json::to_vec_pretty(snapshot)?;
+            self.object_store.put(&path, Bytes::from(body).into()).await?;
+            Ok(())
+        }
+        .await;
+        self.record_publish("wal_snapshot", result.is_ok());
+        result
     }
 
     /// Publish a compaction manifest. Caller-supplied id (typically `Uuid::now_v7`)
@@ -103,9 +148,14 @@ impl SharedInventory {
         snapshot: &PersistedSnapshot,
     ) -> Result<()> {
         let path = compaction_entry(compaction_id);
-        let body = serde_json::to_vec_pretty(snapshot)?;
-        self.object_store.put(&path, Bytes::from(body).into()).await?;
-        Ok(())
+        let result: Result<()> = async {
+            let body = serde_json::to_vec_pretty(snapshot)?;
+            self.object_store.put(&path, Bytes::from(body).into()).await?;
+            Ok(())
+        }
+        .await;
+        self.record_publish("compaction", result.is_ok());
+        result
     }
 
     /// Write a checkpoint that summarizes the inventory state up to and
@@ -118,9 +168,14 @@ impl SharedInventory {
     ) -> Result<String> {
         let checkpoint_id = Uuid::now_v7().to_string();
         let path = checkpoint_entry(&checkpoint_id);
-        let body = serde_json::to_vec_pretty(snapshot)?;
-        self.object_store.put(&path, Bytes::from(body).into()).await?;
-        Ok(checkpoint_id)
+        let result: Result<String> = async {
+            let body = serde_json::to_vec_pretty(snapshot)?;
+            self.object_store.put(&path, Bytes::from(body).into()).await?;
+            Ok(checkpoint_id)
+        }
+        .await;
+        self.record_publish("checkpoint", result.is_ok());
+        result
     }
 
     /// List every WAL-snapshot manifest written by every node. Caller passes
@@ -364,6 +419,34 @@ mod tests {
             },
         );
         s
+    }
+
+    #[tokio::test]
+    async fn publish_records_metrics() {
+        use metric::{Attributes, Metric, U64Counter};
+        let registry = metric::Registry::default();
+        let inv = SharedInventory::new(Arc::new(InMemory::new())).with_metrics(&registry);
+
+        inv.publish_wal_snapshot("node-a", &snap_with("node-a", 1, "a/1.parquet"))
+            .await
+            .unwrap();
+        inv.publish_compaction("c1", &snap_with("comp", 0, "c/1.parquet"))
+            .await
+            .unwrap();
+
+        let publishes = registry
+            .get_instrument::<Metric<U64Counter>>("influxdb3_shared_inventory_publish")
+            .unwrap();
+        for kind in ["wal_snapshot", "compaction"] {
+            assert_eq!(
+                1,
+                publishes
+                    .get_observer(&Attributes::from(&[("kind", kind), ("result", "ok")]))
+                    .unwrap()
+                    .fetch(),
+                "expected one ok publish for kind {kind}"
+            );
+        }
     }
 
     #[tokio::test]

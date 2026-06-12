@@ -26,6 +26,12 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 #[derive(Debug)]
+struct RemoteMetrics {
+    requests: metric::Metric<metric::U64Counter>,
+    duration: metric::DurationHistogram,
+}
+
+#[derive(Debug)]
 pub struct RemoteWriteBuffer {
     writer_urls: Vec<String>,
     client: reqwest::Client,
@@ -34,6 +40,7 @@ pub struct RemoteWriteBuffer {
     /// the log. Key: URL, value: last-warn instant.
     last_warn: Mutex<HashMap<String, std::time::Instant>>,
     warn_interval: Duration,
+    metrics: Option<RemoteMetrics>,
 }
 
 impl RemoteWriteBuffer {
@@ -48,7 +55,25 @@ impl RemoteWriteBuffer {
             request_timeout,
             last_warn: Mutex::new(HashMap::new()),
             warn_interval: Duration::from_secs(60),
+            metrics: None,
         }
+    }
+
+    /// Attach Prometheus metrics for the hot-chunks RPC.
+    pub fn with_metrics(mut self, registry: &metric::Registry) -> Self {
+        self.metrics = Some(RemoteMetrics {
+            requests: registry.register_metric::<metric::U64Counter>(
+                "influxdb3_remote_hot_chunks_requests",
+                "querier-side hot-chunks RPCs to writers by result",
+            ),
+            duration: registry
+                .register_metric::<metric::DurationHistogram>(
+                    "influxdb3_remote_hot_chunks_duration",
+                    "round-trip duration of querier-side hot-chunks RPCs",
+                )
+                .recorder(&[]),
+        });
+        self
     }
 
     pub fn writer_urls(&self) -> &[String] {
@@ -75,10 +100,20 @@ impl RemoteWriteBuffer {
         let mut out: Vec<RecordBatch> = Vec::new();
         let mut any_success = false;
         for url in &self.writer_urls {
-            match self
+            let start = std::time::Instant::now();
+            let outcome = self
                 .fetch_from(url, db_id, table_id, time_min_ns, time_max_ns)
-                .await
-            {
+                .await;
+            if let Some(m) = &self.metrics {
+                m.duration.record(start.elapsed());
+                let result = match &outcome {
+                    Ok(_) => "ok",
+                    Err(RemoteHotChunksError::Timeout) => "timeout",
+                    Err(_) => "error",
+                };
+                m.requests.recorder(&[("result", result)]).inc(1);
+            }
+            match outcome {
                 Ok(batches) => {
                     any_success = true;
                     out.extend(batches);

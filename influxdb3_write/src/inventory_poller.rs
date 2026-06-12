@@ -34,6 +34,51 @@ pub struct InventoryPollerArgs {
     /// snapshot's covered-through `wal_file_sequence_number`, so the tail
     /// drops files that are now redundant with persisted parquet.
     pub wal_tail: Option<Arc<WalTailBuffer>>,
+    pub metric_registry: Arc<metric::Registry>,
+}
+
+#[derive(Debug)]
+struct PollerMetrics {
+    ticks: metric::Metric<metric::U64Counter>,
+    folded: metric::Metric<metric::U64Counter>,
+    duration: metric::DurationHistogram,
+}
+
+impl PollerMetrics {
+    fn new(registry: &metric::Registry) -> Self {
+        let ticks = registry.register_metric::<metric::U64Counter>(
+            "influxdb3_inventory_poll_ticks",
+            "inventory poller ticks by result",
+        );
+        let folded = registry.register_metric::<metric::U64Counter>(
+            "influxdb3_inventory_folded",
+            "manifests folded from the shared inventory by kind",
+        );
+        let duration = registry
+            .register_metric::<metric::DurationHistogram>(
+                "influxdb3_inventory_poll_duration",
+                "wall-clock duration of inventory poll ticks",
+            )
+            .recorder(&[]);
+        Self {
+            ticks,
+            folded,
+            duration,
+        }
+    }
+}
+
+/// Counts of manifests applied by one poll tick.
+#[derive(Debug, Default, Clone, Copy)]
+struct TickSummary {
+    wal_snapshots: usize,
+    compactions: usize,
+}
+
+impl TickSummary {
+    fn total(&self) -> usize {
+        self.wal_snapshots + self.compactions
+    }
 }
 
 pub fn spawn(args: InventoryPollerArgs) -> JoinHandle<()> {
@@ -50,8 +95,10 @@ async fn run(args: InventoryPollerArgs) {
         initial_compaction_watermark,
         shutdown,
         wal_tail,
+        metric_registry,
     } = args;
 
+    let metrics = PollerMetrics::new(&metric_registry);
     let mut wal_cursors = initial_wal_watermarks;
     let mut compaction_cursor = initial_compaction_watermark;
     let cancel = shutdown.clone_cancellation_token();
@@ -65,7 +112,8 @@ async fn run(args: InventoryPollerArgs) {
             _ = tokio::time::sleep(interval) => {}
         }
 
-        match tick(
+        let start = std::time::Instant::now();
+        let outcome = tick(
             &inventory,
             &persisted_files,
             &catalog,
@@ -73,13 +121,34 @@ async fn run(args: InventoryPollerArgs) {
             &mut compaction_cursor,
             wal_tail.as_deref(),
         )
-        .await
-        {
-            Ok(applied) if applied > 0 => {
-                debug!(applied, "inventory poller applied new snapshots");
+        .await;
+        metrics.duration.record(start.elapsed());
+        match outcome {
+            Ok(applied) => {
+                metrics.ticks.recorder(&[("result", "ok")]).inc(1);
+                if applied.wal_snapshots > 0 {
+                    metrics
+                        .folded
+                        .recorder(&[("kind", "wal_snapshot")])
+                        .inc(applied.wal_snapshots as u64);
+                }
+                if applied.compactions > 0 {
+                    metrics
+                        .folded
+                        .recorder(&[("kind", "compaction")])
+                        .inc(applied.compactions as u64);
+                }
+                if applied.total() > 0 {
+                    debug!(
+                        applied = applied.total(),
+                        "inventory poller applied new snapshots"
+                    );
+                }
             }
-            Ok(_) => {}
-            Err(e) => warn!("inventory poll tick failed: {}", e),
+            Err(e) => {
+                metrics.ticks.recorder(&[("result", "error")]).inc(1);
+                warn!("inventory poll tick failed: {}", e);
+            }
         }
     }
 }
@@ -91,7 +160,7 @@ async fn tick(
     wal_cursors: &mut HashMap<String, u64>,
     compaction_cursor: &mut Option<String>,
     wal_tail: Option<&WalTailBuffer>,
-) -> Result<usize, crate::shared_inventory::InventoryError> {
+) -> Result<TickSummary, crate::shared_inventory::InventoryError> {
     // Pull catalog forward unconditionally on every tick. Without this, a
     // querier never sees new databases or tables until something writes an
     // inventory entry referencing them — and on a fresh stack the inventory
@@ -126,10 +195,10 @@ async fn tick(
         .await?;
 
     if new_wal.is_empty() && new_comp.is_empty() {
-        return Ok(0);
+        return Ok(TickSummary::default());
     }
 
-    let mut applied = 0;
+    let mut applied = TickSummary::default();
     for s in new_wal {
         let node = s.node_id.clone();
         let seq = s.snapshot_sequence_number.as_u64();
@@ -142,7 +211,7 @@ async fn tick(
         if let Some(tail) = wal_tail {
             tail.evict_up_to(&node, wal_seq);
         }
-        applied += 1;
+        applied.wal_snapshots += 1;
     }
     if let Some((last_id, _)) = new_comp.last() {
         *compaction_cursor = Some(last_id.clone());
@@ -162,7 +231,7 @@ async fn tick(
             let _ = (tail, wal_seq);
         }
         persisted_files.add_persisted_snapshot_files(s);
-        applied += 1;
+        applied.compactions += 1;
     }
 
     Ok(applied)
@@ -220,14 +289,14 @@ mod tests {
         let n = tick(&inv, &persisted, &catalog, &mut wal_cursors, &mut comp_cursor, None)
             .await
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n.total(), 1);
         assert_eq!(wal_cursors.get("writer-1"), Some(&1));
 
         // empty tick: nothing new
         let n = tick(&inv, &persisted, &catalog, &mut wal_cursors, &mut comp_cursor, None)
             .await
             .unwrap();
-        assert_eq!(n, 0);
+        assert_eq!(n.total(), 0);
 
         // publish another, tick picks it up
         inv.publish_wal_snapshot("writer-1", &snap("writer-1", 2, "a/2.parquet"))
@@ -236,7 +305,8 @@ mod tests {
         let n = tick(&inv, &persisted, &catalog, &mut wal_cursors, &mut comp_cursor, None)
             .await
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n.total(), 1);
+        assert_eq!(n.wal_snapshots, 1);
         assert_eq!(wal_cursors.get("writer-1"), Some(&2));
 
         // metrics reflect both
@@ -267,6 +337,7 @@ mod tests {
             initial_compaction_watermark: None,
             shutdown: token,
             wal_tail: None,
+            metric_registry: Arc::new(metric::Registry::default()),
         });
 
         inv.publish_wal_snapshot("w1", &snap("w1", 1, "a.parquet"))

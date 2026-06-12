@@ -1332,6 +1332,21 @@ impl HttpApi {
     /// `RemoteWriteBuffer`. JSON request body:
     /// `{"db_id": u32, "table_id": u32, "time_min_ns": i64?, "time_max_ns": i64?}`.
     async fn hot_chunks(&self, req: Request) -> Result<Response> {
+        let result = self.hot_chunks_inner(req).await;
+        // register_metric is idempotent (cached by name), so per-request
+        // registration just resolves the existing instrument.
+        self.common_state
+            .metrics
+            .register_metric::<metric::U64Counter>(
+                "influxdb3_hot_chunks_served",
+                "writer-side hot-chunks RPCs served by result",
+            )
+            .recorder(&[("result", if result.is_ok() { "ok" } else { "error" })])
+            .inc(1);
+        result
+    }
+
+    async fn hot_chunks_inner(&self, req: Request) -> Result<Response> {
         #[derive(serde::Deserialize)]
         struct HotChunksReq {
             db_id: u32,
