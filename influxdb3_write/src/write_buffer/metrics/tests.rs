@@ -73,3 +73,15 @@ fn record_bytes() {
             .fetch()
     );
 }
+
+#[test]
+fn set_wal_buffer_size_bytes() {
+    let metric_registry = Registry::new();
+    let metrics = WriteMetrics::new(&metric_registry);
+    assert_eq!(0, metrics.wal_buffer_size_bytes.fetch());
+    metrics.set_wal_buffer_size_bytes(4096);
+    assert_eq!(4096, metrics.wal_buffer_size_bytes.fetch());
+    // gauge overwrites, not accumulates
+    metrics.set_wal_buffer_size_bytes(512);
+    assert_eq!(512, metrics.wal_buffer_size_bytes.fetch());
+}

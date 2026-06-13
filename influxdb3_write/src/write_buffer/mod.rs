@@ -873,6 +873,9 @@ async fn check_mem_and_force_snapshot(
     memory_threshold_bytes: usize,
 ) {
     let current_buffer_size_bytes = write_buffer.buffer.get_total_size_bytes();
+    write_buffer
+        .metrics
+        .set_wal_buffer_size_bytes(current_buffer_size_bytes as u64);
     debug!(
         current_buffer_size_bytes,
         memory_threshold_bytes, "checking buffer size and snapshotting"
