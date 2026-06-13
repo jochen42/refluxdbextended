@@ -999,6 +999,61 @@ impl EndpointPolicy {
     }
 }
 
+/// Gates query readiness reported via `/health`. Holds zero or more gate flags;
+/// the probe is ready only once **all** of them are set. An empty probe (the
+/// default) is always ready.
+///
+/// A querier must not serve until its parquet-ref view has converged, so it is
+/// built with one gate per async startup condition — the ref-validator's first
+/// sweep (evicts compaction-deleted phantom refs → no 404s) and the inventory
+/// poller's first tick (folds the live inventory → no empty results during the
+/// cold-load window). Until every gate flips, `/health` returns 503 so the load
+/// balancer keeps the backend out of rotation. Liveness is unaffected — the
+/// startup probe already answered probes during replay, and these gates flip
+/// within seconds, well inside MIG autohealing's startup grace.
+#[derive(Debug, Clone, Default)]
+pub struct ReadinessProbe(Vec<Arc<std::sync::atomic::AtomicBool>>);
+
+impl ReadinessProbe {
+    /// Build a probe gated on `gates`; ready only when every flag is set.
+    /// An empty `gates` yields an always-ready probe.
+    pub fn from_gates(gates: Vec<Arc<std::sync::atomic::AtomicBool>>) -> Self {
+        Self(gates)
+    }
+
+    /// Ready once all gate flags are set (vacuously true when there are none).
+    pub fn is_ready(&self) -> bool {
+        self.0
+            .iter()
+            .all(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+mod readiness_probe_tests {
+    use super::ReadinessProbe;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn empty_is_always_ready() {
+        assert!(ReadinessProbe::default().is_ready());
+        assert!(ReadinessProbe::from_gates(vec![]).is_ready());
+    }
+
+    #[test]
+    fn ready_only_when_all_gates_set() {
+        let g1 = Arc::new(AtomicBool::new(false));
+        let g2 = Arc::new(AtomicBool::new(false));
+        let probe = ReadinessProbe::from_gates(vec![Arc::clone(&g1), Arc::clone(&g2)]);
+        assert!(!probe.is_ready(), "no gates set");
+        g1.store(true, Ordering::Relaxed);
+        assert!(!probe.is_ready(), "one gate still pending");
+        g2.store(true, Ordering::Relaxed);
+        assert!(probe.is_ready(), "all gates set");
+    }
+}
+
 pub struct HttpApi {
     common_state: CommonServerState,
     write_buffer: Arc<dyn WriteBuffer>,
@@ -1009,6 +1064,7 @@ pub struct HttpApi {
     authorizer: Arc<dyn AuthProvider>,
     legacy_write_param_unifier: SingleTenantRequestUnifier,
     pub(crate) endpoint_policy: EndpointPolicy,
+    readiness: ReadinessProbe,
 }
 
 impl std::fmt::Debug for HttpApi {
@@ -1044,6 +1100,7 @@ impl HttpApi {
             legacy_write_param_unifier,
             processing_engine,
             endpoint_policy: EndpointPolicy::allow_all(),
+            readiness: ReadinessProbe::default(),
         }
     }
 
@@ -1052,6 +1109,13 @@ impl HttpApi {
     /// refuses writes, etc.). Idempotent; call once after construction.
     pub fn with_endpoint_policy(mut self, policy: EndpointPolicy) -> Self {
         self.endpoint_policy = policy;
+        self
+    }
+
+    /// Gate `/health` (and thus LB query routing) on this readiness probe.
+    /// Idempotent; call once after construction. The default is ungated.
+    pub fn with_readiness_gate(mut self, readiness: ReadinessProbe) -> Self {
+        self.readiness = readiness;
         self
     }
 }
@@ -1294,6 +1358,19 @@ impl HttpApi {
     }
 
     fn health(&self) -> Result<Response> {
+        // Not-ready (gated querier still doing its first ref-validation sweep)
+        // returns 503 so the LB withholds query traffic until phantom refs are
+        // evicted. Liveness is unaffected: the startup probe already kept the
+        // supervisor away during replay, and the first sweep is seconds.
+        if !self.readiness.is_ready() {
+            return Ok(ResponseBuilder::new()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                .header("retry-after", "5")
+                .body(bytes_to_response_body(
+                    "server is starting: validating parquet references\n".to_string(),
+                ))?);
+        }
         let response_body = "OK";
         Ok(ResponseBuilder::new()
             .status(StatusCode::OK)

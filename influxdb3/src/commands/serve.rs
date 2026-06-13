@@ -1469,7 +1469,23 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     // periodically; on the compactor the next inventory checkpoint then
     // propagates the cleaned view durably.
     let ref_validation_interval: Duration = config.ref_validation_interval.into();
+    // A querier must not serve queries until its parquet-ref view has converged.
+    // Collect one readiness gate per async startup condition and gate `/health`
+    // on all of them, so the LB keeps the backend out of rotation until each has
+    // fired. Gates are only created on a querier, and only for components that
+    // actually run — other modes accumulate none and stay always-ready. A gate
+    // that is never created can never deadlock readiness.
+    let querier_gated = matches!(config.mode, NodeMode::Querier);
+    let mut readiness_gates: Vec<Arc<std::sync::atomic::AtomicBool>> = Vec::new();
+
     if !ref_validation_interval.is_zero() {
+        // Gate 1: first ref-validation sweep evicts compaction-deleted phantom
+        // refs, so a freshly booted querier doesn't 404 on the unswept set.
+        let first_pass_ready = querier_gated.then(|| {
+            let f = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            readiness_gates.push(Arc::clone(&f));
+            f
+        });
         info!(
             interval = ?ref_validation_interval,
             "spawning parquet ref validator"
@@ -1480,6 +1496,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             interval: ref_validation_interval,
             shutdown: shutdown_manager.register(),
             metric_registry: Arc::clone(&metrics),
+            first_pass_ready,
         });
     }
 
@@ -1495,6 +1512,30 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             .collect();
         let wal_tail_interval: Duration = config.wal_tail_poll_interval.into();
         if !writer_node_ids.is_empty() && !wal_tail_interval.is_zero() {
+            // Guard the recent-data-hole footgun: the querier's WAL tail must
+            // hold at least the writer's unpersisted window. The writer keeps up
+            // to 3x --wal-snapshot-size WAL periods buffered before force-
+            // snapshot; if the tail cap is smaller it evicts un-persisted files
+            // whose parquet doesn't exist yet, and recent-window queries silently
+            // return EMPTY (June 2026 incident). Warn loudly rather than refuse,
+            // so an operator is never blocked from booting in an emergency.
+            if is_unsafe_wal_tail_sizing(config.wal_tail_max_files, config.wal_snapshot_size) {
+                let min_safe = min_safe_wal_tail_files(config.wal_snapshot_size);
+                warn!(
+                    wal_tail_max_files = config.wal_tail_max_files,
+                    wal_snapshot_size = config.wal_snapshot_size,
+                    min_safe_wal_tail_max_files = min_safe,
+                    "UNSAFE WAL-tail sizing: --wal-tail-max-files ({}) is below 3x \
+                     --wal-snapshot-size ({} -> need >= {}). The querier may evict \
+                     un-persisted tail files and return EMPTY results for recent \
+                     time windows. Raise --wal-tail-max-files to >= {} (3x \
+                     snapshot-size + margin), or lower --wal-snapshot-size.",
+                    config.wal_tail_max_files,
+                    config.wal_snapshot_size,
+                    min_safe,
+                    min_safe,
+                );
+            }
             info!(?writer_node_ids, interval = ?wal_tail_interval,
                 "enabling layer C (wal tail)");
             let t = influxdb3_write::wal_tail::WalTailBuffer::new(
@@ -1524,6 +1565,14 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         && !inventory_poll_interval.is_zero()
     {
         if let Some(inv) = &shared_inventory {
+            // Gate 2: first poll tick folds the live inventory onto the loaded
+            // view, so a querier doesn't return empty results in the cold-load
+            // window. Created only here, where the poller actually runs.
+            let first_tick_ready = querier_gated.then(|| {
+                let f = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                readiness_gates.push(Arc::clone(&f));
+                f
+            });
             info!(
                 interval = ?inventory_poll_interval,
                 "spawning shared-inventory poller"
@@ -1540,10 +1589,15 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
                     shutdown: shutdown_manager.register(),
                     wal_tail: wal_tail_buffer.clone(),
                     metric_registry: Arc::clone(&metrics),
+                    first_tick_ready,
                 },
             );
         }
     }
+
+    // Finalize the readiness probe from the gates collected above. Non-querier
+    // modes and degraded configs accumulate no gates → always ready.
+    let query_readiness = influxdb3_server::http::ReadinessProbe::from_gates(readiness_gates);
 
     let object_deleter = Some(Arc::clone(&persisted_files) as _);
 
@@ -1813,7 +1867,8 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             config.max_http_request_size,
             Arc::clone(&authorizer),
         )
-        .with_endpoint_policy(endpoint_policy),
+        .with_endpoint_policy(endpoint_policy)
+        .with_readiness_gate(query_readiness),
     );
 
     // Only create recovery server if listener was created
@@ -2171,6 +2226,50 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use influxdb3_write::deleter::DeleteManagerArgs;
 #[cfg(tokio_unstable)]
 use tokio_metrics_bridge::setup_tokio_metrics;
+
+/// Smallest `--wal-tail-max-files` that still covers the writer's worst-case
+/// unpersisted window (3x `--wal-snapshot-size`, the cap before a force
+/// snapshot). A tail below this evicts un-persisted files and punches a
+/// recent-data hole in querier reads.
+fn min_safe_wal_tail_files(wal_snapshot_size: usize) -> usize {
+    wal_snapshot_size.saturating_mul(3)
+}
+
+/// True when the querier's WAL-tail cap is too small for the configured
+/// snapshot size, risking empty results for recent time windows.
+fn is_unsafe_wal_tail_sizing(wal_tail_max_files: usize, wal_snapshot_size: usize) -> bool {
+    wal_tail_max_files < min_safe_wal_tail_files(wal_snapshot_size)
+}
+
+#[cfg(test)]
+mod wal_tail_sizing_tests {
+    use super::{is_unsafe_wal_tail_sizing, min_safe_wal_tail_files};
+
+    #[test]
+    fn min_safe_is_three_times_snapshot_size() {
+        assert_eq!(min_safe_wal_tail_files(600), 1800);
+        assert_eq!(min_safe_wal_tail_files(20), 60);
+        assert_eq!(min_safe_wal_tail_files(0), 0);
+    }
+
+    #[test]
+    fn flags_unsafe_below_three_times_snapshot_size() {
+        // The reported footgun: tail 64 with snapshot-size 600.
+        assert!(is_unsafe_wal_tail_sizing(64, 600));
+        // Just below the boundary.
+        assert!(is_unsafe_wal_tail_sizing(1799, 600));
+    }
+
+    #[test]
+    fn allows_safe_sizings() {
+        // The shipped default pairing.
+        assert!(!is_unsafe_wal_tail_sizing(2000, 600));
+        // Exactly at the boundary is allowed (>= min_safe).
+        assert!(!is_unsafe_wal_tail_sizing(1800, 600));
+        // tail 64 is safe only with a small snapshot size.
+        assert!(!is_unsafe_wal_tail_sizing(64, 20));
+    }
+}
 
 #[cfg(any(not(feature = "jemalloc_replacing_malloc"), target_env = "msvc"))]
 pub fn build_malloc_conf() -> String {

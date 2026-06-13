@@ -35,6 +35,11 @@ pub struct InventoryPollerArgs {
     /// drops files that are now redundant with persisted parquet.
     pub wal_tail: Option<Arc<WalTailBuffer>>,
     pub metric_registry: Arc<metric::Registry>,
+    /// Flipped to `true` after the first successful tick, so a querier can gate
+    /// query readiness on having converged its loaded view with the live shared
+    /// inventory before serving (avoids empty results in the cold-load window).
+    /// `None` leaves readiness ungated.
+    pub first_tick_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug)]
@@ -96,6 +101,7 @@ async fn run(args: InventoryPollerArgs) {
         shutdown,
         wal_tail,
         metric_registry,
+        first_tick_ready,
     } = args;
 
     let metrics = PollerMetrics::new(&metric_registry);
@@ -104,14 +110,9 @@ async fn run(args: InventoryPollerArgs) {
     let cancel = shutdown.clone_cancellation_token();
 
     loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                debug!("inventory poller shutting down");
-                return;
-            }
-            _ = tokio::time::sleep(interval) => {}
-        }
-
+        // Tick first (no initial sleep) so the loaded view converges with the
+        // live inventory as soon as possible — this is what gates query
+        // readiness, so any delay here is a 503 window for the querier.
         let start = std::time::Instant::now();
         let outcome = tick(
             &inventory,
@@ -144,11 +145,24 @@ async fn run(args: InventoryPollerArgs) {
                         "inventory poller applied new snapshots"
                     );
                 }
+                // Converged with the live inventory at least once — safe to
+                // serve queries now (idempotent thereafter).
+                if let Some(ready) = &first_tick_ready {
+                    ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             Err(e) => {
                 metrics.ticks.recorder(&[("result", "error")]).inc(1);
                 warn!("inventory poll tick failed: {}", e);
             }
+        }
+
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                debug!("inventory poller shutting down");
+                return;
+            }
+            _ = tokio::time::sleep(interval) => {}
         }
     }
 }
@@ -338,6 +352,7 @@ mod tests {
             shutdown: token,
             wal_tail: None,
             metric_registry: Arc::new(metric::Registry::default()),
+            first_tick_ready: None,
         });
 
         inv.publish_wal_snapshot("w1", &snap("w1", 1, "a.parquet"))
@@ -356,5 +371,45 @@ mod tests {
             .await
             .expect("poller did not exit after shutdown")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_tick_flips_readiness_flag() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let object_store = Arc::new(InMemory::new());
+        let inv = SharedInventory::new(object_store.clone());
+        let persisted = Arc::new(PersistedFiles::new(None));
+        let catalog = Arc::new(Catalog::new_in_memory("test").await.unwrap());
+        let ready = Arc::new(AtomicBool::new(false));
+        let shutdown_mgr = ShutdownManager::new_testing();
+
+        // Long interval: the flag must be set by the immediate first tick, not a
+        // later periodic one — proves the tick-first ordering.
+        let handle = spawn(InventoryPollerArgs {
+            inventory: inv.clone(),
+            persisted_files: Arc::clone(&persisted),
+            catalog: Arc::clone(&catalog),
+            interval: Duration::from_secs(3600),
+            initial_wal_watermarks: HashMap::new(),
+            initial_compaction_watermark: None,
+            shutdown: shutdown_mgr.register(),
+            wal_tail: None,
+            metric_registry: Arc::new(metric::Registry::default()),
+            first_tick_ready: Some(Arc::clone(&ready)),
+        });
+
+        let mut flipped = false;
+        for _ in 0..200 {
+            if ready.load(Ordering::Relaxed) {
+                flipped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(flipped, "readiness flag should flip after the first tick");
+
+        shutdown_mgr.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 }

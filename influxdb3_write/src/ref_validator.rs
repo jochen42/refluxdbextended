@@ -34,6 +34,11 @@ pub struct RefValidatorArgs {
     pub interval: Duration,
     pub shutdown: ShutdownToken,
     pub metric_registry: Arc<metric::Registry>,
+    /// Flipped to `true` once the boot-time validation pass completes, so a
+    /// querier can gate query readiness on having swept its startup-loaded
+    /// (potentially phantom-ref-laden) `PersistedFiles` before serving. `None`
+    /// leaves readiness ungated.
+    pub first_pass_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug)]
@@ -92,6 +97,7 @@ async fn run(args: RefValidatorArgs) {
         interval,
         shutdown,
         metric_registry,
+        first_pass_ready,
     } = args;
 
     let metrics = RefValidatorMetrics::new(&metric_registry);
@@ -102,6 +108,11 @@ async fn run(args: RefValidatorArgs) {
         let start = std::time::Instant::now();
         let summary = validate_once(&object_store, &persisted_files).await;
         metrics.record_pass(summary, start.elapsed());
+        // Signal query readiness as soon as the first sweep over the
+        // startup-loaded PersistedFiles is done (idempotent thereafter).
+        if let Some(ready) = &first_pass_ready {
+            ready.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if summary.evicted > 0 || summary.skipped > 0 {
             info!(
                 checked = summary.checked,
@@ -315,5 +326,39 @@ mod tests {
         let persisted = PersistedFiles::default();
         let summary = validate_once(&store, &persisted).await;
         assert_eq!(summary, ValidationSummary::default());
+    }
+
+    #[tokio::test]
+    async fn first_pass_flips_readiness_flag() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let persisted = Arc::new(PersistedFiles::default());
+        let ready = Arc::new(AtomicBool::new(false));
+        let shutdown_mgr = influxdb3_shutdown::ShutdownManager::new_testing();
+
+        let handle = spawn(RefValidatorArgs {
+            object_store: store,
+            persisted_files: persisted,
+            // Long interval: the boot-time pass must flip the flag well before
+            // any periodic pass, so this proves the flip is at boot.
+            interval: std::time::Duration::from_secs(3600),
+            shutdown: shutdown_mgr.register(),
+            metric_registry: Arc::new(metric::Registry::new()),
+            first_pass_ready: Some(Arc::clone(&ready)),
+        });
+
+        let mut flipped = false;
+        for _ in 0..200 {
+            if ready.load(Ordering::Relaxed) {
+                flipped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(flipped, "readiness flag should flip after the boot-time pass");
+
+        shutdown_mgr.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     }
 }
