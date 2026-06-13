@@ -376,6 +376,24 @@ impl CompactionService {
             return Ok(());
         };
 
+        // Validate the live view against object store and evict phantom refs
+        // BEFORE materializing the checkpoint. `merged_snapshot` carries no
+        // `removed_files`, so any compaction-deleted (or never-uploaded) parquet
+        // baked into it could never be evicted by loaders — and every node that
+        // loads this checkpoint would inherit the phantom, re-paying a full
+        // ref-validation sweep on each boot. Cleaning here breaks that loop at
+        // the source. Cheap: one recursive LIST per node prefix.
+        let summary =
+            crate::ref_validator::validate_once(&self.object_store, &persisted_files).await;
+        if summary.evicted > 0 {
+            warn!(
+                checked = summary.checked,
+                evicted = summary.evicted,
+                skipped = summary.skipped,
+                "evicted phantom parquet refs before writing inventory checkpoint"
+            );
+        }
+
         // Synthesize a `PersistedSnapshot` containing every live file. The
         // checkpoint's `merged_snapshot` will be the only entry loaders need
         // to fold before applying newer WAL/compaction manifests on top.
