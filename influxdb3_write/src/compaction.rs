@@ -37,11 +37,18 @@ pub struct CompactionConfig {
     pub min_files_for_compaction: usize,
     /// Generation durations for each level
     pub generation_durations: HashMap<u8, Duration>,
-    /// Wait this long after publishing a compaction manifest before deleting the
-    /// original gen{n-1} parquet files. Prevents 404s on in-flight queries that
-    /// resolved the old paths before the manifest landed. Should be greater than
-    /// the longest expected query duration.
+    /// Small backstop wait after publishing a compaction manifest before
+    /// deleting the original gen{n-1} files: covers in-flight queries that
+    /// resolved the old paths *before* the manifest landed. With
+    /// `consumer_convergence` set this need only exceed the longest query
+    /// duration (not the querier convergence time — the gate handles that).
     pub delete_grace: Duration,
+    /// When set, gate deletion of superseded files on every live querier having
+    /// folded this compaction (via consumer heartbeats) — not just the fixed
+    /// `delete_grace`. This is what makes deletion safe under heavy churn
+    /// (backfill) where queriers lag past any fixed grace. `None` keeps the
+    /// legacy grace-only behavior.
+    pub consumer_convergence: Option<ConvergenceConfig>,
     /// Write a materialized inventory checkpoint after this many compaction
     /// cycles. Loaders use the latest checkpoint to bound startup cost as the
     /// number of WAL snapshots + compaction manifests grows. `0` disables.
@@ -50,6 +57,19 @@ pub struct CompactionConfig {
     /// claim left by a crashed compactor older than this can be taken over.
     /// Should exceed the longest expected single-job compaction time.
     pub claim_ttl: Duration,
+}
+
+/// Tuning for convergence-gated deletion.
+#[derive(Debug, Clone, Copy)]
+pub struct ConvergenceConfig {
+    /// A querier whose heartbeat is older than this is treated as dead and
+    /// ignored, so it can't block GC forever.
+    pub staleness_ttl: Duration,
+    /// Give up waiting for convergence after this and delete anyway (a backstop
+    /// against a wedged-but-fresh consumer). Should be generous.
+    pub max_wait: Duration,
+    /// How often to re-check consumer convergence while waiting.
+    pub poll_interval: Duration,
 }
 
 impl Default for CompactionConfig {
@@ -61,6 +81,7 @@ impl Default for CompactionConfig {
             min_files_for_compaction: 10,
             generation_durations: HashMap::new(),
             delete_grace: Duration::from_secs(600), // 10 minutes
+            consumer_convergence: None,
             checkpoint_every_n_cycles: 10,
             claim_ttl: Duration::from_secs(30 * 60), // 30 minutes
         }
@@ -878,47 +899,70 @@ impl CompactionService {
             }
         }
 
-        // Best-effort delete of original objects, after `delete_grace` so any
-        // queries that resolved the old paths before the manifest landed can
-        // finish reading them. Surviving objects after retries become orphans
+        // Delete the superseded inputs in one task: a small in-flight backstop,
+        // then (if configured) wait until every live querier has folded this
+        // compaction before deleting — so no consumer is left with a phantom ref
+        // and a missing successor. Surviving objects after retries become orphans
         // (no manifest references them) — they don't cause data loss.
         let grace = self.config.delete_grace;
-        for file in old_files {
-            let path = ObjPath::from(file.path.clone());
-            let object_store = Arc::clone(&self.object_store);
-            let deletes = self.metrics.input_deletes.clone();
-            tokio::spawn(async move {
-                if !grace.is_zero() {
-                    tokio::time::sleep(grace).await;
+        let convergence = self.config.consumer_convergence.clone();
+        let inv = self.shared_inventory.clone();
+        let time_provider = Arc::clone(&self.time_provider);
+        let compaction_id = compaction_id.to_string();
+        let old_paths: Vec<ObjPath> =
+            old_files.iter().map(|f| ObjPath::from(f.path.clone())).collect();
+        let object_store = Arc::clone(&self.object_store);
+        let deletes = self.metrics.input_deletes.clone();
+        tokio::spawn(async move {
+            // In-flight backstop: let queries planned before the manifest landed
+            // finish reading the old paths.
+            if !grace.is_zero() {
+                tokio::time::sleep(grace).await;
+            }
+            // Convergence gate: wait until every live querier has folded this
+            // compaction (heartbeat cursor >= compaction_id), or give up after
+            // max_wait. Skipped when unconfigured or there's no inventory.
+            if let (Some(cfg), Some(inv)) = (&convergence, &inv) {
+                let start = std::time::Instant::now();
+                loop {
+                    let now_ms = time_provider.now().timestamp_millis();
+                    let ttl_ms = cfg.staleness_ttl.as_millis() as i64;
+                    match inv.all_live_consumers_folded(&compaction_id, now_ms, ttl_ms).await {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(e) => warn!("convergence gate check failed: {e}"),
+                    }
+                    if start.elapsed() >= cfg.max_wait {
+                        warn!(
+                            %compaction_id,
+                            "convergence gate timed out; deleting superseded inputs anyway"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(cfg.poll_interval).await;
                 }
+            }
+            for path in old_paths {
                 let mut retry = 0u32;
                 let mut deleted = false;
                 while retry <= 5 {
                     match object_store.delete(&path).await {
-                        Ok(()) => {
-                            deleted = true;
-                            break;
-                        }
-                        Err(object_store::Error::NotFound { .. }) => {
+                        Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                             deleted = true;
                             break;
                         }
                         Err(e) => {
                             retry += 1;
-                            warn!(
-                                "compaction delete retry {} for {}: {}",
-                                retry, path, e
-                            );
-                            tokio::time::sleep(Duration::from_secs(u64::from(retry) * 2))
-                                .await;
+                            warn!("compaction delete retry {} for {}: {}", retry, path, e);
+                            tokio::time::sleep(Duration::from_secs(u64::from(retry) * 2)).await;
                         }
                     }
                 }
                 deletes
                     .recorder(&[("result", if deleted { "ok" } else { "failed" })])
                     .inc(1);
-            });
-        }
+            }
+        });
 
         Ok(())
     }

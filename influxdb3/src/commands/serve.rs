@@ -1604,6 +1604,10 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
                     metric_registry: Arc::clone(&metrics),
                     first_tick_ready,
                     watermarks_out: inventory_watermarks.clone(),
+                    // Only queriers heartbeat — they're the consumers that read
+                    // compacted files and must converge before deletion.
+                    heartbeat_node_id: querier_gated.then(|| node_id.clone()),
+                    time_provider: Arc::clone(&time_provider),
                 },
             );
         }
@@ -1682,6 +1686,15 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             min_files_for_compaction: config.min_files_for_compaction,
             generation_durations,
             delete_grace: config.compaction_delete_grace.into(),
+            // Gate deletion of superseded files on queriers having folded the
+            // compaction — robust to convergence lag under backfill, where a
+            // fixed grace is insufficient. `delete_grace` stays as the small
+            // in-flight-query backstop.
+            consumer_convergence: Some(influxdb3_write::compaction::ConvergenceConfig {
+                staleness_ttl: Duration::from_secs(300),
+                max_wait: Duration::from_secs(3600),
+                poll_interval: Duration::from_secs(5),
+            }),
             checkpoint_every_n_cycles: 10,
             claim_ttl: Duration::from_secs(30 * 60),
         };

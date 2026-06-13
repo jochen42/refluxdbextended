@@ -69,6 +69,27 @@ fn checkpoint_entry(checkpoint_id: &str) -> ObjPath {
     ))
 }
 
+fn consumer_dir() -> ObjPath {
+    ObjPath::from(format!("{SHARED_INVENTORY_PREFIX}/consumers"))
+}
+
+fn consumer_entry(node_id: &str) -> ObjPath {
+    ObjPath::from(format!("{SHARED_INVENTORY_PREFIX}/consumers/{node_id}.json"))
+}
+
+/// A consumer's (querier's) self-reported convergence position: the highest
+/// compaction id it has folded into its `PersistedFiles` view, plus when it last
+/// said so. The compactor reads these to gate deletion of superseded files on
+/// real convergence instead of a fixed grace timer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConsumerHeartbeat {
+    pub node_id: String,
+    /// Highest folded compaction id (ULID/uuid-v7, lexicographically ordered),
+    /// or `None` if the consumer has folded no compactions yet.
+    pub compaction_cursor: Option<String>,
+    pub updated_at_ms: i64,
+}
+
 /// Prometheus metrics for shared-inventory publishes. A failed publish means
 /// peers won't see the snapshot/manifest — the silent failure mode behind the
 /// phantom-ref incident class — so it must be visible on a dashboard.
@@ -176,6 +197,58 @@ impl SharedInventory {
         .await;
         self.record_publish("checkpoint", result.is_ok());
         result
+    }
+
+    /// Publish this consumer's convergence position so the compactor can gate
+    /// deletion of superseded files on real convergence. Cheap: one small PUT.
+    pub async fn write_consumer_heartbeat(
+        &self,
+        node_id: &str,
+        compaction_cursor: Option<String>,
+        now_ms: i64,
+    ) -> Result<()> {
+        let hb = ConsumerHeartbeat {
+            node_id: node_id.to_string(),
+            compaction_cursor,
+            updated_at_ms: now_ms,
+        };
+        let body = serde_json::to_vec(&hb)?;
+        self.object_store
+            .put(&consumer_entry(node_id), Bytes::from(body).into())
+            .await?;
+        Ok(())
+    }
+
+    /// True iff every consumer that heartbeated within `ttl_ms` has folded a
+    /// compaction id `>= compaction_id` (lexicographic; ids are time-ordered).
+    /// No live consumers ⇒ true (nothing to wait for). A consumer with a `None`
+    /// cursor, or one older than `compaction_id`, blocks (returns false) — it
+    /// hasn't folded the manifest that removed the files about to be deleted, so
+    /// deleting now would strand it with a phantom ref + a missing successor.
+    /// Stale consumers (heartbeat older than `ttl_ms`) are ignored so a dead
+    /// querier can't wedge GC.
+    pub async fn all_live_consumers_folded(
+        &self,
+        compaction_id: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<bool> {
+        let mut listing = self.object_store.list(Some(&consumer_dir()));
+        while let Some(item) = listing.next().await {
+            let location = item?.location;
+            let bytes = self.object_store.get(&location).await?.bytes().await?;
+            let Ok(hb) = serde_json::from_slice::<ConsumerHeartbeat>(&bytes) else {
+                continue;
+            };
+            if now_ms.saturating_sub(hb.updated_at_ms) > ttl_ms {
+                continue; // stale → assume dead, don't let it block GC
+            }
+            match hb.compaction_cursor.as_deref() {
+                Some(c) if c >= compaction_id => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     /// List every WAL-snapshot manifest written by every node. Caller passes
@@ -397,6 +470,41 @@ mod tests {
     use influxdb3_id::{DbId, TableId};
     use influxdb3_wal::{SnapshotSequenceNumber, WalFileSequenceNumber};
     use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn consumer_convergence_gate() {
+        let inv = SharedInventory::new(Arc::new(InMemory::new()));
+        let cid = "019ec300-0000-7000-8000-000000000000"; // the compaction being deleted
+
+        // No consumers → nothing to wait for.
+        assert!(inv.all_live_consumers_folded(cid, 1000, 60_000).await.unwrap());
+
+        // A consumer that has NOT folded cid (older cursor) blocks.
+        inv.write_consumer_heartbeat("q1", Some("019ec200-0000-7000-8000-000000000000".into()), 1000)
+            .await
+            .unwrap();
+        assert!(!inv.all_live_consumers_folded(cid, 1000, 60_000).await.unwrap());
+
+        // A consumer with no cursor at all blocks.
+        inv.write_consumer_heartbeat("q2", None, 1000).await.unwrap();
+        assert!(!inv.all_live_consumers_folded(cid, 1000, 60_000).await.unwrap());
+
+        // Both advance past cid → unblocked.
+        inv.write_consumer_heartbeat("q1", Some("019ec300-0000-7000-8000-000000000001".into()), 2000)
+            .await
+            .unwrap();
+        inv.write_consumer_heartbeat("q2", Some(cid.to_string()), 2000)
+            .await
+            .unwrap();
+        assert!(inv.all_live_consumers_folded(cid, 2000, 60_000).await.unwrap());
+
+        // A stale lagging consumer is ignored (heartbeat older than ttl).
+        inv.write_consumer_heartbeat("q3", Some("019ec100-0000-7000-8000-000000000000".into()), 2000)
+            .await
+            .unwrap();
+        // now=100_000, ttl=60_000 → q3 (last seen 2000) is stale; q1/q2 (2000) also stale → all ignored → true.
+        assert!(inv.all_live_consumers_folded(cid, 100_000, 60_000).await.unwrap());
+    }
 
     fn snap_with(node: &str, seq: u64, file_path: &str) -> PersistedSnapshot {
         let mut s = PersistedSnapshot::new(

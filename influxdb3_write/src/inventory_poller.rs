@@ -45,6 +45,11 @@ pub struct InventoryPollerArgs {
     /// marks of the inventory checkpoint it writes. `None` on non-compactor
     /// nodes, which write no checkpoints.
     pub watermarks_out: Option<SharedInventoryWatermarks>,
+    /// When set (queriers), the poller heartbeats this node's folded compaction
+    /// cursor to the shared inventory each tick, so the compactor can gate
+    /// deletion of superseded files on this consumer having converged.
+    pub heartbeat_node_id: Option<String>,
+    pub time_provider: Arc<dyn iox_time::TimeProvider>,
 }
 
 /// How far the inventory poller has folded — the high-water marks describing a
@@ -134,6 +139,8 @@ async fn run(args: InventoryPollerArgs) {
         metric_registry,
         first_tick_ready,
         watermarks_out,
+        heartbeat_node_id,
+        time_provider,
     } = args;
 
     let metrics = PollerMetrics::new(&metric_registry);
@@ -192,6 +199,17 @@ async fn run(args: InventoryPollerArgs) {
                         wal: wal_cursors.clone(),
                         compaction: compaction_cursor.clone(),
                     };
+                }
+                // Heartbeat this querier's converged position so the compactor
+                // gates deletion of superseded files on us having folded them.
+                if let Some(node_id) = &heartbeat_node_id {
+                    let now_ms = time_provider.now().timestamp_millis();
+                    if let Err(e) = inventory
+                        .write_consumer_heartbeat(node_id, compaction_cursor.clone(), now_ms)
+                        .await
+                    {
+                        warn!("failed to write consumer heartbeat: {}", e);
+                    }
                 }
             }
             Err(e) => {
@@ -397,6 +415,8 @@ mod tests {
             metric_registry: Arc::new(metric::Registry::default()),
             first_tick_ready: None,
             watermarks_out: None,
+            heartbeat_node_id: None,
+            time_provider: Arc::new(iox_time::SystemProvider::new()),
         });
 
         inv.publish_wal_snapshot("w1", &snap("w1", 1, "a.parquet"))
@@ -442,6 +462,8 @@ mod tests {
             metric_registry: Arc::new(metric::Registry::default()),
             first_tick_ready: Some(Arc::clone(&ready)),
             watermarks_out: None,
+            heartbeat_node_id: None,
+            time_provider: Arc::new(iox_time::SystemProvider::new()),
         });
 
         let mut flipped = false;
@@ -483,6 +505,8 @@ mod tests {
             metric_registry: Arc::new(metric::Registry::default()),
             first_tick_ready: None,
             watermarks_out: Some(Arc::clone(&watermarks)),
+            heartbeat_node_id: None,
+            time_provider: Arc::new(iox_time::SystemProvider::new()),
         });
 
         // After folding the published snapshot, the poller republishes its
