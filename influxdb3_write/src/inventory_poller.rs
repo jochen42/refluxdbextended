@@ -40,7 +40,38 @@ pub struct InventoryPollerArgs {
     /// inventory before serving (avoids empty results in the cold-load window).
     /// `None` leaves readiness ungated.
     pub first_tick_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Published after each successful tick with the poller's current cursors,
+    /// so the compactor (on the same node) can stamp them as the high-water
+    /// marks of the inventory checkpoint it writes. `None` on non-compactor
+    /// nodes, which write no checkpoints.
+    pub watermarks_out: Option<SharedInventoryWatermarks>,
 }
+
+/// How far the inventory poller has folded — the high-water marks describing a
+/// node's `PersistedFiles` view. Shared so the compactor can stamp them into the
+/// checkpoint it writes, letting loaders trust the checkpoint's `merged_snapshot`
+/// and skip every wal/compaction manifest at or below these marks instead of
+/// replaying the whole history on top.
+#[derive(Debug, Default, Clone)]
+pub struct InventoryWatermarks {
+    /// `node_id -> highest folded snapshot_sequence_number`.
+    pub wal: HashMap<String, u64>,
+    /// Highest folded compaction id (ULID), or `None`.
+    pub compaction: Option<String>,
+}
+
+impl InventoryWatermarks {
+    /// Build a shared handle seeded with the boot-load cursors, so a reader sees
+    /// sane marks before the first poll tick republishes them.
+    pub fn shared(
+        wal: HashMap<String, u64>,
+        compaction: Option<String>,
+    ) -> SharedInventoryWatermarks {
+        Arc::new(parking_lot::RwLock::new(Self { wal, compaction }))
+    }
+}
+
+pub type SharedInventoryWatermarks = Arc<parking_lot::RwLock<InventoryWatermarks>>;
 
 #[derive(Debug)]
 struct PollerMetrics {
@@ -102,6 +133,7 @@ async fn run(args: InventoryPollerArgs) {
         wal_tail,
         metric_registry,
         first_tick_ready,
+        watermarks_out,
     } = args;
 
     let metrics = PollerMetrics::new(&metric_registry);
@@ -149,6 +181,17 @@ async fn run(args: InventoryPollerArgs) {
                 // serve queries now (idempotent thereafter).
                 if let Some(ready) = &first_tick_ready {
                     ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Publish the advanced cursors so a co-located compactor stamps
+                // them as the checkpoint high-water. Always <= what snapshot_all()
+                // reflects (cursors advance only via folds already applied to the
+                // shared PersistedFiles), so the checkpoint base is never ahead of
+                // its marks — the safe direction.
+                if let Some(out) = &watermarks_out {
+                    *out.write() = InventoryWatermarks {
+                        wal: wal_cursors.clone(),
+                        compaction: compaction_cursor.clone(),
+                    };
                 }
             }
             Err(e) => {
@@ -353,6 +396,7 @@ mod tests {
             wal_tail: None,
             metric_registry: Arc::new(metric::Registry::default()),
             first_tick_ready: None,
+            watermarks_out: None,
         });
 
         inv.publish_wal_snapshot("w1", &snap("w1", 1, "a.parquet"))
@@ -397,6 +441,7 @@ mod tests {
             wal_tail: None,
             metric_registry: Arc::new(metric::Registry::default()),
             first_tick_ready: Some(Arc::clone(&ready)),
+            watermarks_out: None,
         });
 
         let mut flipped = false;
@@ -408,6 +453,49 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(flipped, "readiness flag should flip after the first tick");
+
+        shutdown_mgr.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn publishes_watermarks_after_tick() {
+        let object_store = Arc::new(InMemory::new());
+        let inv = SharedInventory::new(object_store.clone());
+        let persisted = Arc::new(PersistedFiles::new(None));
+        let catalog = Arc::new(Catalog::new_in_memory("test").await.unwrap());
+        let watermarks = InventoryWatermarks::shared(HashMap::new(), None);
+        let shutdown_mgr = ShutdownManager::new_testing();
+
+        inv.publish_wal_snapshot("w1", &snap("w1", 7, "a.parquet"))
+            .await
+            .unwrap();
+
+        let handle = spawn(InventoryPollerArgs {
+            inventory: inv.clone(),
+            persisted_files: Arc::clone(&persisted),
+            catalog: Arc::clone(&catalog),
+            interval: Duration::from_millis(20),
+            initial_wal_watermarks: HashMap::new(),
+            initial_compaction_watermark: None,
+            shutdown: shutdown_mgr.register(),
+            wal_tail: None,
+            metric_registry: Arc::new(metric::Registry::default()),
+            first_tick_ready: None,
+            watermarks_out: Some(Arc::clone(&watermarks)),
+        });
+
+        // After folding the published snapshot, the poller republishes its
+        // advanced cursor for w1.
+        let mut got = None;
+        for _ in 0..200 {
+            if let Some(seq) = watermarks.read().wal.get("w1").copied() {
+                got = Some(seq);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(got, Some(7), "poller should publish w1 high-water = 7");
 
         shutdown_mgr.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;

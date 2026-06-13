@@ -190,6 +190,10 @@ pub struct CompactionService {
     time_provider: Arc<dyn iox_time::TimeProvider>,
     shutdown_token: influxdb3_shutdown::ShutdownToken,
     metrics: CompactionMetrics,
+    /// Live inventory-poller cursors for this node, stamped as the high-water
+    /// marks of the checkpoint we write. `None` leaves the marks empty (loaders
+    /// then replay the full manifest history on top of `merged_snapshot`).
+    inventory_watermarks: Option<crate::inventory_poller::SharedInventoryWatermarks>,
 }
 
 impl CompactionService {
@@ -218,6 +222,7 @@ impl CompactionService {
             time_provider,
             shutdown_token,
             metrics: CompactionMetrics::new(&metric_registry),
+            inventory_watermarks: None,
         }
     }
 
@@ -225,6 +230,17 @@ impl CompactionService {
     /// acquisition + refresh in the background before calling [`Self::start`].
     pub fn with_lease(mut self, lease: Arc<Lease>) -> Self {
         self.lease = Some(lease);
+        self
+    }
+
+    /// Share the co-located inventory poller's live cursors, written as the
+    /// high-water marks of each checkpoint so loaders can trust `merged_snapshot`
+    /// and skip manifests at or below them.
+    pub fn with_inventory_watermarks(
+        mut self,
+        watermarks: crate::inventory_poller::SharedInventoryWatermarks,
+    ) -> Self {
+        self.inventory_watermarks = Some(watermarks);
         self
     }
 
@@ -409,14 +425,24 @@ impl CompactionService {
             }
         }
 
-        // Per-node WAL high-water marks: the largest snapshot sequence number
-        // we have folded into our view. We don't track this perfectly today
-        // (the manifest doesn't expose source per-file), so we conservatively
-        // leave the map empty — loaders fall back to the per-node `load_snapshots`
-        // for safety.
+        // High-water marks from the co-located inventory poller's live cursors:
+        // how far our PersistedFiles view has folded. These are always <= what
+        // `merged_snapshot` reflects (cursors only advance via folds already
+        // applied to the shared view), so a loader skipping manifests <= these
+        // marks never misses a removal that `merged_snapshot` hasn't already
+        // absorbed. Absent the handle, leave them empty (loaders replay the full
+        // history on top — correct, just slower).
+        let (wal_high_water, compactions_high_water) = self
+            .inventory_watermarks
+            .as_ref()
+            .map(|w| {
+                let g = w.read();
+                (g.wal.clone(), g.compaction.clone())
+            })
+            .unwrap_or_default();
         let cp = crate::shared_inventory::Checkpoint {
-            wal_high_water: Default::default(),
-            compactions_high_water: None,
+            wal_high_water,
+            compactions_high_water,
             merged_snapshot: merged,
         };
         inv.write_checkpoint(&cp).await?;

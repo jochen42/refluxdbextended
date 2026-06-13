@@ -1557,6 +1557,19 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         None
     };
 
+    // Shared inventory high-water handle: the inventory poller publishes its
+    // live cursors here and the compactor stamps them into each checkpoint it
+    // writes. Only the multi-node compactor writes checkpoints, so only it needs
+    // the handle; seed it with the boot-load cursors.
+    let inventory_watermarks: Option<
+        influxdb3_write::inventory_poller::SharedInventoryWatermarks,
+    > = matches!(config.mode, NodeMode::Compactor).then(|| {
+        influxdb3_write::inventory_poller::InventoryWatermarks::shared(
+            write_buffer_impl.initial_wal_watermarks(),
+            write_buffer_impl.initial_compaction_watermark(),
+        )
+    });
+
     // Inventory poller: pulls peer WAL snapshots + compaction manifests into
     // PersistedFiles + catalog without a restart. Only meaningful in modes
     // that share an inventory namespace.
@@ -1590,6 +1603,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
                     wal_tail: wal_tail_buffer.clone(),
                     metric_registry: Arc::clone(&metrics),
                     first_tick_ready,
+                    watermarks_out: inventory_watermarks.clone(),
                 },
             );
         }
@@ -1685,6 +1699,9 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         );
         if let Some(inv) = &shared_inventory {
             compaction_service = compaction_service.with_shared_inventory(inv.clone());
+        }
+        if let Some(w) = &inventory_watermarks {
+            compaction_service = compaction_service.with_inventory_watermarks(Arc::clone(w));
         }
 
         // Advisory compactor lease. Skipped when TTL=0 (single-node operator
