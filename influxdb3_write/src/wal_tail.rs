@@ -24,7 +24,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use data_types::{ChunkId, ChunkOrder, PartitionHashId, PartitionKey};
+use arrow::array::RecordBatch;
+use data_types::{ChunkId, ChunkOrder, PartitionHashId, PartitionKey, TimestampMinMax};
 use datafusion::common::DataFusionError;
 use influxdb3_catalog::catalog::{Catalog, DatabaseSchema, TableDefinition};
 use influxdb3_shutdown::ShutdownToken;
@@ -268,8 +269,19 @@ impl WalTailBuffer {
         chunk_order: i64,
     ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError> {
         let influx_schema = table_def.influx_schema();
-        let mut out: Vec<Arc<dyn QueryChunk>> = Vec::new();
         let guard = self.state.read();
+
+        // Coalesce batches across every un-persisted WAL file (and writer) by
+        // partition (chunk_time) into one chunk per partition. The tail holds up
+        // to --wal-tail-max-files files; emitting one chunk per (file x partition)
+        // — as before — fans a single partition out into thousands of tiny chunks,
+        // and the downstream dedup/merge then pays per-chunk overhead that
+        // dominates query latency (the reason a large tail is slow). `files` is a
+        // BTreeMap keyed by WAL sequence, so iteration is chronological: newer
+        // writes land later in each partition's batch vec, and dedup (last in scan
+        // order wins) keeps them.
+        let mut by_partition: std::collections::HashMap<i64, (TimestampMinMax, Vec<RecordBatch>)> =
+            std::collections::HashMap::new();
         for (_writer, tail) in guard.iter() {
             for (_seq, state) in tail.files.iter() {
                 let Some(db_buffer) = state.db_to_table.get(&db_schema.id) else {
@@ -278,36 +290,52 @@ impl WalTailBuffer {
                 let Some(table_buffer) = db_buffer.get(&table_def.table_id) else {
                     continue;
                 };
+                // Skip a whole file's buffer before materializing anything when it
+                // doesn't overlap the query's time window — this is what makes a
+                // large tail cheap for time-bounded (recent) queries.
+                let buffer_tmm = table_buffer.timestamp_min_max();
+                if !filter.test_time_stamp_min_max(buffer_tmm.min, buffer_tmm.max) {
+                    continue;
+                }
                 let partitioned = table_buffer
                     .partitioned_record_batches(Arc::clone(&table_def), filter)
                     .map_err(|e| {
                         DataFusionError::Execution(format!("wal tail batches: {e}"))
                     })?;
-                for (_, (ts_min_max, batches)) in partitioned {
+                for (chunk_time, (ts_min_max, batches)) in partitioned {
                     if batches.is_empty() {
                         continue;
                     }
-                    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-                    let stats = create_chunk_statistics(
-                        Some(row_count),
-                        influx_schema,
-                        Some(ts_min_max),
-                        &NoColumnRanges,
-                    );
-                    out.push(Arc::new(BufferChunk {
-                        batches,
-                        schema: influx_schema.clone(),
-                        stats: Arc::new(stats),
-                        partition_id: PartitionHashId::new(
-                            data_types::TableId::new(0),
-                            &PartitionKey::from("wal-tail".to_string()),
-                        ),
-                        sort_key: None,
-                        id: ChunkId::new(),
-                        chunk_order: ChunkOrder::new(chunk_order),
-                    }) as Arc<dyn QueryChunk>);
+                    let entry = by_partition
+                        .entry(chunk_time)
+                        .or_insert_with(|| (ts_min_max, Vec::new()));
+                    entry.0 = entry.0.union(&ts_min_max);
+                    entry.1.extend(batches);
                 }
             }
+        }
+
+        let mut out: Vec<Arc<dyn QueryChunk>> = Vec::with_capacity(by_partition.len());
+        for (_chunk_time, (ts_min_max, batches)) in by_partition {
+            let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let stats = create_chunk_statistics(
+                Some(row_count),
+                influx_schema,
+                Some(ts_min_max),
+                &NoColumnRanges,
+            );
+            out.push(Arc::new(BufferChunk {
+                batches,
+                schema: influx_schema.clone(),
+                stats: Arc::new(stats),
+                partition_id: PartitionHashId::new(
+                    data_types::TableId::new(0),
+                    &PartitionKey::from("wal-tail".to_string()),
+                ),
+                sort_key: None,
+                id: ChunkId::new(),
+                chunk_order: ChunkOrder::new(chunk_order),
+            }) as Arc<dyn QueryChunk>);
         }
         Ok(out)
     }
@@ -366,5 +394,145 @@ mod tests {
         let tail = WalTailBuffer::new(store, catalog, vec![], 16);
         let applied = tail.tick().await.unwrap();
         assert_eq!(applied, 0);
+    }
+
+    use crate::chunk::BufferChunk;
+    use crate::test_helpers::TestWriter;
+    use influxdb3_wal::WalOp;
+
+    /// Build a tail buffer with `n_files` WAL files, each replaying `op`, under a
+    /// single writer.
+    fn tail_with_n_files(
+        catalog: &Arc<Catalog>,
+        op: &WalOp,
+        n_files: u64,
+    ) -> Arc<WalTailBuffer> {
+        let buf = WalTailBuffer::new(
+            Arc::new(InMemory::new()),
+            Arc::clone(catalog),
+            vec!["w1".to_string()],
+            n_files as usize,
+        );
+        let mut wt = WriterTail::new();
+        for seq in 1..=n_files {
+            wt.add_file(
+                WalFileSequenceNumber::new(seq),
+                std::slice::from_ref(op),
+                Arc::clone(catalog),
+                n_files as usize,
+                0,
+            );
+        }
+        buf.state.write().insert("w1".to_string(), wt);
+        buf
+    }
+
+    fn total_rows(chunks: &[Arc<dyn QueryChunk>]) -> usize {
+        chunks
+            .iter()
+            .map(|c| {
+                c.as_any()
+                    .downcast_ref::<BufferChunk>()
+                    .unwrap()
+                    .batches
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn coalesces_tail_chunks_per_partition() {
+        let catalog = Arc::new(Catalog::new_in_memory("t").await.unwrap());
+        let writer = TestWriter::new_with_catalog(Arc::clone(&catalog));
+        // All rows fall in the same gen1 partition (tiny, close timestamps).
+        let batch = writer
+            .write_lp_to_write_batch("cpu,host=a usage=1i 1000", 0)
+            .await;
+        let buf = tail_with_n_files(&catalog, &WalOp::Write(batch), 5);
+
+        let db_schema = catalog.db_schema(TestWriter::DB_NAME).unwrap();
+        let table_def = db_schema.table_definition("cpu").unwrap();
+        let filter = ChunkFilter::new(&table_def, &[]).unwrap();
+
+        let chunks = buf
+            .get_table_chunks(Arc::clone(&db_schema), Arc::clone(&table_def), &filter, 0)
+            .unwrap();
+
+        // 5 WAL files, one partition -> ONE coalesced chunk (was 5 per-file
+        // chunks before the fix), and every row is preserved.
+        assert_eq!(chunks.len(), 1, "tail chunks coalesce to one per partition");
+        assert_eq!(total_rows(&chunks), 5, "all rows preserved across files");
+    }
+
+    #[tokio::test]
+    async fn time_prunes_non_overlapping_tail_files() {
+        let catalog = Arc::new(Catalog::new_in_memory("t").await.unwrap());
+        let writer = TestWriter::new_with_catalog(Arc::clone(&catalog));
+        // Data at t=1000ns.
+        let batch = writer
+            .write_lp_to_write_batch("cpu,host=a usage=1i 1000", 0)
+            .await;
+        let buf = tail_with_n_files(&catalog, &WalOp::Write(batch), 3);
+
+        let db_schema = catalog.db_schema(TestWriter::DB_NAME).unwrap();
+        let table_def = db_schema.table_definition("cpu").unwrap();
+
+        // Window entirely after the data -> every file pruned, no materialization.
+        let mut future = ChunkFilter::new(&table_def, &[]).unwrap();
+        future.time_lower_bound_ns = Some(1_000_000_000_000);
+        let pruned = buf
+            .get_table_chunks(Arc::clone(&db_schema), Arc::clone(&table_def), &future, 0)
+            .unwrap();
+        assert!(pruned.is_empty(), "non-overlapping files are pruned");
+
+        // Overlapping window -> data returned.
+        let mut overlap = ChunkFilter::new(&table_def, &[]).unwrap();
+        overlap.time_lower_bound_ns = Some(0);
+        let kept = buf
+            .get_table_chunks(Arc::clone(&db_schema), Arc::clone(&table_def), &overlap, 0)
+            .unwrap();
+        assert_eq!(kept.len(), 1, "overlapping window returns the partition");
+        assert_eq!(total_rows(&kept), 3);
+    }
+
+    /// Unit-test benchmark: with a large tail (many un-persisted WAL files all
+    /// touching one partition), the old code emitted one chunk per file — the
+    /// fan-out that made a big tail slow downstream (dedup/merge cost scales with
+    /// chunk count). Confirm the new code collapses it to a single chunk and stays
+    /// fast. Run with: `cargo test -p influxdb3_write bench_tail_get_table_chunks -- --nocapture`.
+    #[tokio::test]
+    async fn bench_tail_get_table_chunks_at_scale() {
+        let catalog = Arc::new(Catalog::new_in_memory("t").await.unwrap());
+        let writer = TestWriter::new_with_catalog(Arc::clone(&catalog));
+        let batch = writer
+            .write_lp_to_write_batch("cpu,host=a usage=1i 1000", 0)
+            .await;
+
+        let db_schema = catalog.db_schema(TestWriter::DB_NAME).unwrap();
+        let table_def = db_schema.table_definition("cpu").unwrap();
+        let filter = ChunkFilter::new(&table_def, &[]).unwrap();
+
+        for n_files in [100u64, 1000, 2000] {
+            let buf = tail_with_n_files(&catalog, &WalOp::Write(batch.clone()), n_files);
+            let start = std::time::Instant::now();
+            let chunks = buf
+                .get_table_chunks(Arc::clone(&db_schema), Arc::clone(&table_def), &filter, 0)
+                .unwrap();
+            let elapsed = start.elapsed();
+            println!(
+                "tail get_table_chunks: files={n_files:>4}  chunks_emitted={:>4} \
+                 (pre-fix would be {n_files})  rows={:>5}  elapsed={elapsed:?}",
+                chunks.len(),
+                total_rows(&chunks),
+            );
+            assert_eq!(
+                chunks.len(),
+                1,
+                "one partition coalesces to one chunk regardless of file count"
+            );
+            assert_eq!(total_rows(&chunks), n_files as usize);
+        }
     }
 }
