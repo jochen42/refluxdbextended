@@ -392,6 +392,24 @@ impl CompactionService {
             return Ok(());
         };
 
+        // Capture the high-water cursor FIRST, before validate + snapshot_all.
+        // The cursor only advances via folds applied to the shared PersistedFiles,
+        // and merged_snapshot is taken later, so merged always reflects at least
+        // as much folding as these marks (merged >= high_water). A loader then
+        // skips manifests <= high_water knowing merged already absorbed them; it
+        // may idempotently re-apply a few folded after this read. Reading the
+        // cursor AFTER snapshot_all would invert this — the poller could advance
+        // in between, leaving high_water ahead of merged so a loader skips a
+        // removal merged still reflects (a phantom) or an add it lacks.
+        let (wal_high_water, compactions_high_water) = self
+            .inventory_watermarks
+            .as_ref()
+            .map(|w| {
+                let g = w.read();
+                (g.wal.clone(), g.compaction.clone())
+            })
+            .unwrap_or_default();
+
         // Validate the live view against object store and evict phantom refs
         // BEFORE materializing the checkpoint. `merged_snapshot` carries no
         // `removed_files`, so any compaction-deleted (or never-uploaded) parquet
@@ -425,21 +443,6 @@ impl CompactionService {
             }
         }
 
-        // High-water marks from the co-located inventory poller's live cursors:
-        // how far our PersistedFiles view has folded. These are always <= what
-        // `merged_snapshot` reflects (cursors only advance via folds already
-        // applied to the shared view), so a loader skipping manifests <= these
-        // marks never misses a removal that `merged_snapshot` hasn't already
-        // absorbed. Absent the handle, leave them empty (loaders replay the full
-        // history on top — correct, just slower).
-        let (wal_high_water, compactions_high_water) = self
-            .inventory_watermarks
-            .as_ref()
-            .map(|w| {
-                let g = w.read();
-                (g.wal.clone(), g.compaction.clone())
-            })
-            .unwrap_or_default();
         let cp = crate::shared_inventory::Checkpoint {
             wal_high_water,
             compactions_high_water,
