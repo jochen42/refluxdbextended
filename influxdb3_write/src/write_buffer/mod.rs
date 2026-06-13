@@ -57,7 +57,7 @@ use object_store::{ObjectMeta, ObjectStore, path::Path as ObjPath};
 use observability_deps::tracing::{debug, info, trace, warn};
 use parquet_file::storage::DataSourceExecInput;
 use queryable_buffer::QueryableBufferArgs;
-use schema::Schema;
+use schema::{Schema, sort::SortKey};
 use std::{
     borrow::Borrow,
     num::{NonZeroU64, NonZeroUsize},
@@ -662,6 +662,9 @@ impl WriteBufferImpl {
                 self.persister.object_store_url().clone(),
                 self.persister.object_store(),
                 chunk_order,
+                // Files are persisted/compacted sorted by the table sort key, so
+                // declaring it lets the query merge them instead of re-sorting.
+                (!table_def.sort_key.is_empty()).then(|| table_def.sort_key.clone()),
             );
 
             chunks.push(Arc::new(parquet_chunk));
@@ -720,6 +723,14 @@ pub fn parquet_chunk_from_file(
     object_store_url: ObjectStoreUrl,
     object_store: Arc<dyn ObjectStore>,
     chunk_order: i64,
+    // Sort key the file's rows are physically ordered by. Persist
+    // (`sort_dedupe_persist`) and compaction both sort by the table sort key
+    // (series key + time) via `ReorgPlanner` before writing, so declaring it
+    // here lets DataFusion merge the already-sorted files for de-duplication
+    // instead of fully re-sorting every row. New series-key columns are only
+    // ever appended (before `time`) and are constant-null in older files, so an
+    // older file stays correctly ordered under a later, longer sort key.
+    sort_key: Option<SortKey>,
 ) -> ParquetChunk {
     let partition_key = data_types::PartitionKey::from(parquet_file.chunk_time.to_string());
     let partition_id = PartitionHashId::new(data_types::TableId::new(0), &partition_key);
@@ -749,7 +760,7 @@ pub fn parquet_chunk_from_file(
         schema: table_schema.clone(),
         stats: Arc::new(chunk_stats),
         partition_id,
-        sort_key: None,
+        sort_key,
         id: ChunkId::new(),
         chunk_order: ChunkOrder::new(chunk_order),
         parquet_exec,

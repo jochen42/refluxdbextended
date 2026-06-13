@@ -712,6 +712,85 @@ mod test {
         );
     }
 
+    /// Declaring a chunk's `sort_key` (the order its parquet was written in) lets
+    /// DataFusion satisfy the dedup's required ordering by *merging* the already
+    /// sorted files (`SortPreservingMergeExec`) instead of fully re-sorting every
+    /// row (`SortExec`). This is the perf fix for slow wide aggregations: the
+    /// fork's `parquet_chunk_from_file` previously declared `sort_key: None`,
+    /// forcing a full sort of millions of rows for de-duplication.
+    #[tokio::test]
+    async fn declared_sort_key_merges_instead_of_full_resort() {
+        use crate::exec::Executor;
+        use datafusion::catalog::TableProvider;
+
+        // two parquet chunks, each sorted by [tag, time], OVERLAPPING in time so
+        // a cross-file dedup is required.
+        fn make(id: u128, tmin: i64, tmax: i64, declare_sort_key: bool) -> Arc<dyn QueryChunk> {
+            let c = TestChunk::new("t")
+                .with_id(id)
+                .with_order(id as i64)
+                .with_dummy_parquet_file()
+                .with_tag_column("tag")
+                .with_f64_field_column("field")
+                .with_time_column_with_stats(Some(tmin), Some(tmax));
+            let c = if declare_sort_key {
+                c.with_sort_key(SortKey::from_columns(["tag", "time"]))
+            } else {
+                c
+            };
+            Arc::new(c) as Arc<dyn QueryChunk>
+        }
+
+        async fn count_execs(chunks: Vec<Arc<dyn QueryChunk>>) -> (usize, usize) {
+            let executor = Executor::new_testing();
+            let ctx = executor.new_context();
+            let provider = chunks
+                .iter()
+                .fold(
+                    ProviderBuilder::new(Arc::from("t"), chunks[0].schema().clone()),
+                    |b, c| b.add_chunk(Arc::clone(c)),
+                )
+                .build()
+                .unwrap();
+            ctx.inner()
+                .register_table("t", Arc::new(provider) as Arc<dyn TableProvider>)
+                .unwrap();
+            let plan = ctx
+                .inner()
+                .sql("SELECT tag, time, field FROM t")
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let lines = format_execution_plan(&plan);
+            // count *full* sorts (SortExec, not SortPreservingMergeExec)
+            let full_sorts = lines
+                .iter()
+                .filter(|l| l.contains("SortExec"))
+                .count();
+            let merges = lines
+                .iter()
+                .filter(|l| l.contains("SortPreservingMergeExec"))
+                .count();
+            (full_sorts, merges)
+        }
+
+        let (sorts_declared, merges_declared) =
+            count_execs(vec![make(1, 0, 100, true), make(2, 50, 150, true)]).await;
+        let (sorts_none, _merges_none) =
+            count_execs(vec![make(1, 0, 100, false), make(2, 50, 150, false)]).await;
+
+        assert!(
+            sorts_declared < sorts_none,
+            "declared sort key should remove full re-sorts: declared={sorts_declared} none={sorts_none}"
+        );
+        assert!(
+            merges_declared >= 1,
+            "declared sort key should merge pre-sorted files (got {merges_declared} merges)"
+        );
+    }
+
     /// End-to-end timing comparison of the *existing* `SplitDedup` optimizer
     /// rule firing vs not. Both runs go through the real IOx planning + optimizer
     /// + executor (via `Executor::new_context`). The only difference is whether

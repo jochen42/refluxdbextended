@@ -648,7 +648,9 @@ impl CompactionService {
         let total_input_size: u64 = job.files.iter().map(|f| f.size_bytes).sum();
 
         // Build chunks and run the compaction plan.
-        let chunks = self.create_chunks_from_files(&job.files, &job.schema).await?;
+        let chunks = self
+            .create_chunks_from_files(&job.files, &job.schema, &job.sort_key)
+            .await?;
         // The iox_query default `max_parquet_fanout` (40) is far below a
         // bounded job's input count, which forces a full re-sort of every
         // input. Raise it to the job size so the pre-sorted parquet path
@@ -765,6 +767,7 @@ impl CompactionService {
         &self,
         files: &[ParquetFile],
         schema: &Schema,
+        sort_key: &SortKey,
     ) -> Result<Vec<Arc<dyn iox_query::QueryChunk>>> {
         let mut chunks = Vec::with_capacity(files.len());
 
@@ -775,6 +778,9 @@ impl CompactionService {
                 self.persister.object_store_url().clone(),
                 Arc::clone(&self.object_store),
                 i as i64,
+                // Compaction inputs are themselves sorted by the table sort key;
+                // declaring it lets the compaction plan merge rather than re-sort.
+                (!sort_key.is_empty()).then(|| sort_key.clone()),
             );
             chunks.push(Arc::new(chunk) as Arc<dyn iox_query::QueryChunk>);
         }
