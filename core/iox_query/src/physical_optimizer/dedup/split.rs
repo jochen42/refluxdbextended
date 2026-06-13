@@ -17,7 +17,7 @@ use datafusion::{
 };
 use hashbrown::HashMap;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[derive(Debug, Default)]
 pub struct SplitDedup;
@@ -49,6 +49,27 @@ impl PhysicalOptimizerRule for SplitDedup {
             let groups = detect_dedup_requirement(groups);
             let groups = sort_groups(groups);
             let groups = fuse_groups(groups);
+
+            // Diagnostic (enable with RUST_LOG=...split_dedup=debug): the costly
+            // case is a `needs_dedup` group holding many chunks over a wide time
+            // span -- e.g. un-compacted backfill overlapping compacted
+            // generations -- which becomes one big sort. Surfaces the widest
+            // such group so prod can tell *why* a dedup stayed large (overlap)
+            // vs cleanly split.
+            {
+                let widest_dedup_group = groups
+                    .iter()
+                    .filter(|g| g.needs_dedup)
+                    .map(|g| (g.group.len(), group_time_span(&g.group)))
+                    .max_by_key(|(n, _)| *n);
+                debug!(
+                    total_chunks = groups.iter().map(|g| g.group.len()).sum::<usize>(),
+                    n_groups = groups.len(),
+                    dedup_groups = groups.iter().filter(|g| g.needs_dedup).count(),
+                    ?widest_dedup_group,
+                    "split_dedup grouping",
+                );
+            }
 
             // Protect against degenerative plans
             let max_dedup_split = config
@@ -109,6 +130,15 @@ impl PhysicalOptimizerRule for SplitDedup {
 
 /// A group of [`QueryChunk`]s.
 type Group = Vec<Arc<dyn QueryChunk>>;
+
+/// Combined `[min, max]` timestamp across a group's chunks, if any report one.
+fn group_time_span(group: &Group) -> Option<(i64, i64)> {
+    group
+        .iter()
+        .filter_map(|c| timestamp_min_max(c.as_ref()))
+        .map(|mm| (mm.min, mm.max))
+        .reduce(|(amin, amax), (bmin, bmax)| (amin.min(bmin), amax.max(bmax)))
+}
 
 /// A [`Group`] with a flag that indicates if de-duplication is required.
 struct GroupWithDedupFlag {

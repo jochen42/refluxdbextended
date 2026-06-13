@@ -649,6 +649,16 @@ impl TestChunk {
         self
     }
 
+    /// Attach a pre-built record batch as (part of) this chunk's data.
+    ///
+    /// The `with_*_rows_of_data` helpers only emit a handful of rows; this lets
+    /// benchmarks/tests supply large, controlled batches. The batch schema must
+    /// match the chunk's registered column schema.
+    pub fn with_record_batch(mut self, batch: RecordBatch) -> Self {
+        self.push_record_batch(batch);
+        self
+    }
+
     /// Register a tag column with stats with the test chunk
     pub fn with_tag_column_with_nulls_and_full_stats(
         self,

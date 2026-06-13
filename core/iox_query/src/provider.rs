@@ -230,6 +230,9 @@ impl TableProvider for ChunkTableProvider {
         );
 
         // De-dup before doing anything else, because all logical expressions act on de-duplicated data.
+        // NOTE: this wraps *all* chunks in a single `DeduplicateExec`; the
+        // `SplitDedup` physical-optimizer rule later splits it per time-overlap
+        // group and drops it entirely for non-overlapping chunks.
         let plan = if self.deduplication {
             let sort_exprs = arrow_sort_key_exprs(&dedup_sort_key, &plan.schema())
                 .ok_or_else(|| plan_datafusion_err!("de-dup with empty sort key"))?;
@@ -616,6 +619,298 @@ mod test {
         - "         RecordBatchesExec: chunks=1, projection=[field, tag1, tag2, time, __chunk_order]"
         - "         DataSourceExec: file_groups={1 group: [[2.parquet]]}, projection=[field, tag1, tag2, time, __chunk_order], output_ordering=[__chunk_order@4 ASC], file_type=parquet"
         "#
+        );
+    }
+
+    /// The `SplitDedup` physical-optimizer rule must drop the `DeduplicateExec`
+    /// entirely when chunks are time-disjoint (no two can share a primary key),
+    /// yet keep it when some chunk's time range spans the others — exactly the
+    /// shape an un-compacted backfill file (wide data-time range) or a chunk
+    /// missing time-range stats produces. This pins the behaviour the slow
+    /// wide-aggregation investigation hinges on.
+    #[tokio::test]
+    async fn split_dedup_drops_dedup_for_disjoint_chunks() {
+        use crate::exec::Executor;
+        use datafusion::catalog::TableProvider;
+
+        // record-batch chunk over [tmin, tmax]; pass tmin/tmax = None to omit
+        // time-range stats (which forces every chunk into one overlap group).
+        fn make(id: u128, range: Option<(i64, i64)>) -> Arc<dyn QueryChunk> {
+            let base = TestChunk::new("t")
+                .with_id(id)
+                .with_order(id as i64)
+                .with_f64_field_column("field");
+            let base = match range {
+                Some((min, max)) => base.with_time_column_with_stats(Some(min), Some(max)),
+                None => base.with_time_column(),
+            };
+            Arc::new(base) as Arc<dyn QueryChunk>
+        }
+
+        async fn dedup_nodes(executor: &Executor, chunks: Vec<Arc<dyn QueryChunk>>) -> usize {
+            let ctx = executor.new_context();
+            let provider = chunks
+                .iter()
+                .fold(
+                    ProviderBuilder::new(Arc::from("t"), chunks[0].schema().clone()),
+                    |b, c| b.add_chunk(Arc::clone(c)),
+                )
+                .build()
+                .unwrap();
+            ctx.inner()
+                .register_table("t", Arc::new(provider) as Arc<dyn TableProvider>)
+                .unwrap();
+            let plan = ctx
+                .inner()
+                .sql("SELECT count(1), avg(field) FROM t")
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            format_execution_plan(&plan)
+                .iter()
+                .filter(|l| l.contains("DeduplicateExec"))
+                .count()
+        }
+
+        let executor = Executor::new_testing();
+
+        // disjoint -> SplitDedup removes the dedup entirely
+        let disjoint = vec![
+            make(1, Some((0, 100))),
+            make(2, Some((1_000, 1_100))),
+            make(3, Some((2_000, 2_100))),
+        ];
+        assert_eq!(
+            dedup_nodes(&executor, disjoint).await,
+            0,
+            "time-disjoint chunks must not be deduplicated"
+        );
+
+        // one chunk spanning all others (un-compacted backfill) -> dedup remains
+        let backfill = vec![
+            make(1, Some((0, 100))),
+            make(2, Some((1_000, 1_100))),
+            make(3, Some((2_000, 2_100))),
+            make(4, Some((0, 2_100))),
+        ];
+        assert!(
+            dedup_nodes(&executor, backfill).await >= 1,
+            "a chunk spanning all others must force deduplication"
+        );
+
+        // a chunk missing time-range stats -> all lumped together -> dedup remains
+        let no_stats = vec![
+            make(1, Some((0, 100))),
+            make(2, Some((1_000, 1_100))),
+            make(3, None),
+        ];
+        assert!(
+            dedup_nodes(&executor, no_stats).await >= 1,
+            "a chunk without time-range stats must force deduplication"
+        );
+    }
+
+    /// End-to-end timing comparison of the *existing* `SplitDedup` optimizer
+    /// rule firing vs not. Both runs go through the real IOx planning + optimizer
+    /// + executor (via `Executor::new_context`). The only difference is whether
+    /// chunks carry time-range stats:
+    ///
+    /// * with stats, time-disjoint  -> `SplitDedup` splits, the historical
+    ///   chunks skip dedup, and the giant global sort disappears (FAST);
+    /// * without stats              -> `group_potential_duplicates` lumps every
+    ///   chunk into one group, `SplitDedup` can't split, and all rows go through
+    ///   one `DeduplicateExec` + sort (SLOW).
+    ///
+    /// This reproduces the production slow-aggregation: a single chunk whose
+    /// time range spans everything (un-compacted backfill, or a chunk missing
+    /// time stats) defeats `SplitDedup` and forces the whole scan through one
+    /// sort. Models many time-disjoint compacted generations plus a small
+    /// recent, overlapping write window.
+    ///
+    /// Ignored by default (timing + heavy); run with:
+    ///   cargo test -p iox_query --lib bench_split_dedup -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn bench_split_dedup_fires_vs_defeated() {
+        use crate::exec::Executor;
+        use arrow::array::{ArrayRef, Float64Array, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType, SchemaRef};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::catalog::TableProvider;
+        use std::time::Instant;
+
+        const ROWS_PER_CHUNK: usize = 20_000;
+        const N_HISTORICAL: usize = 40; // time-disjoint compacted generations
+        const N_RECENT: usize = 4; // overlapping recent write window
+        const DT: i64 = 1_000_000; // 1ms between points
+        let span = ROWS_PER_CHUNK as i64 * DT;
+
+        fn gen_batch(schema: &SchemaRef, n: usize, t0: i64, dt: i64) -> RecordBatch {
+            let cols: Vec<ArrayRef> = schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    if f.name() == "time" {
+                        let times: Vec<i64> = (0..n as i64).map(|i| t0 + i * dt).collect();
+                        let arr = TimestampNanosecondArray::from(times);
+                        match f.data_type() {
+                            DataType::Timestamp(_, Some(tz)) => {
+                                Arc::new(arr.with_timezone(tz.clone())) as ArrayRef
+                            }
+                            _ => Arc::new(arr) as ArrayRef,
+                        }
+                    } else {
+                        // Deterministic, identical across chunks so dedup of the
+                        // overlapping recent rows leaves the average unchanged.
+                        let vals: Vec<f64> = (0..n).map(|i| (i % 97) as f64 + 0.5).collect();
+                        Arc::new(Float64Array::from(vals)) as ArrayRef
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(Arc::clone(schema), cols).unwrap()
+        }
+
+        // Build identical data either with or without time-range stats. With
+        // stats -> overlap-grouped (new). Without -> one group -> global (old).
+        let make_chunk = |id: u128, order: i64, tmin: i64, with_stats: bool| -> Arc<dyn QueryChunk> {
+            let tmax = tmin + (ROWS_PER_CHUNK as i64 - 1) * DT;
+            let base = TestChunk::new("tbl").with_f64_field_column("field");
+            let base = if with_stats {
+                base.with_time_column_with_stats(Some(tmin), Some(tmax))
+            } else {
+                base.with_time_column()
+            };
+            let schema = base.schema().as_arrow();
+            let batch = gen_batch(&schema, ROWS_PER_CHUNK, tmin, DT);
+            Arc::new(
+                base.with_record_batch(batch)
+                    .with_id(id)
+                    .with_order(order)
+                    .with_row_count(ROWS_PER_CHUNK as u64),
+            ) as Arc<dyn QueryChunk>
+        };
+
+        let recent_t0 = (N_HISTORICAL as i64 + 8) * span * 2; // well past history
+        let build = |with_stats: bool| -> Vec<Arc<dyn QueryChunk>> {
+            let mut v = Vec::with_capacity(N_HISTORICAL + N_RECENT);
+            for k in 0..N_HISTORICAL {
+                // disjoint: leave a full span gap between chunks
+                v.push(make_chunk(k as u128, k as i64, (k as i64) * span * 2, with_stats));
+            }
+            for r in 0..N_RECENT {
+                // all recent chunks cover the SAME range -> overlap + dup keys
+                v.push(make_chunk(
+                    (N_HISTORICAL + r) as u128,
+                    (N_HISTORICAL + r) as i64,
+                    recent_t0,
+                    with_stats,
+                ));
+            }
+            v
+        };
+
+        let executor = Executor::new_testing();
+        let ctx = executor.new_context();
+        let schema = build(true)[0].schema().clone();
+
+        for (name, with_stats) in [("tbl_nosplit", false), ("tbl_split", true)] {
+            let provider = ProviderBuilder::new(Arc::from("tbl"), schema.clone());
+            let provider = build(with_stats)
+                .into_iter()
+                .fold(provider, |b, c| b.add_chunk(c))
+                .build()
+                .unwrap();
+            ctx.inner()
+                .register_table(name, Arc::new(provider) as Arc<dyn TableProvider>)
+                .unwrap();
+        }
+
+        let run = |table: &'static str| {
+            let ctx = &ctx;
+            async move {
+                let sql = format!("SELECT count(1) AS n, avg(field) AS a FROM {table}");
+                let batches = ctx.inner().sql(&sql).await.unwrap().collect().await.unwrap();
+                let b = &batches[0];
+                let n = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap()
+                    .value(0);
+                let a = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(0);
+                (n, a)
+            }
+        };
+
+        // Show the planned shapes.
+        for table in ["tbl_nosplit", "tbl_split"] {
+            let sql = format!("SELECT count(1) AS n, avg(field) AS a FROM {table}");
+            let plan = ctx
+                .inner()
+                .sql(&sql)
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let dedups = format_execution_plan(&plan)
+                .iter()
+                .filter(|l| l.contains("DeduplicateExec"))
+                .count();
+            println!("[{table}] DeduplicateExec nodes in plan: {dedups}");
+        }
+
+        // Warm up + correctness: identical results whether or not SplitDedup fires.
+        let (n_old, a_old) = run("tbl_nosplit").await;
+        let (n_new, a_new) = run("tbl_split").await;
+        assert_eq!(n_old, n_new, "row counts must match (dedup correctness)");
+        assert!(
+            (a_old - a_new).abs() < 1e-9,
+            "averages must match: nosplit={a_old} split={a_new}"
+        );
+        println!(
+            "rows after dedup: {n_new} (from {} raw)",
+            (N_HISTORICAL + N_RECENT) * ROWS_PER_CHUNK
+        );
+
+        const ITERS: u32 = 6;
+        let time_it = |table: &'static str| {
+            let ctx = &ctx;
+            async move {
+                let mut best = std::time::Duration::MAX;
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..ITERS {
+                    let t = Instant::now();
+                    let sql = format!("SELECT count(1) AS n, avg(field) AS a FROM {table}");
+                    let _ = ctx.inner().sql(&sql).await.unwrap().collect().await.unwrap();
+                    let e = t.elapsed();
+                    best = best.min(e);
+                    total += e;
+                }
+                (best, total / ITERS)
+            }
+        };
+
+        let (old_best, old_avg) = time_it("tbl_nosplit").await;
+        let (new_best, new_avg) = time_it("tbl_split").await;
+
+        println!("\n=== SplitDedup defeated vs firing ===");
+        println!(
+            "chunks: {N_HISTORICAL} historical (disjoint) + {N_RECENT} recent (overlapping), {ROWS_PER_CHUNK} rows each"
+        );
+        println!("DEFEATED (no time stats -> 1 global dedup+sort): best={old_best:?} avg={old_avg:?}");
+        println!("FIRING   (disjoint -> historical skip dedup):    best={new_best:?} avg={new_avg:?}");
+        println!(
+            "speedup: {:.2}x (best), {:.2}x (avg)",
+            old_best.as_secs_f64() / new_best.as_secs_f64(),
+            old_avg.as_secs_f64() / new_avg.as_secs_f64(),
         );
     }
 }
