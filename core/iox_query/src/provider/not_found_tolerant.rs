@@ -60,13 +60,42 @@ struct NotFoundTolerantOpener {
 
 impl FileOpener for NotFoundTolerantOpener {
     fn open(&self, file: PartitionedFile) -> Result<FileOpenFuture> {
-        // For parquet the footer GET happens inside the open future, so a missing
-        // object surfaces as an error from `fut.await` (not mid-stream).
+        // A missing object can surface either at open (footer GET) or mid-stream
+        // (row-group GET when the footer was already cached before the object was
+        // deleted). Tolerate NotFound in both places: at open, yield an empty
+        // stream; mid-stream, end this file early. The surviving (higher-gen)
+        // file in the same plan supplies the rows.
         let path = file.object_meta.location.clone();
         let fut = self.inner.open(file)?;
         Ok(async move {
             match fut.await {
-                Ok(stream) => Ok(stream),
+                Ok(stream) => {
+                    let path = path.clone();
+                    let mut warned = false;
+                    let mapped = stream.scan(false, move |stopped, item| {
+                        if *stopped {
+                            return futures::future::ready(None);
+                        }
+                        match item {
+                            Ok(batch) => futures::future::ready(Some(Ok(batch))),
+                            Err(e) if is_object_store_not_found(&e) => {
+                                if !warned {
+                                    warn!(
+                                        %path,
+                                        "parquet object missing mid-scan; ending file \
+                                         early (stale ref, compaction-deleted)"
+                                    );
+                                    warned = true;
+                                }
+                                *stopped = true;
+                                futures::future::ready(None)
+                            }
+                            // Propagate any other error unchanged.
+                            Err(e) => futures::future::ready(Some(Err(e))),
+                        }
+                    });
+                    Ok(mapped.boxed())
+                }
                 Err(e) if is_object_store_not_found(&e) => {
                     warn!(
                         %path,
@@ -245,5 +274,86 @@ mod tests {
         assert!(!is_object_store_not_found(&e));
         let df = datafusion::error::DataFusionError::External("nope".into());
         assert!(!is_object_store_not_found(&df));
+    }
+
+    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::common::Result as DfResult;
+    use datafusion::datasource::listing::PartitionedFile;
+    use futures::StreamExt;
+    use std::sync::Arc;
+
+    fn one_row() -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new("v", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap()
+    }
+
+    fn not_found_err() -> datafusion::error::DataFusionError {
+        datafusion::error::DataFusionError::ObjectStore(Box::new(object_store::Error::NotFound {
+            path: "gone.parquet".to_string(),
+            source: "404".into(),
+        }))
+    }
+
+    /// A [`FileOpener`] whose stream yields the given items.
+    struct FakeOpener(Vec<DfResult<RecordBatch>>);
+    impl FileOpener for FakeOpener {
+        fn open(&self, _f: PartitionedFile) -> Result<FileOpenFuture> {
+            let items: Vec<DfResult<RecordBatch>> = self
+                .0
+                .iter()
+                .map(|r| match r {
+                    Ok(b) => Ok(b.clone()),
+                    Err(_) => Err(not_found_err()),
+                })
+                .collect();
+            Ok(async move { Ok(futures::stream::iter(items).boxed()) }.boxed())
+        }
+    }
+
+    fn dummy_file() -> PartitionedFile {
+        PartitionedFile::new("x.parquet".to_string(), 1)
+    }
+
+    async fn collect(opener: &NotFoundTolerantOpener) -> DfResult<Vec<RecordBatch>> {
+        let stream = opener.open(dummy_file()).unwrap().await?;
+        stream.collect::<Vec<_>>().await.into_iter().collect()
+    }
+
+    #[tokio::test]
+    async fn mid_stream_not_found_ends_file_early() {
+        // [row, NotFound, row] -> the file ends at the 404; the trailing row is
+        // dropped (it doesn't exist — the surviving gen supplies those rows).
+        // FakeOpener turns any `Err` item into an object-store NotFound.
+        let inner = Arc::new(FakeOpener(vec![
+            Ok(one_row()),
+            Err(datafusion::error::DataFusionError::External("nf".into())),
+            Ok(one_row()),
+        ]));
+        let opener = NotFoundTolerantOpener { inner };
+        let batches = collect(&opener).await.expect("must not error on NotFound");
+        assert_eq!(batches.len(), 1, "stops at the mid-stream NotFound");
+    }
+
+    #[tokio::test]
+    async fn mid_stream_other_error_propagates() {
+        struct OtherErrOpener;
+        impl FileOpener for OtherErrOpener {
+            fn open(&self, _f: PartitionedFile) -> Result<FileOpenFuture> {
+                Ok(async move {
+                    let items: Vec<DfResult<RecordBatch>> = vec![
+                        Ok(one_row()),
+                        Err(datafusion::error::DataFusionError::External("boom".into())),
+                    ];
+                    Ok(futures::stream::iter(items).boxed())
+                }
+                .boxed())
+            }
+        }
+        let opener = NotFoundTolerantOpener {
+            inner: Arc::new(OtherErrOpener),
+        };
+        let res = collect(&opener).await;
+        assert!(res.is_err(), "non-NotFound errors still propagate");
     }
 }
