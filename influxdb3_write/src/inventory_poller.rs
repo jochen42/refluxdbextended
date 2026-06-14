@@ -21,6 +21,13 @@ use influxdb3_shutdown::ShutdownToken;
 use observability_deps::tracing::{debug, warn};
 use tokio::task::JoinHandle;
 
+/// How often a querier republishes its liveness heartbeat, independent of how
+/// long a poll tick spends folding. Must stay well below the compactor's
+/// convergence `staleness_ttl` (300s) so that a multi-minute backfill fold can
+/// never age our heartbeat into "stale" — which would make the convergence gate
+/// treat this live querier as dead and delete files we still reference.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Debug)]
 pub struct InventoryPollerArgs {
     pub inventory: SharedInventory,
@@ -148,6 +155,45 @@ async fn run(args: InventoryPollerArgs) {
     let mut compaction_cursor = initial_compaction_watermark;
     let cancel = shutdown.clone_cancellation_token();
 
+    // Liveness heartbeat, decoupled from fold work. A poll tick can spend
+    // minutes folding a backlog under backfill; the heartbeat used to be written
+    // only after the tick, so it aged past the compactor's convergence
+    // `staleness_ttl` and the gate treated this live-but-busy querier as dead —
+    // deleting superseded files we still referenced and stranding queries with
+    // 404s. Firing on a fixed short interval from a shared cursor keeps us
+    // "live" while folding, so the gate keeps blocking deletion until we have
+    // actually converged. The cursor it reports only ever reflects compactions
+    // already applied to PersistedFiles (see `tick`), so it is never ahead of
+    // our real view.
+    let heartbeat_cursor = Arc::new(parking_lot::Mutex::new(compaction_cursor.clone()));
+    {
+        let node = heartbeat_node_id.clone();
+        let inv = inventory.clone();
+        let cursor = Arc::clone(&heartbeat_cursor);
+        let tp = Arc::clone(&time_provider);
+        let hb_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let Some(node_id) = node else { return };
+            loop {
+                let now_ms = tp.now().timestamp_millis();
+                // Clone out and drop the guard BEFORE the await: a parking_lot
+                // MutexGuard is !Send, and holding it across .await would make
+                // this future non-Send (tokio::spawn requires Send).
+                let cursor_now = cursor.lock().clone();
+                if let Err(e) = inv
+                    .write_consumer_heartbeat(&node_id, cursor_now, now_ms)
+                    .await
+                {
+                    warn!("failed to write consumer heartbeat: {}", e);
+                }
+                tokio::select! {
+                    _ = hb_cancel.cancelled() => return,
+                    _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {}
+                }
+            }
+        });
+    }
+
     loop {
         // Tick first (no initial sleep) so the loaded view converges with the
         // live inventory as soon as possible — this is what gates query
@@ -200,17 +246,12 @@ async fn run(args: InventoryPollerArgs) {
                         compaction: compaction_cursor.clone(),
                     };
                 }
-                // Heartbeat this querier's converged position so the compactor
-                // gates deletion of superseded files on us having folded them.
-                if let Some(node_id) = &heartbeat_node_id {
-                    let now_ms = time_provider.now().timestamp_millis();
-                    if let Err(e) = inventory
-                        .write_consumer_heartbeat(node_id, compaction_cursor.clone(), now_ms)
-                        .await
-                    {
-                        warn!("failed to write consumer heartbeat: {}", e);
-                    }
-                }
+                // Publish our converged compaction cursor for the liveness
+                // heartbeat task, which writes it to the shared inventory on its
+                // own cadence (see HEARTBEAT_INTERVAL) so the compactor's
+                // convergence gate can hold deletion of superseded files until
+                // we have folded them — without a long fold making us look dead.
+                *heartbeat_cursor.lock() = compaction_cursor.clone();
             }
             Err(e) => {
                 metrics.ticks.recorder(&[("result", "error")]).inc(1);
@@ -288,10 +329,7 @@ async fn tick(
         }
         applied.wal_snapshots += 1;
     }
-    if let Some((last_id, _)) = new_comp.last() {
-        *compaction_cursor = Some(last_id.clone());
-    }
-    for (_, s) in new_comp {
+    for (id, s) in new_comp {
         // Compaction manifests carry the highest covered WAL seq per source
         // writer too. `node_id` on these is the compactor's id; the actual
         // covered writer ids live inside `databases` -> tables -> files. We
@@ -306,6 +344,13 @@ async fn tick(
             let _ = (tail, wal_seq);
         }
         persisted_files.add_persisted_snapshot_files(s);
+        // Advance the cursor only AFTER the fold lands in PersistedFiles. The
+        // heartbeat task publishes this cursor to the convergence gate, whose
+        // guarantee ("cursor >= id ⇒ this querier has dropped that compaction's
+        // removed files") only holds if we never advertise an id we have not
+        // actually applied. (The old code pre-advanced to the last id before
+        // the fold loop, briefly over-reporting convergence.)
+        *compaction_cursor = Some(id);
         applied.compactions += 1;
     }
 
@@ -321,6 +366,7 @@ mod tests {
     use influxdb3_id::{DbId, TableId};
     use influxdb3_shutdown::ShutdownManager;
     use influxdb3_wal::{SnapshotSequenceNumber, WalFileSequenceNumber};
+    use iox_time::TimeProvider;
     use object_store::memory::InMemory;
 
     fn snap(node: &str, seq: u64, file_path: &str) -> PersistedSnapshot {
@@ -475,6 +521,61 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(flipped, "readiness flag should flip after the first tick");
+
+        shutdown_mgr.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn heartbeats_without_folding() {
+        // Liveness must not depend on fold completion. With a long poll interval
+        // and an empty inventory (nothing to fold), the dedicated heartbeat task
+        // must still publish a consumer heartbeat promptly — otherwise a querier
+        // mid-backfill-fold would look dead to the compactor's convergence gate.
+        let object_store = Arc::new(InMemory::new());
+        let inv = SharedInventory::new(object_store.clone());
+        let persisted = Arc::new(PersistedFiles::new(None));
+        let catalog = Arc::new(Catalog::new_in_memory("test").await.unwrap());
+        let shutdown_mgr = ShutdownManager::new_testing();
+        let tp = Arc::new(iox_time::SystemProvider::new());
+
+        let handle = spawn(InventoryPollerArgs {
+            inventory: inv.clone(),
+            persisted_files: Arc::clone(&persisted),
+            catalog: Arc::clone(&catalog),
+            // Deliberately long: the heartbeat must not be tied to poll ticks.
+            interval: Duration::from_secs(3600),
+            initial_wal_watermarks: HashMap::new(),
+            initial_compaction_watermark: Some("019ec000".to_string()),
+            shutdown: shutdown_mgr.register(),
+            wal_tail: None,
+            metric_registry: Arc::new(metric::Registry::default()),
+            first_tick_ready: None,
+            watermarks_out: None,
+            heartbeat_node_id: Some("querier-x".to_string()),
+            time_provider: Arc::clone(&tp) as Arc<dyn iox_time::TimeProvider>,
+        });
+
+        // The gate reports a live consumer lagging behind a higher compaction id
+        // only once our heartbeat (cursor "019ec000") has been written. An empty
+        // consumer set would instead report `true`, so a `false` proves liveness.
+        let now_ms = tp.now().timestamp_millis();
+        let mut saw_live_lagging = false;
+        for _ in 0..400 {
+            if !inv
+                .all_live_consumers_folded("019ec999", now_ms, 10_000_000)
+                .await
+                .unwrap()
+            {
+                saw_live_lagging = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_live_lagging,
+            "heartbeat task should publish a lagging consumer heartbeat without any fold"
+        );
 
         shutdown_mgr.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
