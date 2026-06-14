@@ -437,33 +437,9 @@ pub struct Config {
     )]
     pub ref_validation_interval: humantime::Duration,
 
-    /// Writer HTTP base URLs the querier will hit for hot in-memory rows
-    /// (Layer B). Comma-separated; empty disables Layer B. Required for
-    /// sub-second freshness in `--mode=querier`. Wire-format:
-    /// `http://writer-1:8181,http://writer-2:8181`.
-    #[clap(
-        long = "writer-urls",
-        env = "INFLUXDB3_WRITER_URLS",
-        value_delimiter = ',',
-        default_value = "",
-        action
-    )]
-    pub writer_urls: Vec<String>,
-
-    /// Per-request timeout for remote hot-chunks fetches. On miss, the query
-    /// continues with persisted + WAL-tail data without raising an error.
-    #[clap(
-        long = "remote-hot-timeout",
-        env = "INFLUXDB3_REMOTE_HOT_TIMEOUT",
-        default_value = "250ms",
-        action
-    )]
-    pub remote_hot_timeout: humantime::Duration,
-
     /// Writer node-id prefixes whose `_wal/` directories the querier should
-    /// tail (Layer C). Distinct from `--writer-urls` — these are object-store
-    /// path prefixes (e.g. `writer-1`), not hosts. Comma-separated; empty
-    /// disables Layer C.
+    /// tail (Layer C). These are object-store path prefixes (e.g.
+    /// `writer-1`), not hosts. Comma-separated; empty disables Layer C.
     #[clap(
         long = "writer-node-ids",
         env = "INFLUXDB3_WRITER_NODE_IDS",
@@ -1770,30 +1746,12 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     .await;
 
     // Querier wraps WriteBufferImpl in a CompositeWriteBuffer so reads see
-    // hot rows from the writer (Layer B) and WAL tail (Layer C) in addition
-    // to the locally-folded inventory (Layer A). Writer / compactor / all
-    // pass the WriteBufferImpl through unchanged.
+    // the writer's un-persisted WAL tail (Layer C) in addition to the
+    // locally-folded inventory (Layer A). Writer / compactor / all pass the
+    // WriteBufferImpl through unchanged.
     let write_buffer: Arc<dyn WriteBuffer> = if matches!(config.mode, NodeMode::Querier) {
-        let writer_urls: Vec<String> = config
-            .writer_urls
-            .iter()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string())
-            .collect();
-        let remote = (!writer_urls.is_empty()).then(|| {
-            info!(?writer_urls, "enabling layer B (remote hot chunks)");
-            Arc::new(
-                influxdb3_write::remote_write_buffer::RemoteWriteBuffer::new(
-                    writer_urls,
-                    config.remote_hot_timeout.into(),
-                )
-                .with_metrics(&metrics),
-            )
-        });
-
         Arc::new(influxdb3_write::composite_write_buffer::CompositeWriteBuffer::new(
             Arc::clone(&write_buffer_impl),
-            remote,
             wal_tail_buffer.clone(),
         )) as Arc<dyn WriteBuffer>
     } else {
@@ -1882,10 +1840,6 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     let endpoint_policy = influxdb3_server::http::EndpointPolicy {
         allow_write: config.mode.runs_ingest(),
         allow_query: config.mode.runs_query(),
-        // Only the writer (and legacy `all`) holds live in-memory rows that
-        // a querier could fetch. Everywhere else this RPC is dead weight,
-        // so disable it explicitly to make 405 the deliberate response.
-        allow_internal_rpc: matches!(config.mode, NodeMode::All | NodeMode::Writer),
     };
     let http = Arc::new(
         HttpApi::new(

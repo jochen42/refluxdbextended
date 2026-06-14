@@ -102,40 +102,6 @@ impl QueryableBuffer {
         }
     }
 
-    /// Return record batches currently in the in-memory buffer for
-    /// (db, table) whose chunk-time range overlaps `[time_min_ns,
-    /// time_max_ns]`. Callers (e.g. the cross-node hot-chunks RPC) reapply
-    /// row-level predicates on receive.
-    pub fn hot_record_batches(
-        &self,
-        db_id: DbId,
-        table_id: TableId,
-        table_def: Arc<TableDefinition>,
-        time_min_ns: Option<i64>,
-        time_max_ns: Option<i64>,
-    ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let buffer = self.buffer.read();
-        let Some(db_buffer) = buffer.db_to_table.get(&db_id) else {
-            return Ok(vec![]);
-        };
-        let Some(table_buffer) = db_buffer.get(&table_id) else {
-            return Ok(vec![]);
-        };
-        let mut filter = ChunkFilter::default();
-        filter.time_lower_bound_ns = time_min_ns;
-        filter.time_upper_bound_ns = time_max_ns;
-        let partitioned = table_buffer
-            .partitioned_record_batches(table_def, &filter)
-            .map_err(|e| {
-                DataFusionError::Execution(format!("hot_record_batches: {e}"))
-            })?;
-        let mut out = Vec::new();
-        for (_, (_, batches)) in partitioned {
-            out.extend(batches);
-        }
-        Ok(out)
-    }
-
     pub fn get_table_chunks(
         &self,
         db_schema: Arc<DatabaseSchema>,

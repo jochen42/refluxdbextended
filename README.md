@@ -63,16 +63,14 @@ freshness layer for sub-second visibility of recent writes.
 - `influxdb3 migrate catalog --to-shared` to move a single-node catalog
   into the shared layout
 
-### Read-your-writes freshness (A/B/C layers)
+### Read-your-writes freshness (A/C layers)
 - Sub-second visibility of recent writes on a separate querier without waiting
-  for the writer's snapshot cadence. Each query is assembled from three sources,
+  for the writer's snapshot cadence. Each query is assembled from two sources,
   deduplicated so the freshest copy of a row always wins:
   - **A — persisted Parquet** folded from the shared inventory (the durable base)
-  - **B — remote hot chunks**: an optional query-time RPC to the writer's
-    in-memory buffer (`--writer-urls`, ~100 ms, best-effort)
   - **C — WAL tail**: the querier follows the writer's un-persisted WAL files
-    from object storage (`--writer-node-ids`), so recent data stays visible even
-    if the writer is offline
+    from object storage (`--writer-node-ids`), so recent data stays visible
+    before its snapshot lands and even if the writer is offline
 
 ## Architecture at a glance
 
@@ -80,14 +78,12 @@ The same `influxdb3` binary runs as a **writer**, **compactor**, or **querier**
 (or `all`, the upstream single-process mode). The roles share nothing but an
 object store — they coordinate through a shared catalog, a shared file
 inventory, and advisory leases, all mediated by conditional object-store writes.
-No node calls another to coordinate durable state (one optional hot-read RPC
-aside).
+No node ever calls another — all coordination flows through the object store.
 
 ```mermaid
 graph TB
     W[write traffic] -->|line protocol| WR["writer<br/>ingest + persist"]
     Q[query traffic] -->|SQL / FlightSQL| QU["querier x N"]
-    QU -.->|hot-chunks RPC, optional| WR
     WR -->|WAL + gen1 parquet + manifests| OS[(Object store)]
     CO["compactor<br/>gen1 to gen5 merge + GC"] <-->|inputs, genN, manifests| OS
     OS -->|catalog + inventory + WAL tail| QU

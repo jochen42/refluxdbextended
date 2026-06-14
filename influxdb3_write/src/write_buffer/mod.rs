@@ -809,26 +809,6 @@ impl Bufferer for WriteBufferImpl {
     fn watch_persisted_snapshots(&self) -> Receiver<Option<PersistedSnapshotVersion>> {
         self.buffer.persisted_snapshot_notify_rx()
     }
-
-    async fn hot_record_batches(
-        &self,
-        db_id: DbId,
-        table_id: TableId,
-        time_min_ns: Option<i64>,
-        time_max_ns: Option<i64>,
-    ) -> Result<Vec<arrow::array::RecordBatch>, DataFusionError> {
-        let db_schema = self
-            .catalog
-            .db_schema_by_id(&db_id)
-            .ok_or_else(|| DataFusionError::Execution(format!("db {db_id:?} not found")))?;
-        let table_def = db_schema
-            .table_definition_by_id(&table_id)
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!("table {table_id:?} not found"))
-            })?;
-        self.buffer
-            .hot_record_batches(db_id, table_id, table_def, time_min_ns, time_max_ns)
-    }
 }
 
 impl ChunkContainer for WriteBufferImpl {

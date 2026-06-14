@@ -3,9 +3,6 @@ pub(crate) const API_V2_WRITE: &str = "/api/v2/write";
 pub(crate) const API_V3_WRITE: &str = "/api/v3/write_lp";
 pub(crate) const API_V3_QUERY_SQL: &str = "/api/v3/query_sql";
 pub(crate) const API_V3_QUERY_INFLUXQL: &str = "/api/v3/query_influxql";
-/// Internal cross-node RPC: writer streams hot in-memory record batches to
-/// a remote querier so reads are immediate, before WAL flush.
-pub(crate) const API_V3_INTERNAL_HOT_CHUNKS: &str = "/api/v3/internal/hot_chunks";
 pub(crate) const API_V1_QUERY: &str = "/query";
 pub const API_V3_HEALTH: &str = "/health";
 pub const API_V1_HEALTH: &str = "/api/v1/health";

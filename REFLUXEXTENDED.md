@@ -22,7 +22,7 @@ detailed companion to the high-level summary in [README.md](README.md).
 9. [Multi-level compaction](#8-multi-level-compaction)
 10. [Convergence-gated deletion](#9-convergence-gated-deletion)
 11. [Phantom-reference validation](#10-phantom-reference-validation)
-12. [Read-your-writes freshness (A / B / C layers)](#11-read-your-writes-freshness-a--b--c-layers)
+12. [Read-your-writes freshness (A / C layers)](#11-read-your-writes-freshness-a--c-layers)
 13. [Query-planner performance](#12-query-planner-performance)
 14. [Observability](#13-observability)
 15. [Build and runtime notes](#14-build-and-runtime-notes)
@@ -42,8 +42,8 @@ into larger generations; one or more **queriers** answer reads. They coordinate
 entirely through the object store: a **shared catalog**, a **shared inventory**
 of file manifests, **advisory leases**, and a **read-your-writes freshness
 layer** that lets a querier see writes that have not yet been persisted. No
-node ever calls another to coordinate state (one optional hot-read RPC aside) —
-all durable coordination is mediated by conditional object-store writes.
+node ever calls another — all coordination is mediated by conditional
+object-store writes.
 
 ---
 
@@ -54,19 +54,18 @@ The same `influxdb3` binary runs in one of four modes, selected by
 
 `NodeMode` — `influxdb3/src/commands/serve.rs:193`:
 
-| Mode | `runs_ingest()` | `runs_compaction()` | `runs_query()` | Internal hot-read RPC |
-|------|:---:|:---:|:---:|:---:|
-| `all` | ✓ | ✓ | ✓ | ✓ (serves) |
-| `writer` | ✓ | ✗ | ✓ | ✓ (serves) |
-| `compactor` | ✗ | ✓ | ✗ | ✗ |
-| `querier` | ✗ | ✗ | ✓ | ✗ (consumes) |
+| Mode | `runs_ingest()` | `runs_compaction()` | `runs_query()` |
+|------|:---:|:---:|:---:|
+| `all` | ✓ | ✓ | ✓ |
+| `writer` | ✓ | ✗ | ✓ |
+| `compactor` | ✗ | ✓ | ✗ |
+| `querier` | ✗ | ✗ | ✓ |
 
-Mode drives an `EndpointPolicy` (`influxdb3_server/src/http.rs:978`) built at
-`serve.rs:1882`. The HTTP router enforces it before dispatch
-(`http.rs:2883`): write paths return **405** unless `allow_write`, query paths
-return **405** unless `allow_query`, and the internal hot-chunks RPC returns
-**405** unless `allow_internal_rpc`. A querier therefore physically cannot
-accept a write, and a compactor accepts neither writes nor queries.
+Mode drives an `EndpointPolicy` (`influxdb3_server/src/http.rs`) built in
+`serve.rs`. The HTTP router enforces it before dispatch: write paths return
+**405** unless `allow_write`, and query paths return **405** unless
+`allow_query`. A querier therefore physically cannot accept a write, and a
+compactor accepts neither writes nor queries.
 
 ```mermaid
 graph TB
@@ -76,7 +75,7 @@ graph TB
     end
 
     subgraph nodes[Reflux nodes - share nothing but object store]
-        WR["writer<br/>ingest + persist + hot-read RPC"]
+        WR["writer<br/>ingest + persist"]
         CO["compactor<br/>gen1 to gen5 merge + GC"]
         QU["querier x N<br/>read replicas"]
     end
@@ -85,7 +84,6 @@ graph TB
 
     W -->|line protocol| WR
     Q -->|SQL / InfluxQL / FlightSQL| QU
-    QU -.->|hot-chunks RPC, optional| WR
 
     WR -->|WAL + gen1 parquet + manifests| OS
     CO <-->|read inputs, write genN, manifests| OS
@@ -451,49 +449,35 @@ upload or an already-announced removal — never live data.
 
 ---
 
-## 11. Read-your-writes freshness (A / B / C layers)
+## 11. Read-your-writes freshness (A / C layers)
 
 A separate querier folds the inventory only every couple of seconds, and the
 writer only snapshots gen1 every `--wal-snapshot-size` periods. Naively, a row
 just written would be invisible on the querier for seconds. The freshness layer
-closes that gap by assembling each query from **three sources**, deduplicated by
+closes that gap by assembling each query from **two sources**, deduplicated by
 **chunk order** so the freshest copy always wins. Wiring is in
 `influxdb3_write/src/composite_write_buffer.rs`.
 
 | Layer | Source | Mechanism | `chunk_order` | Config |
 |------|--------|-----------|:---:|--------|
 | **A** Persisted | committed Parquet (gen1–gen5) | folded from `_inventory/` into `PersistedFiles` | gen/chunk_time (lowest) | always on |
-| **B** Remote hot | writer's in-memory `QueryableBuffer` | HTTP RPC `/api/v3/internal/hot_chunks` at query time | `i64::MAX − 1` | `--writer-urls` |
 | **C** WAL tail | writer's un-persisted WAL segment files | querier lists + replays the writer's `wal/` into local buffer chunks | `i64::MAX − 2` | `--writer-node-ids` |
 
 Precedence on dedup (IOx keeps the higher `chunk_order` for equal
 primary-key + time): writer-local hot (`i64::MAX`, on the writer itself) >
-Layer B > Layer C > Layer A. So the newest copy of a row always wins, with
-transparent fallback as layers miss.
+Layer C > Layer A. So the newest copy of a row always wins, with transparent
+fallback as layers miss.
 
 ```mermaid
 flowchart TD
     Q[Query on querier] --> A[Layer A: persisted parquet<br/>from PersistedFiles]
-    Q --> B{Layer B<br/>writer-urls set?}
-    B -- yes, writer reachable --> BR["RPC hot_chunks<br/>(timeout --remote-hot-timeout 250ms)"]
-    B -- no / unreachable --> C{Layer C<br/>writer-node-ids set?}
-    BR -- got rows --> MERGE
-    BR -- timeout/miss --> C
-    C -- yes --> CT["replay WAL tail buffer<br/>(only if writer NOT reachable)"]
+    Q --> C{Layer C<br/>writer-node-ids set?}
+    C -- yes --> CT["replay WAL tail buffer<br/>un-persisted writer WAL files"]
     C -- no --> MERGE
     A --> MERGE[Dedup by chunk_order, freshest wins]
     CT --> MERGE
     MERGE --> R[Result]
 ```
-
-### Layer B — remote hot-chunks RPC
-
-`RemoteWriteBuffer` (`influxdb3_write/src/remote_write_buffer.rs`) calls the
-writer's hot-chunks endpoint (`http.rs:1404`), which returns the live rows from
-the writer's `QueryableBuffer.hot_record_batches()` within the query's time
-bounds. It is best-effort: a timeout (`--remote-hot-timeout`, default `250ms`)
-is logged, not fatal — the query proceeds on A + C. This is the lowest-latency
-path (~100 ms) and authoritative when the writer is reachable.
 
 ### Layer C — WAL tail
 
@@ -501,8 +485,9 @@ path (~100 ms) and authoritative when the writer is reachable.
 `--wal-tail-poll-interval` (default `1s`) it lists the writer's `wal/` prefix,
 GETs WAL files past its cursor, replays their ops into per-`(writer, table)`
 buffer state, and serves them as `BufferChunk`s with `chunk_order =
-i64::MAX − 2`. Unlike Layer B it is pre-materialized and survives the writer
-being **offline** — it is the failsafe path.
+i64::MAX − 2`. It is pre-materialized and survives the writer being
+**offline** — recent data stays visible from the last WAL files the querier
+replayed before the writer went away.
 
 Files are evicted two ways:
 
@@ -612,8 +597,6 @@ Extension flags added/changed by this fork (defaults in parentheses):
 | `--compactor-lease-ttl` | `INFLUXDB3_COMPACTOR_LEASE_TTL` | `60s` | compactor | `0s` disables |
 | `--inventory-poll-interval` | `INFLUXDB3_INVENTORY_POLL_INTERVAL` | `2s` | querier/compactor | fold cadence |
 | `--ref-validation-interval` | `INFLUXDB3_REF_VALIDATION_INTERVAL` | `1h` | querier/compactor | phantom-ref sweep |
-| `--writer-urls` | `INFLUXDB3_WRITER_URLS` | (empty) | querier | Layer B hot-read hosts |
-| `--remote-hot-timeout` | `INFLUXDB3_REMOTE_HOT_TIMEOUT` | `250ms` | querier | Layer B timeout |
 | `--writer-node-ids` | `INFLUXDB3_WRITER_NODE_IDS` | (empty) | querier | Layer C WAL-tail prefixes |
 | `--wal-tail-poll-interval` | `INFLUXDB3_WAL_TAIL_POLL_INTERVAL` | `1s` | querier | `0s` disables tail |
 | `--wal-tail-max-files` | `INFLUXDB3_WAL_TAIL_MAX_FILES` | `2000` | querier | **must exceed 3 × snapshot-size** |

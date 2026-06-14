@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Sub-second read-your-writes validation for the querier-freshness stack
-# (Layers A + B + C).
+# (Layers A + C).
 #
 # Flow:
 #   1. Bring up minio + writer + querier (no compactor).
@@ -10,10 +10,9 @@
 #   4. Poll querier `SELECT COUNT(*) FROM sensors` in a tight loop.
 #   5. Assert count >= 1 within FRESHNESS_DEADLINE_SEC (default 3s).
 #
-# Layer B (remote hot chunks) should make the row visible without ever
-# touching object storage. Layer C (WAL tail) is the fallback if the
-# writer becomes unreachable. Layer A picks up snapshots once the WAL
-# flushes — used here as a sanity backstop.
+# Layer C (WAL tail) should make the row visible by replaying the writer's
+# un-persisted WAL files, even after the writer becomes unreachable. Layer A
+# picks up snapshots once the WAL flushes — used here as a sanity backstop.
 #
 # Invoke from `e2e/`:
 #

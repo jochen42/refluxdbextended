@@ -20,8 +20,6 @@ const SENSITIVE_PARAMS: &[&str] = &[
     "tls-key",
     "tls-cert",
     "without-auth",
-    // Multi-node: internal writer endpoints (same treatment as aws-endpoint)
-    "writer-urls",
 ];
 
 /// List of all known non-sensitive CLI parameters - only used in test but declared at module level
@@ -86,7 +84,6 @@ const NON_SENSITIVE_PARAMS: &[&str] = &[
     "inventory-poll-interval",
     "ref-validation-interval",
     "writer-node-ids",
-    "remote-hot-timeout",
     "wal-tail-poll-interval",
     "wal-tail-max-files",
     // Generation configuration

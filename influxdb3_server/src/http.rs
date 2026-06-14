@@ -978,9 +978,6 @@ pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct EndpointPolicy {
     pub allow_write: bool,
     pub allow_query: bool,
-    /// Cross-node internal RPCs (e.g. hot-chunks fetch). Only the writer
-    /// should expose these; the querier consumes them but does not serve.
-    pub allow_internal_rpc: bool,
 }
 
 impl Default for EndpointPolicy {
@@ -994,7 +991,6 @@ impl EndpointPolicy {
         Self {
             allow_write: true,
             allow_query: true,
-            allow_internal_rpc: true,
         }
     }
 }
@@ -1398,64 +1394,6 @@ impl HttpApi {
             .header("X-Influxdb-Version", INFLUXDB3_VERSION.to_string())
             .header("X-Request-Id", request_id)
             .body(bytes_to_response_body(body))
-            .map_err(Into::into)
-    }
-
-    /// Cross-node internal RPC: streams the writer's in-memory hot rows for
-    /// (db_id, table_id) as an Arrow IPC stream. The optional time bounds
-    /// let the querier ship only the slice it actually needs — without
-    /// them, every query forces the writer to re-serialize its entire
-    /// in-memory dataset and tanks compacted-query latency. Used by
-    /// `RemoteWriteBuffer`. JSON request body:
-    /// `{"db_id": u32, "table_id": u32, "time_min_ns": i64?, "time_max_ns": i64?}`.
-    async fn hot_chunks(&self, req: Request) -> Result<Response> {
-        let result = self.hot_chunks_inner(req).await;
-        // register_metric is idempotent (cached by name), so per-request
-        // registration just resolves the existing instrument.
-        self.common_state
-            .metrics
-            .register_metric::<metric::U64Counter>(
-                "influxdb3_hot_chunks_served",
-                "writer-side hot-chunks RPCs served by result",
-            )
-            .recorder(&[("result", if result.is_ok() { "ok" } else { "error" })])
-            .inc(1);
-        result
-    }
-
-    async fn hot_chunks_inner(&self, req: Request) -> Result<Response> {
-        #[derive(serde::Deserialize)]
-        struct HotChunksReq {
-            db_id: u32,
-            table_id: u32,
-            #[serde(default)]
-            time_min_ns: Option<i64>,
-            #[serde(default)]
-            time_max_ns: Option<i64>,
-        }
-        let body: HotChunksReq = self.read_body_json(req).await?;
-        let db_id = influxdb3_id::DbId::from(body.db_id);
-        let table_id = influxdb3_id::TableId::from(body.table_id);
-        let batches = self
-            .write_buffer
-            .hot_record_batches(db_id, table_id, body.time_min_ns, body.time_max_ns)
-            .await?;
-        let mut buf: Vec<u8> = Vec::new();
-        if let Some(first) = batches.first() {
-            let schema = first.schema();
-            // Concat into a single batch so any dictionary columns get a
-            // unified dictionary. StreamWriter only emits the first batch's
-            // dictionaries; per-batch dictionaries with diverging entries
-            // produce "out of bounds" errors at the reader.
-            let combined = arrow::compute::concat_batches(&schema, &batches)?;
-            let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)?;
-            writer.write(&combined)?;
-            writer.finish()?;
-        }
-        ResponseBuilder::new()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/vnd.apache.arrow.stream")
-            .body(bytes_to_response_body(buf))
             .map_err(Into::into)
     }
 
@@ -2862,16 +2800,7 @@ async fn perform_routing(
 
     // admin token creation should be allowed without authentication
     // and any endpoints that are disabled.
-    //
-    // `/api/v3/internal/*` paths are exempt because they are intra-cluster
-    // RPCs (Layer B hot-chunks fetch from querier to writer). The mode
-    // enforcement below (`allow_internal_rpc`) already ensures these only
-    // serve on nodes that opt in, and these endpoints are expected to live
-    // on a private network, not the public ingress.
-    if path == all_paths::API_V3_CONFIGURE_ADMIN_TOKEN
-        || path.starts_with("/api/v3/internal/")
-        || paths_without_authz.contains(&path)
-    {
+    if path == all_paths::API_V3_CONFIGURE_ADMIN_TOKEN || paths_without_authz.contains(&path) {
         trace!(?uri, "not authenticating request");
     } else {
         trace!(?uri, "authenticating request");
@@ -2907,16 +2836,6 @@ async fn perform_routing(
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(bytes_to_response_body(
                 "this node is not configured to serve queries",
-            ))
-            .unwrap());
-    }
-    if path == all_paths::API_V3_INTERNAL_HOT_CHUNKS
-        && !http_server.endpoint_policy.allow_internal_rpc
-    {
-        return Ok(ResponseBuilder::new()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(bytes_to_response_body(
-                "internal rpc disabled on this node",
             ))
             .unwrap());
     }
@@ -2961,9 +2880,6 @@ async fn perform_routing(
                 .map_err(RoutingError::V2Write)?)
         }
         (Method::POST, all_paths::API_V3_WRITE) => http_server.write_lp(req).await,
-        (Method::POST, all_paths::API_V3_INTERNAL_HOT_CHUNKS) => {
-            http_server.hot_chunks(req).await
-        }
         (Method::GET | Method::POST, all_paths::API_V3_QUERY_SQL) => {
             http_server.query_sql(req).await
         }

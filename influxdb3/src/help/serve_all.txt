@@ -186,10 +186,6 @@ Examples:
                                                  [env: INFLUXDB3_INVENTORY_POLL_INTERVAL=]
   --ref-validation-interval <INTERVAL>         Evict parquet refs missing from object store [default: 1h]
                                                  [env: INFLUXDB3_REF_VALIDATION_INTERVAL=]
-  --writer-urls <URLS>                         Writer HTTP base URLs for hot reads (Layer B)
-                                                 [env: INFLUXDB3_WRITER_URLS=]
-  --remote-hot-timeout <DURATION>              Timeout for remote hot-chunk fetches [default: 250ms]
-                                                 [env: INFLUXDB3_REMOTE_HOT_TIMEOUT=]
   --writer-node-ids <IDS>                      Writer node-id prefixes to tail (Layer C)
                                                  [env: INFLUXDB3_WRITER_NODE_IDS=]
   --wal-tail-poll-interval <INTERVAL>          WAL-tail listing cadence (Layer C) [default: 1s]
