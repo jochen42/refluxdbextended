@@ -90,6 +90,9 @@ ENV INFLUXDB3_PLUGIN_DIR=/plugins
 COPY --from=build "/root/$PACKAGE" "/usr/bin/$PACKAGE"
 COPY docker/entrypoint.sh /usr/bin/entrypoint.sh
 
+# License text shipped with the binary (Apache-2.0 / MIT dual license)
+COPY LICENSE-APACHE LICENSE-MIT /usr/share/doc/influxdb3/
+
 RUN chmod +x /usr/bin/influxdb3 /usr/bin/entrypoint.sh
 
 EXPOSE 8181

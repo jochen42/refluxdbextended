@@ -116,6 +116,16 @@ jobs:
           files: |
             ./release/${{ matrix.asset }}
 
+      # Attach the dual-license text to the release once (amd64 job only) so the
+      # binary assets ship with their license, as MIT/Apache-2.0 require.
+      - name: Attach license files
+        uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag' && matrix.arch == 'amd64'
+        with:
+          files: |
+            LICENSE-APACHE
+            LICENSE-MIT
+
   build-docker:
     name: Build Docker Image (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}

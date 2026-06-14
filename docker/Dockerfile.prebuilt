@@ -42,6 +42,9 @@ RUN chmod +x /usr/bin/$PACKAGE
 COPY docker/entrypoint.sh /usr/bin/entrypoint.sh
 RUN chmod +x /usr/bin/entrypoint.sh
 
+# License text shipped with the binary (Apache-2.0 / MIT dual license)
+COPY LICENSE-APACHE LICENSE-MIT /usr/share/doc/influxdb3/
+
 USER influxdb3
 
 RUN mkdir ~/.influxdb3
