@@ -1055,6 +1055,13 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
 
     let metrics = setup_metric_registry();
 
+    // Wire the NotFound-tolerant read path's swallow counter to the main
+    // registry (the one CommonServerState / query executor expose at /metrics).
+    // Built deep in the DataFusion planner with no registry in scope, so it
+    // takes a process-global initialized here. Cheap and mode-agnostic; only
+    // the querier read path ever increments it.
+    iox_query::provider::init_not_found_tolerant_metrics(&metrics);
+
     // Install custom panic handler and forget about it.
     //
     // This leaks the handler and prevents it from ever being dropped during the

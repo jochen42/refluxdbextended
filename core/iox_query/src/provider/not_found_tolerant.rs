@@ -18,7 +18,7 @@
 
 use std::any::Any;
 use std::fmt::{self, Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use datafusion::common::{Result, Statistics};
 use datafusion::config::ConfigOptions;
@@ -33,8 +33,57 @@ use datafusion::physical_plan::DisplayFormatType;
 use datafusion::physical_plan::filter_pushdown::FilterPushdownPropagation;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::{FutureExt, StreamExt};
+use metric::{Metric, Registry, U64Counter};
 use object_store::ObjectStore;
 use tracing::warn;
+
+/// Process-global counters for tolerated (swallowed) NotFound reads. The file
+/// source is built in `chunks_to_physical_nodes`, deep in the DataFusion
+/// planner with no metric registry in scope, so a global wired once at startup
+/// is the pragmatic seam. `None` until [`init_not_found_tolerant_metrics`] runs
+/// — increments before that (there shouldn't be any) are silently dropped.
+static TOLERATED: OnceLock<ToleratedCounters> = OnceLock::new();
+
+struct ToleratedCounters {
+    at_open: U64Counter,
+    mid_scan: U64Counter,
+}
+
+/// Register the swallow counter on `registry`. Call once at serve startup; the
+/// first registration wins and later calls are ignored. Safe in any mode — only
+/// the querier read path increments it.
+///
+/// Emits `influxdb3_parquet_notfound_tolerated_total{phase=open|mid_scan}`. A
+/// nonzero-and-climbing value is the masked phantom-ref race firing: each count
+/// is one file served empty because its object was already deleted. Pair it
+/// with the `warn!` log lines (which carry the file `%path`) to chase a slice
+/// that looks short. Sustained growth means ref-validation/convergence is not
+/// keeping up — not that data is gone (the surviving gen supplies the rows).
+pub fn init_not_found_tolerant_metrics(registry: &Registry) {
+    let metric: Metric<U64Counter> = registry.register_metric(
+        "influxdb3_parquet_notfound_tolerated",
+        "parquet objects skipped as empty because their object was NotFound \
+         (stale ref, compaction-deleted before ref validation), by scan phase",
+    );
+    let _ = TOLERATED.set(ToleratedCounters {
+        at_open: metric.recorder(&[("phase", "open")]),
+        mid_scan: metric.recorder(&[("phase", "mid_scan")]),
+    });
+}
+
+#[inline]
+fn record_tolerated_at_open() {
+    if let Some(c) = TOLERATED.get() {
+        c.at_open.inc(1);
+    }
+}
+
+#[inline]
+fn record_tolerated_mid_scan() {
+    if let Some(c) = TOLERATED.get() {
+        c.mid_scan.inc(1);
+    }
+}
 
 /// Walk the error source chain; `true` if any link is
 /// [`object_store::Error::NotFound`]. The mem-cache layer may re-wrap a NotFound
@@ -85,6 +134,7 @@ impl FileOpener for NotFoundTolerantOpener {
                                         "parquet object missing mid-scan; ending file \
                                          early (stale ref, compaction-deleted)"
                                     );
+                                    record_tolerated_mid_scan();
                                     warned = true;
                                 }
                                 *stopped = true;
@@ -102,6 +152,7 @@ impl FileOpener for NotFoundTolerantOpener {
                         "parquet object missing at open; skipping file as empty \
                          (stale ref, likely compaction-deleted before ref validation)"
                     );
+                    record_tolerated_at_open();
                     Ok(futures::stream::empty().boxed())
                 }
                 Err(e) => Err(e),

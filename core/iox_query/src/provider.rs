@@ -35,6 +35,7 @@ mod physical;
 pub(crate) mod progressive_eval;
 mod record_batch_exec;
 pub(crate) mod reorder_partitions;
+pub use self::not_found_tolerant::init_not_found_tolerant_metrics;
 pub use self::overlap::group_potential_duplicates;
 pub use deduplicate::{DeduplicateExec, RecordBatchDeduplicator};
 pub(crate) use physical::{PartitionedFileExt, chunks_to_physical_nodes};
