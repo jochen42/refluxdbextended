@@ -402,6 +402,10 @@ impl SharedInventory {
             .as_ref()
             .map(|cp| cp.tombstones.clone())
             .unwrap_or_default();
+        let compaction_tombstones = checkpoint
+            .as_ref()
+            .map(|cp| cp.compaction_tombstones.clone())
+            .unwrap_or_default();
 
         debug!(
             "shared inventory loaded: checkpoint={}, wal_snapshots={}, compactions={}",
@@ -417,6 +421,7 @@ impl SharedInventory {
             wal_watermarks,
             compaction_watermark,
             tombstones,
+            compaction_tombstones,
         })
     }
 
@@ -439,14 +444,21 @@ pub struct Checkpoint {
     /// empty. Applying it to a fresh `PersistedFiles` reproduces the
     /// checkpoint's view.
     pub merged_snapshot: PersistedSnapshot,
-    /// Removed-file tombstones carried forward as `(path, wal_seq)`: writer
-    /// gen1 files that a folded compaction removed but whose adding WAL
-    /// snapshot may still be re-folded above `wal_high_water`. A loader seeds
-    /// these so it suppresses re-adds whose removal manifest sits below the
-    /// high-water and is never replayed. Defaulted for backward compatibility
-    /// with checkpoints written before this field existed.
+    /// Removed-file tombstones for writer gen1 files carried forward as
+    /// `(path, wal_seq)`: gen1 files a folded compaction removed but whose
+    /// adding WAL snapshot may still be re-folded above `wal_high_water`. A
+    /// loader seeds these so it suppresses re-adds whose removal manifest sits
+    /// below the high-water and is never replayed. Defaulted for backward
+    /// compatibility with checkpoints written before this field existed.
     #[serde(default)]
     pub tombstones: Vec<(String, u64)>,
+    /// Removed-file tombstones for compactor gen2+ files carried forward as
+    /// `(path, removing_compaction_id)`. Same purpose as `tombstones` but GC'd
+    /// against the compaction high-water (ULID) rather than the WAL high-water.
+    /// Defaulted for backward compatibility (incl. `-24` checkpoints, which
+    /// carry only `tombstones`).
+    #[serde(default)]
+    pub compaction_tombstones: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -462,8 +474,11 @@ pub struct LoadedInventory {
     pub compaction_watermark: Option<String>,
     /// Removed-file tombstones from the checkpoint, seeded into `PersistedFiles`
     /// before folding `wal_snapshots`/`compactions` so re-adds of
-    /// compaction-deleted gen1 files are suppressed.
+    /// compaction-deleted files are suppressed. `tombstones` are gen1
+    /// `(path, wal_seq)`; `compaction_tombstones` are gen2+
+    /// `(path, removing_compaction_id)`.
     pub tombstones: Vec<(String, u64)>,
+    pub compaction_tombstones: Vec<(String, String)>,
 }
 
 impl LoadedInventory {
@@ -660,6 +675,7 @@ mod tests {
             compactions_high_water: Some("01ABC".to_string()),
             merged_snapshot: snap_with("checkpoint", 0, "merged/file.parquet"),
             tombstones: Vec::new(),
+            compaction_tombstones: Vec::new(),
         };
         inv.write_checkpoint(&cp).await.unwrap();
         let loaded = inv.load_latest_checkpoint().await.unwrap().unwrap();
@@ -676,10 +692,15 @@ mod tests {
             compactions_high_water: None,
             merged_snapshot: snap_with("checkpoint", 0, "merged.parquet"),
             tombstones: vec![("main-writer-0/dbs/1/2/d/h/0000001800.parquet".to_string(), 1800)],
+            compaction_tombstones: vec![(
+                "main-compactor-0/dbs/u-1/u-2/gen2/d/h/019ec5ca.parquet".to_string(),
+                "019ec5ff".to_string(),
+            )],
         };
         let bytes = serde_json::to_vec(&cp).unwrap();
         let back: Checkpoint = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.tombstones, cp.tombstones);
+        assert_eq!(back.compaction_tombstones, cp.compaction_tombstones);
 
         // Legacy checkpoint JSON without the `tombstones` field.
         let legacy = serde_json::json!({
@@ -689,6 +710,7 @@ mod tests {
         });
         let parsed: Checkpoint = serde_json::from_value(legacy).unwrap();
         assert!(parsed.tombstones.is_empty());
+        assert!(parsed.compaction_tombstones.is_empty());
     }
 
     #[tokio::test]
@@ -726,6 +748,7 @@ mod tests {
             compactions_high_water: None,
             merged_snapshot: snap_with("checkpoint", 0, "merged.parquet"),
             tombstones: Vec::new(),
+            compaction_tombstones: Vec::new(),
         };
         inv.write_checkpoint(&cp).await.unwrap();
 

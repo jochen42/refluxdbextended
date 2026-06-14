@@ -470,14 +470,15 @@ impl CompactionService {
         // and are never replayed, but a writer snapshot above `wal_high_water`
         // can still re-list them). GC against the high-water first so only
         // still-re-addable tombstones are persisted.
-        persisted_files.gc_tombstones(&wal_high_water);
-        let tombstones = persisted_files.tombstones();
+        persisted_files.gc_tombstones(&wal_high_water, compactions_high_water.as_deref());
+        let (tombstones, compaction_tombstones) = persisted_files.tombstones_for_checkpoint();
 
         let cp = crate::shared_inventory::Checkpoint {
             wal_high_water,
             compactions_high_water,
             merged_snapshot: merged,
             tombstones,
+            compaction_tombstones,
         };
         inv.write_checkpoint(&cp).await?;
         Ok(())

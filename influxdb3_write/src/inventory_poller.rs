@@ -343,7 +343,7 @@ async fn tick(
             // WAL snapshot from each writer.
             let _ = (tail, wal_seq);
         }
-        persisted_files.add_persisted_snapshot_files(s);
+        persisted_files.add_persisted_compaction_files(s, &id);
         // Advance the cursor only AFTER the fold lands in PersistedFiles. The
         // heartbeat task publishes this cursor to the convergence gate, whose
         // guarantee ("cursor >= id ⇒ this querier has dropped that compaction's
@@ -357,7 +357,7 @@ async fn tick(
     // Drop removed-file tombstones whose source WAL snapshot the high-water has
     // now passed (it can no longer be re-folded, so it can never re-add the
     // file). Bounds tombstone memory; rides this tick's advanced cursors.
-    persisted_files.gc_tombstones(wal_cursors);
+    persisted_files.gc_tombstones(wal_cursors, compaction_cursor.as_deref());
 
     Ok(applied)
 }

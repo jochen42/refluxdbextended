@@ -271,7 +271,7 @@ fn test_tombstone_suppresses_reordered_readd() {
     persisted.add_persisted_snapshot_files(removal);
 
     // Tombstone recorded; nothing visible.
-    assert_eq!(persisted.tombstones().len(), 1);
+    assert_eq!(persisted.tombstone_count(), 1);
     assert!(
         persisted
             .get_files(DbId::from(0), TableId::from(0))
@@ -314,21 +314,21 @@ fn test_tombstone_gc_by_high_water() {
         .push(gen1.clone());
     removal.removed_files = removed;
     persisted.add_persisted_snapshot_files(removal);
-    assert_eq!(persisted.tombstones().len(), 1);
+    assert_eq!(persisted.tombstone_count(), 1);
 
     // High-water still below the source seq (1800): retained.
     persisted.gc_tombstones(&std::collections::HashMap::from([(
         "main-writer-0".to_string(),
         1799u64,
-    )]));
-    assert_eq!(persisted.tombstones().len(), 1);
+    )]), None);
+    assert_eq!(persisted.tombstone_count(), 1);
 
     // High-water reaches the source seq: collected.
     persisted.gc_tombstones(&std::collections::HashMap::from([(
         "main-writer-0".to_string(),
         1800u64,
-    )]));
-    assert!(persisted.tombstones().is_empty());
+    )]), None);
+    assert!(persisted.tombstone_count() == 0);
 }
 
 /// The common path — add then remove, in order — must NOT leave a tombstone, so
@@ -365,7 +365,7 @@ fn test_in_order_removal_leaves_no_tombstone() {
             .is_empty()
     );
     assert!(
-        persisted.tombstones().is_empty(),
+        persisted.tombstone_count() == 0,
         "in-order removal should not create a tombstone"
     );
 }
@@ -385,7 +385,7 @@ fn test_seed_tombstones_suppresses_readd() {
         max_time: 100,
     };
     let persisted = PersistedFiles::new(None);
-    persisted.seed_tombstones(vec![(path, 1800)]);
+    persisted.seed_tombstones(vec![(path, 1800)], vec![]);
 
     persisted.add_persisted_snapshot_files(build_snapshot(vec![gen1], 5, 5, 5));
     assert!(
@@ -394,6 +394,58 @@ fn test_seed_tombstones_suppresses_readd() {
             .is_empty(),
         "seeded tombstone did not suppress checkpoint re-add"
     );
+}
+
+/// The gen2 case the gen1-only fix missed (prod 404 on
+/// `…/gen2/2025-12-28/…019ec5ca….parquet`): a compactor-path file whose removal
+/// (gen2→gen3) is folded before its add (gen1→gen2). Compactor paths have a
+/// ULID stem so they don't parse as gen1 — the tombstone is keyed on the
+/// removing compaction id and GC'd against the compaction high-water.
+#[test_log::test(test)]
+fn test_compaction_tombstone_suppresses_reordered_readd() {
+    let gen2 = ParquetFile {
+        id: ParquetFileId::from(1),
+        path: "main-compactor-0/dbs/0169c974-24/1e94c01c-2/gen2/2025-12-28/00-00/\
+               019ec5ca-d4d7-7ce3-9fd2-dd40ebd3d7eb.parquet"
+            .to_owned(),
+        size_bytes: 50,
+        row_count: 5,
+        chunk_time: 0,
+        min_time: 0,
+        max_time: 100,
+    };
+    let persisted = PersistedFiles::new(None);
+
+    // gen2→gen3 removal arrives first (removing compaction id 019ec5ff),
+    // target not present yet.
+    let mut removal = build_snapshot(vec![], 1, 1, 1);
+    let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
+    removed
+        .entry(DbId::from(0))
+        .or_default()
+        .tables
+        .entry(TableId::from(0))
+        .or_default()
+        .push(gen2.clone());
+    removal.removed_files = removed;
+    persisted.add_persisted_compaction_files(removal, "019ec5ff");
+    assert_eq!(persisted.tombstone_count(), 1);
+
+    // gen1→gen2 add lands later (older compaction id) — must be suppressed.
+    persisted.add_persisted_compaction_files(build_snapshot(vec![gen2], 2, 2, 2), "019ec5aa");
+    assert!(
+        persisted
+            .get_files(DbId::from(0), TableId::from(0))
+            .is_empty(),
+        "reordered add resurrected a compaction-deleted gen2 file (phantom ref)"
+    );
+
+    // GC against the compaction high-water: below the removing id it is kept,
+    // at/above it is collected.
+    persisted.gc_tombstones(&std::collections::HashMap::new(), Some("019ec5fe"));
+    assert_eq!(persisted.tombstone_count(), 1);
+    persisted.gc_tombstones(&std::collections::HashMap::new(), Some("019ec5ff"));
+    assert!(persisted.tombstone_count() == 0);
 }
 
 #[test]

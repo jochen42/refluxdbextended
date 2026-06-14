@@ -430,7 +430,8 @@ impl WriteBufferImpl {
                     // Seed tombstones before folding so a re-listed gen1 file
                     // whose removal sits below the checkpoint high-water is
                     // suppressed rather than resurrected as a phantom ref.
-                    persisted_files.seed_tombstones(loaded.tombstones.clone());
+                    persisted_files
+                        .seed_tombstones(loaded.tombstones.clone(), loaded.compaction_tombstones.clone());
                     for snapshot in loaded.flatten() {
                         persisted_files.add_persisted_snapshot_files(snapshot);
                     }

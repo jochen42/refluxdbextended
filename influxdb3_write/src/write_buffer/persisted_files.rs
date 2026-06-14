@@ -142,7 +142,20 @@ impl PersistedFiles {
     /// Called from `Replica::reload_snapshots` during replica recovery.
     pub fn add_persisted_snapshot_files(&self, persisted_snapshot: PersistedSnapshot) {
         let mut inner = self.inner.write();
-        inner.add_persisted_snapshot(persisted_snapshot);
+        inner.add_persisted_snapshot(persisted_snapshot, None);
+    }
+
+    /// Fold a compaction manifest, tagging any tombstone it creates with the
+    /// compaction's id so the tombstone can be GC'd against the compaction
+    /// high-water. Used by the inventory poller for the compaction stream,
+    /// where a removal can arrive before the add it supersedes.
+    pub fn add_persisted_compaction_files(
+        &self,
+        persisted_snapshot: PersistedSnapshot,
+        compaction_id: &str,
+    ) {
+        let mut inner = self.inner.write();
+        inner.add_persisted_snapshot(persisted_snapshot, Some(compaction_id));
     }
 
     /// Add a single parquet file to the tracked files for a specific table.
@@ -206,27 +219,50 @@ impl PersistedFiles {
         out
     }
 
-    /// Garbage-collect removed-file tombstones against the current per-node WAL
-    /// high-water marks. Called by the inventory poller after each fold tick.
-    pub fn gc_tombstones(&self, wal_high_water: &std::collections::HashMap<String, u64>) {
-        self.inner.write().gc_tombstones(wal_high_water);
+    /// Garbage-collect removed-file tombstones against the current high-water
+    /// marks. Called by the inventory poller after each fold tick.
+    pub fn gc_tombstones(
+        &self,
+        wal_high_water: &std::collections::HashMap<String, u64>,
+        compactions_high_water: Option<&str>,
+    ) {
+        self.inner
+            .write()
+            .gc_tombstones(wal_high_water, compactions_high_water);
     }
 
-    /// Snapshot the live removed-file tombstones as `(path, wal_seq)` pairs for
-    /// persistence in a shared-inventory checkpoint.
-    pub fn tombstones(&self) -> Vec<(String, u64)> {
-        self.inner
-            .read()
-            .removed_tombstones
-            .iter()
-            .map(|(path, ts)| (path.clone(), ts.wal_seq))
-            .collect()
+    /// Snapshot the live removed-file tombstones for persistence in a
+    /// shared-inventory checkpoint, split by GC key: gen1 `(path, wal_seq)` and
+    /// compactor `(path, removing_compaction_id)`.
+    #[allow(clippy::type_complexity)]
+    pub fn tombstones_for_checkpoint(&self) -> (Vec<(String, u64)>, Vec<(String, String)>) {
+        let inner = self.inner.read();
+        let mut gen1 = Vec::new();
+        let mut compaction = Vec::new();
+        for (path, gc) in &inner.removed_tombstones {
+            match gc {
+                TombstoneGc::WalSeq { wal_seq, .. } => gen1.push((path.clone(), *wal_seq)),
+                TombstoneGc::Compaction { removing_id } => {
+                    compaction.push((path.clone(), removing_id.clone()))
+                }
+            }
+        }
+        (gen1, compaction)
     }
 
     /// Seed removed-file tombstones from a shared-inventory checkpoint before
     /// folding the newer WAL/compaction manifests on top of it.
-    pub fn seed_tombstones(&self, tombstones: Vec<(String, u64)>) {
-        self.inner.write().seed_tombstones(tombstones);
+    pub fn seed_tombstones(
+        &self,
+        gen1: Vec<(String, u64)>,
+        compaction: Vec<(String, String)>,
+    ) {
+        self.inner.write().seed_tombstones(gen1, compaction);
+    }
+
+    /// Number of live removed-file tombstones (test/observability helper).
+    pub fn tombstone_count(&self) -> usize {
+        self.inner.read().removed_tombstones.len()
     }
 
     /// Get the list of files for a given database and table, always return in descending order of min_time
@@ -394,25 +430,31 @@ struct Inner {
     pub parquet_files_row_count: u64,
     /// Data that are marked for deletion.
     pub deleted_data: HashMap<DbId, DeletedTables>,
-    /// Removed-file tombstones: writer gen1 object-store paths that a folded
-    /// compaction `removed_files` referenced but which were not present at fold
-    /// time (the removal landed before the writer snapshot that adds them).
-    /// A subsequent add for a tombstoned path is suppressed, making the fold
-    /// order-independent and preventing phantom refs to compaction-deleted
-    /// gen1 files. Value is the source WAL `snapshot_sequence_number` parsed
-    /// from the path stem, used to garbage-collect the tombstone once the
-    /// writer's `wal_high_water` passes it (that snapshot can no longer re-add
-    /// the file). Object-store paths are write-once, so tombstoning one can
-    /// never hide a live file — only a stale re-listing of a deleted one.
-    pub removed_tombstones: HashMap<String, GenOneTombstone>,
+    /// Removed-file tombstones: object-store paths that a folded compaction
+    /// `removed_files` referenced but which were not present at fold time (the
+    /// removal landed before the add that introduces them — a reorder between
+    /// the writer-snapshot and compaction streams, or across a checkpoint
+    /// boundary). A subsequent add for a tombstoned path is suppressed, making
+    /// the fold order-independent and preventing phantom refs to
+    /// compaction-deleted files of any generation. The value is the
+    /// garbage-collection key (see [`TombstoneGc`]). Object-store paths are
+    /// write-once, so tombstoning one can never hide a live file — only a stale
+    /// re-listing of a deleted one.
+    pub removed_tombstones: HashMap<String, TombstoneGc>,
 }
 
-/// GC key for a removed-file tombstone: the writer node that owns the gen1
-/// path and the WAL snapshot sequence number parsed from its stem.
+/// When a removed-file tombstone may be dropped: once the relevant high-water
+/// mark passes the point at which any manifest could re-add the file.
 #[derive(Debug, Clone)]
-pub(crate) struct GenOneTombstone {
-    pub node_id: String,
-    pub wal_seq: u64,
+pub(crate) enum TombstoneGc {
+    /// Writer gen1 file. Drop once `wal_high_water[node_id] >= wal_seq` — that
+    /// WAL snapshot can no longer be re-folded, so it can't re-add the file.
+    WalSeq { node_id: String, wal_seq: u64 },
+    /// Compactor gen2+ file. Drop once `compactions_high_water >= removing_id`
+    /// (the ULID of the compaction whose `removed_files` carried this path). The
+    /// compaction that *adds* the file is older still, so once the high-water
+    /// passes the remover it has also passed the adder and the file can't recur.
+    Compaction { removing_id: String },
 }
 
 /// Parse a writer gen1 parquet path into `(node_id, wal_seq)`.
@@ -421,9 +463,9 @@ pub(crate) struct GenOneTombstone {
 /// `<node_id>/dbs/<db>/<table>/<date>/<hour>/<wal_seq:010>.parquet`, so the
 /// leading path segment is the node id and the file stem is the zero-padded
 /// WAL `snapshot_sequence_number`. Compactor outputs (gen2+) use a ULID stem
-/// and a `<uuid>-<id>` directory scheme, so they do not parse here — those
-/// removals fold in ULID order and never reorder, so they need no tombstone.
-fn parse_gen1_path(path: &str) -> Option<GenOneTombstone> {
+/// and a `<uuid>-<id>` directory scheme and so do not parse here — their
+/// tombstones are GC'd against the compaction high-water instead.
+fn parse_gen1_path(path: &str) -> Option<(String, u64)> {
     let node_id = path.split('/').next()?.to_string();
     if node_id.is_empty() {
         return None;
@@ -433,7 +475,7 @@ fn parse_gen1_path(path: &str) -> Option<GenOneTombstone> {
         return None;
     }
     let wal_seq = stem.parse::<u64>().ok()?;
-    Some(GenOneTombstone { node_id, wal_seq })
+    Some((node_id, wal_seq))
 }
 
 impl Inner {
@@ -451,15 +493,21 @@ impl Inner {
         let mut file_count: u64 = 0;
         let mut size_in_mb = 0.0;
         let mut row_count: u64 = 0;
-        let mut removed_tombstones: HashMap<String, GenOneTombstone> = HashMap::new();
+        let mut removed_tombstones: HashMap<String, TombstoneGc> = HashMap::new();
 
         let files = persisted_snapshots.iter().fold(
             hashbrown::HashMap::new(),
             |mut files, persisted_snapshot| {
+                // Boot fold: snapshots are applied in deterministic order
+                // (merged checkpoint, then WAL ascending, then compactions
+                // ascending), so a compaction id is not threaded here — gen1
+                // tombstoning by path plus the seeded checkpoint tombstones
+                // cover the reorderable cases.
                 let delta = update_persisted_files_with_snapshot(
                     persisted_snapshot,
                     &mut files,
                     &mut removed_tombstones,
+                    None,
                 );
                 file_count += delta.added_count;
                 file_count = file_count.saturating_sub(delta.removed_count);
@@ -508,9 +556,10 @@ impl Inner {
         // Convert merged checkpoint to Inner, or start with empty
         let mut inner = merged_checkpoint.map(Inner::from).unwrap_or_default();
 
-        // Apply additional snapshots
+        // Apply additional snapshots (deterministic boot order, no compaction
+        // id threaded — see `new_from_persisted_snapshots`).
         for snapshot in additional_snapshots {
-            inner.add_persisted_snapshot(snapshot);
+            inner.add_persisted_snapshot(snapshot, None);
         }
 
         debug!(
@@ -526,11 +575,16 @@ impl Inner {
     /// Merges all files from a [`PersistedSnapshot`] into the persisted files hierarchy.
     ///
     /// Deduplicates incoming files. Called at runtime (not during initial load).
-    pub(crate) fn add_persisted_snapshot(&mut self, persisted_snapshot: PersistedSnapshot) {
+    pub(crate) fn add_persisted_snapshot(
+        &mut self,
+        persisted_snapshot: PersistedSnapshot,
+        source_compaction_id: Option<&str>,
+    ) {
         let delta = update_persisted_files_with_snapshot(
             &persisted_snapshot,
             &mut self.files,
             &mut self.removed_tombstones,
+            source_compaction_id,
         );
         self.parquet_files_count += delta.added_count;
         self.parquet_files_count = self
@@ -572,13 +626,20 @@ impl Inner {
     /// it can never re-add the file and the tombstone is no longer needed.
     /// Bounds tombstone memory; correctness does not depend on it (paths are
     /// write-once, so a stale tombstone could only suppress a deleted file).
-    fn gc_tombstones(&mut self, wal_high_water: &std::collections::HashMap<String, u64>) {
-        self.removed_tombstones.retain(|_path, ts| {
-            wal_high_water
-                .get(&ts.node_id)
-                .copied()
-                .unwrap_or(0)
-                < ts.wal_seq
+    fn gc_tombstones(
+        &mut self,
+        wal_high_water: &std::collections::HashMap<String, u64>,
+        compactions_high_water: Option<&str>,
+    ) {
+        self.removed_tombstones.retain(|_path, gc| match gc {
+            TombstoneGc::WalSeq { node_id, wal_seq } => {
+                wal_high_water.get(node_id).copied().unwrap_or(0) < *wal_seq
+            }
+            TombstoneGc::Compaction { removing_id } => {
+                // Keep until the compaction high-water reaches the removing id;
+                // ULIDs are lexicographically time-ordered.
+                compactions_high_water.is_none_or(|hw| hw < removing_id.as_str())
+            }
         });
     }
 
@@ -586,8 +647,12 @@ impl Inner {
     /// booted node suppresses re-adds of files compaction removed before the
     /// checkpoint (whose removal manifests sit below the loader's high-water
     /// and are therefore never re-folded).
-    fn seed_tombstones(&mut self, tombstones: impl IntoIterator<Item = (String, u64)>) {
-        for (path, wal_seq) in tombstones {
+    fn seed_tombstones(
+        &mut self,
+        gen1: impl IntoIterator<Item = (String, u64)>,
+        compaction: impl IntoIterator<Item = (String, String)>,
+    ) {
+        for (path, wal_seq) in gen1 {
             if let Some(node_id) = path
                 .split('/')
                 .next()
@@ -595,8 +660,12 @@ impl Inner {
                 .map(str::to_string)
             {
                 self.removed_tombstones
-                    .insert(path, GenOneTombstone { node_id, wal_seq });
+                    .insert(path, TombstoneGc::WalSeq { node_id, wal_seq });
             }
+        }
+        for (path, removing_id) in compaction {
+            self.removed_tombstones
+                .insert(path, TombstoneGc::Compaction { removing_id });
         }
     }
 }
@@ -662,7 +731,8 @@ struct SnapshotFoldDelta {
 fn update_persisted_files_with_snapshot(
     persisted_snapshot: &PersistedSnapshot,
     db_to_tables: &mut HashMap<DbId, HashMap<TableId, Vec<ParquetFile>>>,
-    tombstones: &mut HashMap<String, GenOneTombstone>,
+    tombstones: &mut HashMap<String, TombstoneGc>,
+    source_compaction_id: Option<&str>,
 ) -> SnapshotFoldDelta {
     let mut delta = SnapshotFoldDelta::default();
     persisted_snapshot
@@ -753,12 +823,21 @@ fn update_persisted_files_with_snapshot(
                     // reordered ahead of its add) becomes a tombstone so the
                     // later add is suppressed. Present-and-removed targets need
                     // none — keeps the set bounded under normal compaction.
+                    // gen1 writer paths GC against the WAL high-water; gen2+
+                    // compactor paths GC against the removing compaction's id.
                     for f in remove_parquet_files {
                         if present_targets.contains(&f.path) {
                             continue;
                         }
-                        if let Some(ts) = parse_gen1_path(&f.path) {
-                            tombstones.insert(f.path.clone(), ts);
+                        let gc = if let Some((node_id, wal_seq)) = parse_gen1_path(&f.path) {
+                            Some(TombstoneGc::WalSeq { node_id, wal_seq })
+                        } else {
+                            source_compaction_id.map(|id| TombstoneGc::Compaction {
+                                removing_id: id.to_string(),
+                            })
+                        };
+                        if let Some(gc) = gc {
+                            tombstones.insert(f.path.clone(), gc);
                         }
                     }
                 });
