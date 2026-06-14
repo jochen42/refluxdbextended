@@ -398,6 +398,11 @@ impl SharedInventory {
         let compactions: Vec<PersistedSnapshot> =
             compactions_raw.into_iter().map(|(_, s)| s).collect();
 
+        let tombstones = checkpoint
+            .as_ref()
+            .map(|cp| cp.tombstones.clone())
+            .unwrap_or_default();
+
         debug!(
             "shared inventory loaded: checkpoint={}, wal_snapshots={}, compactions={}",
             checkpoint.is_some(),
@@ -411,6 +416,7 @@ impl SharedInventory {
             compactions,
             wal_watermarks,
             compaction_watermark,
+            tombstones,
         })
     }
 
@@ -433,6 +439,14 @@ pub struct Checkpoint {
     /// empty. Applying it to a fresh `PersistedFiles` reproduces the
     /// checkpoint's view.
     pub merged_snapshot: PersistedSnapshot,
+    /// Removed-file tombstones carried forward as `(path, wal_seq)`: writer
+    /// gen1 files that a folded compaction removed but whose adding WAL
+    /// snapshot may still be re-folded above `wal_high_water`. A loader seeds
+    /// these so it suppresses re-adds whose removal manifest sits below the
+    /// high-water and is never replayed. Defaulted for backward compatibility
+    /// with checkpoints written before this field existed.
+    #[serde(default)]
+    pub tombstones: Vec<(String, u64)>,
 }
 
 #[derive(Debug)]
@@ -446,6 +460,10 @@ pub struct LoadedInventory {
     /// Highest compaction ULID seen — feeds the inventory poller's starting
     /// cursor for compaction listings.
     pub compaction_watermark: Option<String>,
+    /// Removed-file tombstones from the checkpoint, seeded into `PersistedFiles`
+    /// before folding `wal_snapshots`/`compactions` so re-adds of
+    /// compaction-deleted gen1 files are suppressed.
+    pub tombstones: Vec<(String, u64)>,
 }
 
 impl LoadedInventory {
@@ -641,11 +659,36 @@ mod tests {
             wal_high_water: [("node-a".to_string(), 5u64)].into_iter().collect(),
             compactions_high_water: Some("01ABC".to_string()),
             merged_snapshot: snap_with("checkpoint", 0, "merged/file.parquet"),
+            tombstones: Vec::new(),
         };
         inv.write_checkpoint(&cp).await.unwrap();
         let loaded = inv.load_latest_checkpoint().await.unwrap().unwrap();
         assert_eq!(loaded.wal_high_water.get("node-a"), Some(&5));
         assert_eq!(loaded.compactions_high_water.as_deref(), Some("01ABC"));
+    }
+
+    /// Tombstones round-trip, and a checkpoint written before the field existed
+    /// (no `tombstones` key) still deserializes with an empty set.
+    #[test]
+    fn checkpoint_tombstones_round_trip_and_backcompat() {
+        let cp = Checkpoint {
+            wal_high_water: [("node-a".to_string(), 5u64)].into_iter().collect(),
+            compactions_high_water: None,
+            merged_snapshot: snap_with("checkpoint", 0, "merged.parquet"),
+            tombstones: vec![("main-writer-0/dbs/1/2/d/h/0000001800.parquet".to_string(), 1800)],
+        };
+        let bytes = serde_json::to_vec(&cp).unwrap();
+        let back: Checkpoint = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.tombstones, cp.tombstones);
+
+        // Legacy checkpoint JSON without the `tombstones` field.
+        let legacy = serde_json::json!({
+            "wal_high_water": {"node-a": 5},
+            "compactions_high_water": null,
+            "merged_snapshot": serde_json::to_value(snap_with("checkpoint", 0, "m.parquet")).unwrap(),
+        });
+        let parsed: Checkpoint = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.tombstones.is_empty());
     }
 
     #[tokio::test]
@@ -682,6 +725,7 @@ mod tests {
             wal_high_water: [("node-a".to_string(), 3u64)].into_iter().collect(),
             compactions_high_water: None,
             merged_snapshot: snap_with("checkpoint", 0, "merged.parquet"),
+            tombstones: Vec::new(),
         };
         inv.write_checkpoint(&cp).await.unwrap();
 

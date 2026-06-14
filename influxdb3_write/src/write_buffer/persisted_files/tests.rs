@@ -237,6 +237,165 @@ fn test_removed_files_match_by_path_at_runtime() {
     assert_eq!(compactor_output.path, files[0].path);
 }
 
+/// Phantom-ref root cause: a compaction `removed_files` for a writer gen1 file
+/// is folded BEFORE the WAL snapshot that adds it (reorder under backfill, or a
+/// checkpoint that baked the removal below its high-water while the add sits
+/// above it). The removal finds nothing to drop, so without a tombstone the
+/// later add resurrects the deleted gen1 file — a phantom ref that 404s. The
+/// fold must record a tombstone on the absent removal and suppress the re-add.
+#[test_log::test(test)]
+fn test_tombstone_suppresses_reordered_readd() {
+    let gen1 = ParquetFile {
+        id: ParquetFileId::from(1),
+        path: "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".to_owned(),
+        size_bytes: 50,
+        row_count: 5,
+        chunk_time: 0,
+        min_time: 0,
+        max_time: 100,
+    };
+
+    let persisted = PersistedFiles::new(None);
+
+    // Removal arrives first, targeting a file not present yet.
+    let mut removal = build_snapshot(vec![], 1, 1, 1);
+    let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
+    removed
+        .entry(DbId::from(0))
+        .or_default()
+        .tables
+        .entry(TableId::from(0))
+        .or_default()
+        .push(gen1.clone());
+    removal.removed_files = removed;
+    persisted.add_persisted_snapshot_files(removal);
+
+    // Tombstone recorded; nothing visible.
+    assert_eq!(persisted.tombstones().len(), 1);
+    assert!(
+        persisted
+            .get_files(DbId::from(0), TableId::from(0))
+            .is_empty()
+    );
+
+    // The add lands later — it must be suppressed, not resurrected.
+    persisted.add_persisted_snapshot_files(build_snapshot(vec![gen1.clone()], 2, 2, 2));
+    assert!(
+        persisted
+            .get_files(DbId::from(0), TableId::from(0))
+            .is_empty(),
+        "reordered add resurrected a compaction-deleted gen1 file (phantom ref)"
+    );
+}
+
+/// A tombstone is dropped once the writer's WAL high-water passes the source
+/// snapshot (it can never be re-folded after that, so the file can't re-add).
+/// Below the mark it is retained; at/above it is collected.
+#[test_log::test(test)]
+fn test_tombstone_gc_by_high_water() {
+    let gen1 = ParquetFile {
+        id: ParquetFileId::from(1),
+        path: "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".to_owned(),
+        size_bytes: 50,
+        row_count: 5,
+        chunk_time: 0,
+        min_time: 0,
+        max_time: 100,
+    };
+    let persisted = PersistedFiles::new(None);
+    let mut removal = build_snapshot(vec![], 1, 1, 1);
+    let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
+    removed
+        .entry(DbId::from(0))
+        .or_default()
+        .tables
+        .entry(TableId::from(0))
+        .or_default()
+        .push(gen1.clone());
+    removal.removed_files = removed;
+    persisted.add_persisted_snapshot_files(removal);
+    assert_eq!(persisted.tombstones().len(), 1);
+
+    // High-water still below the source seq (1800): retained.
+    persisted.gc_tombstones(&std::collections::HashMap::from([(
+        "main-writer-0".to_string(),
+        1799u64,
+    )]));
+    assert_eq!(persisted.tombstones().len(), 1);
+
+    // High-water reaches the source seq: collected.
+    persisted.gc_tombstones(&std::collections::HashMap::from([(
+        "main-writer-0".to_string(),
+        1800u64,
+    )]));
+    assert!(persisted.tombstones().is_empty());
+}
+
+/// The common path — add then remove, in order — must NOT leave a tombstone, so
+/// the tombstone set stays bounded under normal compaction.
+#[test_log::test(test)]
+fn test_in_order_removal_leaves_no_tombstone() {
+    let gen1 = ParquetFile {
+        id: ParquetFileId::from(1),
+        path: "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".to_owned(),
+        size_bytes: 50,
+        row_count: 5,
+        chunk_time: 0,
+        min_time: 0,
+        max_time: 100,
+    };
+    let persisted = PersistedFiles::new(None);
+    persisted.add_persisted_snapshot_files(build_snapshot(vec![gen1.clone()], 1, 1, 1));
+
+    let mut removal = build_snapshot(vec![], 2, 2, 2);
+    let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
+    removed
+        .entry(DbId::from(0))
+        .or_default()
+        .tables
+        .entry(TableId::from(0))
+        .or_default()
+        .push(gen1.clone());
+    removal.removed_files = removed;
+    persisted.add_persisted_snapshot_files(removal);
+
+    assert!(
+        persisted
+            .get_files(DbId::from(0), TableId::from(0))
+            .is_empty()
+    );
+    assert!(
+        persisted.tombstones().is_empty(),
+        "in-order removal should not create a tombstone"
+    );
+}
+
+/// Seeding tombstones from a checkpoint (the querier boot path) suppresses a
+/// re-listed gen1 file whose removal sits below the checkpoint high-water.
+#[test_log::test(test)]
+fn test_seed_tombstones_suppresses_readd() {
+    let path = "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".to_owned();
+    let gen1 = ParquetFile {
+        id: ParquetFileId::from(1),
+        path: path.clone(),
+        size_bytes: 50,
+        row_count: 5,
+        chunk_time: 0,
+        min_time: 0,
+        max_time: 100,
+    };
+    let persisted = PersistedFiles::new(None);
+    persisted.seed_tombstones(vec![(path, 1800)]);
+
+    persisted.add_persisted_snapshot_files(build_snapshot(vec![gen1], 5, 5, 5));
+    assert!(
+        persisted
+            .get_files(DbId::from(0), TableId::from(0))
+            .is_empty(),
+        "seeded tombstone did not suppress checkpoint re-add"
+    );
+}
+
 #[test]
 fn test_get_files_with_filters() {
     let parquet_files = (0..100)

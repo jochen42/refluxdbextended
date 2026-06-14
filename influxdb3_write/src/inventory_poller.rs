@@ -354,6 +354,11 @@ async fn tick(
         applied.compactions += 1;
     }
 
+    // Drop removed-file tombstones whose source WAL snapshot the high-water has
+    // now passed (it can no longer be re-folded, so it can never re-add the
+    // file). Bounds tombstone memory; rides this tick's advanced cursors.
+    persisted_files.gc_tombstones(wal_cursors);
+
     Ok(applied)
 }
 

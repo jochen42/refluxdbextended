@@ -427,6 +427,10 @@ impl WriteBufferImpl {
                 Ok(loaded) => {
                     initial_wal_watermarks = loaded.wal_watermarks.clone();
                     initial_compaction_watermark = loaded.compaction_watermark.clone();
+                    // Seed tombstones before folding so a re-listed gen1 file
+                    // whose removal sits below the checkpoint high-water is
+                    // suppressed rather than resurrected as a phantom ref.
+                    persisted_files.seed_tombstones(loaded.tombstones.clone());
                     for snapshot in loaded.flatten() {
                         persisted_files.add_persisted_snapshot_files(snapshot);
                     }

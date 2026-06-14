@@ -13,7 +13,7 @@ use influxdb3_catalog::catalog::Catalog;
 use influxdb3_id::TableId;
 use influxdb3_id::{DbId, SerdeVecMap};
 use influxdb3_telemetry::ParquetMetrics;
-use observability_deps::tracing::{debug, trace, warn};
+use observability_deps::tracing::{debug, trace};
 use parking_lot::RwLock;
 
 type DatabaseToTables = HashMap<DbId, TableToFiles>;
@@ -206,6 +206,29 @@ impl PersistedFiles {
         out
     }
 
+    /// Garbage-collect removed-file tombstones against the current per-node WAL
+    /// high-water marks. Called by the inventory poller after each fold tick.
+    pub fn gc_tombstones(&self, wal_high_water: &std::collections::HashMap<String, u64>) {
+        self.inner.write().gc_tombstones(wal_high_water);
+    }
+
+    /// Snapshot the live removed-file tombstones as `(path, wal_seq)` pairs for
+    /// persistence in a shared-inventory checkpoint.
+    pub fn tombstones(&self) -> Vec<(String, u64)> {
+        self.inner
+            .read()
+            .removed_tombstones
+            .iter()
+            .map(|(path, ts)| (path.clone(), ts.wal_seq))
+            .collect()
+    }
+
+    /// Seed removed-file tombstones from a shared-inventory checkpoint before
+    /// folding the newer WAL/compaction manifests on top of it.
+    pub fn seed_tombstones(&self, tombstones: Vec<(String, u64)>) {
+        self.inner.write().seed_tombstones(tombstones);
+    }
+
     /// Get the list of files for a given database and table, always return in descending order of min_time
     pub fn get_files(&self, db_id: DbId, table_id: TableId) -> Vec<ParquetFile> {
         self.get_files_filtered(db_id, table_id, &ChunkFilter::default())
@@ -371,6 +394,46 @@ struct Inner {
     pub parquet_files_row_count: u64,
     /// Data that are marked for deletion.
     pub deleted_data: HashMap<DbId, DeletedTables>,
+    /// Removed-file tombstones: writer gen1 object-store paths that a folded
+    /// compaction `removed_files` referenced but which were not present at fold
+    /// time (the removal landed before the writer snapshot that adds them).
+    /// A subsequent add for a tombstoned path is suppressed, making the fold
+    /// order-independent and preventing phantom refs to compaction-deleted
+    /// gen1 files. Value is the source WAL `snapshot_sequence_number` parsed
+    /// from the path stem, used to garbage-collect the tombstone once the
+    /// writer's `wal_high_water` passes it (that snapshot can no longer re-add
+    /// the file). Object-store paths are write-once, so tombstoning one can
+    /// never hide a live file — only a stale re-listing of a deleted one.
+    pub removed_tombstones: HashMap<String, GenOneTombstone>,
+}
+
+/// GC key for a removed-file tombstone: the writer node that owns the gen1
+/// path and the WAL snapshot sequence number parsed from its stem.
+#[derive(Debug, Clone)]
+pub(crate) struct GenOneTombstone {
+    pub node_id: String,
+    pub wal_seq: u64,
+}
+
+/// Parse a writer gen1 parquet path into `(node_id, wal_seq)`.
+///
+/// Writer gen1 files are laid out as
+/// `<node_id>/dbs/<db>/<table>/<date>/<hour>/<wal_seq:010>.parquet`, so the
+/// leading path segment is the node id and the file stem is the zero-padded
+/// WAL `snapshot_sequence_number`. Compactor outputs (gen2+) use a ULID stem
+/// and a `<uuid>-<id>` directory scheme, so they do not parse here — those
+/// removals fold in ULID order and never reorder, so they need no tombstone.
+fn parse_gen1_path(path: &str) -> Option<GenOneTombstone> {
+    let node_id = path.split('/').next()?.to_string();
+    if node_id.is_empty() {
+        return None;
+    }
+    let stem = path.strip_suffix(".parquet")?.rsplit('/').next()?;
+    if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let wal_seq = stem.parse::<u64>().ok()?;
+    Some(GenOneTombstone { node_id, wal_seq })
 }
 
 impl Inner {
@@ -388,11 +451,16 @@ impl Inner {
         let mut file_count: u64 = 0;
         let mut size_in_mb = 0.0;
         let mut row_count: u64 = 0;
+        let mut removed_tombstones: HashMap<String, GenOneTombstone> = HashMap::new();
 
         let files = persisted_snapshots.iter().fold(
             hashbrown::HashMap::new(),
             |mut files, persisted_snapshot| {
-                let delta = update_persisted_files_with_snapshot(persisted_snapshot, &mut files);
+                let delta = update_persisted_files_with_snapshot(
+                    persisted_snapshot,
+                    &mut files,
+                    &mut removed_tombstones,
+                );
                 file_count += delta.added_count;
                 file_count = file_count.saturating_sub(delta.removed_count);
                 size_in_mb += as_mb(delta.added_size_bytes);
@@ -413,6 +481,7 @@ impl Inner {
             parquet_files_row_count: row_count,
             parquet_files_size_mb: size_in_mb,
             deleted_data: HashMap::new(),
+            removed_tombstones,
         }
     }
 
@@ -458,7 +527,11 @@ impl Inner {
     ///
     /// Deduplicates incoming files. Called at runtime (not during initial load).
     pub(crate) fn add_persisted_snapshot(&mut self, persisted_snapshot: PersistedSnapshot) {
-        let delta = update_persisted_files_with_snapshot(&persisted_snapshot, &mut self.files);
+        let delta = update_persisted_files_with_snapshot(
+            &persisted_snapshot,
+            &mut self.files,
+            &mut self.removed_tombstones,
+        );
         self.parquet_files_count += delta.added_count;
         self.parquet_files_count = self
             .parquet_files_count
@@ -493,6 +566,39 @@ impl Inner {
         }
         self.parquet_files_count += 1;
     }
+
+    /// Drop tombstones whose source WAL snapshot has been passed by the
+    /// writer's high-water mark: that snapshot can no longer be re-folded, so
+    /// it can never re-add the file and the tombstone is no longer needed.
+    /// Bounds tombstone memory; correctness does not depend on it (paths are
+    /// write-once, so a stale tombstone could only suppress a deleted file).
+    fn gc_tombstones(&mut self, wal_high_water: &std::collections::HashMap<String, u64>) {
+        self.removed_tombstones.retain(|_path, ts| {
+            wal_high_water
+                .get(&ts.node_id)
+                .copied()
+                .unwrap_or(0)
+                < ts.wal_seq
+        });
+    }
+
+    /// Seed tombstones loaded from a shared-inventory checkpoint, so a freshly
+    /// booted node suppresses re-adds of files compaction removed before the
+    /// checkpoint (whose removal manifests sit below the loader's high-water
+    /// and are therefore never re-folded).
+    fn seed_tombstones(&mut self, tombstones: impl IntoIterator<Item = (String, u64)>) {
+        for (path, wal_seq) in tombstones {
+            if let Some(node_id) = path
+                .split('/')
+                .next()
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+            {
+                self.removed_tombstones
+                    .insert(path, GenOneTombstone { node_id, wal_seq });
+            }
+        }
+    }
 }
 
 impl From<PersistedSnapshotCheckpoint> for Inner {
@@ -518,6 +624,7 @@ impl From<PersistedSnapshotCheckpoint> for Inner {
             parquet_files_size_mb: as_mb(checkpoint.parquet_size_bytes),
             parquet_files_row_count: checkpoint.row_count,
             deleted_data: HashMap::new(),
+            removed_tombstones: HashMap::new(),
         }
     }
 }
@@ -555,6 +662,7 @@ struct SnapshotFoldDelta {
 fn update_persisted_files_with_snapshot(
     persisted_snapshot: &PersistedSnapshot,
     db_to_tables: &mut HashMap<DbId, HashMap<TableId, Vec<ParquetFile>>>,
+    tombstones: &mut HashMap<String, GenOneTombstone>,
 ) -> SnapshotFoldDelta {
     let mut delta = SnapshotFoldDelta::default();
     persisted_snapshot
@@ -575,6 +683,13 @@ fn update_persisted_files_with_snapshot(
                     let mut seen_paths: HashSet<String> =
                         table_files.iter().map(|f| f.path.clone()).collect();
                     for file in new_parquet_files {
+                        // Suppress a re-add of a file a prior fold already saw
+                        // removed (removal-before-add reorder). Without this the
+                        // add resurrects a compaction-deleted gen1 file → a
+                        // phantom ref that 404s at query time.
+                        if tombstones.contains_key(&file.path) {
+                            continue;
+                        }
                         if seen_paths.insert(file.path.clone()) {
                             delta.added_count += 1;
                             delta.added_size_bytes += file.size_bytes;
@@ -585,49 +700,67 @@ fn update_persisted_files_with_snapshot(
                 });
         });
 
-    // We now remove any files as we load the snapshots if they exist.
+    // Remove files referenced by `removed_files`. A removal whose target is not
+    // present yet (the writer snapshot that adds it has not been folded, or was
+    // already folded into a checkpoint below the loader's high-water) is
+    // recorded as a tombstone so the later add is suppressed — making the fold
+    // order-independent. Tombstones are kept only for writer gen1 paths, the
+    // one stream that can reorder against compaction manifests; they GC once
+    // `wal_high_water` passes the source snapshot.
     persisted_snapshot
         .removed_files
         .iter()
         .for_each(|(db_id, tables)| {
-            let Some(db_tables) = db_to_tables.get_mut(db_id) else {
-                // this can happen if the table(s) to remove from PersistedFiles is further back in
-                // history than the default number of snapshots loaded during server initialization
-                warn!(
-                    db_id = ?db_id,
-                    "expected to remove tables for db in persisted files"
-                );
-                return;
-            };
-
             tables
                 .tables
                 .iter()
                 .for_each(|(table_id, remove_parquet_files)| {
-                    let Some(table_files) = db_tables.get_mut(table_id) else {
-                        // this can happen if the table(s) to remove from PersistedFiles is further back in
-                        // history than the default number of snapshots loaded during server initialization
-                        warn!(
-                            db_id = ?db_id,
-                            table_id = ?table_id,
-                            "expected to remove table from db in persisted files"
-                        );
-                        return;
-                    };
                     let remove_paths: HashSet<&str> = remove_parquet_files
                         .iter()
                         .map(|f| f.path.as_str())
                         .collect();
-                    table_files.retain(|f| {
-                        if remove_paths.contains(f.path.as_str()) {
-                            delta.removed_count += 1;
-                            delta.removed_size_bytes += f.size_bytes;
-                            delta.removed_row_count += f.row_count;
-                            false
-                        } else {
-                            true
+
+                    // Which targets are actually present right now? Captured
+                    // before the retain so we can tell "removed" (was present)
+                    // from "absent" (reordered ahead of its add) afterwards.
+                    let present_targets: HashSet<String> = db_to_tables
+                        .get(db_id)
+                        .and_then(|t| t.get(table_id))
+                        .map(|fs| {
+                            fs.iter()
+                                .filter(|f| remove_paths.contains(f.path.as_str()))
+                                .map(|f| f.path.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    if let Some(table_files) =
+                        db_to_tables.get_mut(db_id).and_then(|t| t.get_mut(table_id))
+                    {
+                        table_files.retain(|f| {
+                            if remove_paths.contains(f.path.as_str()) {
+                                delta.removed_count += 1;
+                                delta.removed_size_bytes += f.size_bytes;
+                                delta.removed_row_count += f.row_count;
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                    }
+
+                    // A removal target that was NOT present (absent because
+                    // reordered ahead of its add) becomes a tombstone so the
+                    // later add is suppressed. Present-and-removed targets need
+                    // none — keeps the set bounded under normal compaction.
+                    for f in remove_parquet_files {
+                        if present_targets.contains(&f.path) {
+                            continue;
                         }
-                    });
+                        if let Some(ts) = parse_gen1_path(&f.path) {
+                            tombstones.insert(f.path.clone(), ts);
+                        }
+                    }
                 });
         });
 

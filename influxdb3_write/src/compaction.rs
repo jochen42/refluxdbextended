@@ -464,10 +464,20 @@ impl CompactionService {
             }
         }
 
+        // Carry forward removed-file tombstones so a loader starting from this
+        // checkpoint suppresses re-adds of gen1 files compaction already
+        // removed (their removal manifests sit below `compactions_high_water`
+        // and are never replayed, but a writer snapshot above `wal_high_water`
+        // can still re-list them). GC against the high-water first so only
+        // still-re-addable tombstones are persisted.
+        persisted_files.gc_tombstones(&wal_high_water);
+        let tombstones = persisted_files.tombstones();
+
         let cp = crate::shared_inventory::Checkpoint {
             wal_high_water,
             compactions_high_water,
             merged_snapshot: merged,
+            tombstones,
         };
         inv.write_checkpoint(&cp).await?;
         Ok(())
