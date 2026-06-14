@@ -4,6 +4,7 @@ use crate::statistics::{SchemaBoundStatistics, build_statistics_for_chunks};
 use crate::util::union_multiple_children;
 use crate::{
     CHUNK_ORDER_COLUMN_NAME, QueryChunk, QueryChunkData,
+    provider::not_found_tolerant::NotFoundTolerantSource,
     provider::record_batch_exec::RecordBatchesExec, util::arrow_sort_key_exprs,
 };
 use arrow::datatypes::{Fields, Schema as ArrowSchema, SchemaRef};
@@ -302,7 +303,19 @@ pub fn chunks_to_physical_nodes(
             object_store_url,
             // file_schema is the schema of all files in the DataSourceExec which is a superset of each file's schema
             Arc::clone(&schema_without_chunk_order),
-            Arc::new(ParquetSource::new(table_parquet_options())),
+            // Tolerate a single missing (compaction-deleted, stale-ref) parquet
+            // by scanning it as empty instead of failing the whole query; the
+            // superseding (higher-gen) file is already in this same plan and the
+            // ReorgPlanner dedupes the overlap, so the result stays correct.
+            // Scoped to object-store NotFound only — auth/corruption/transient
+            // errors still fail loud. A safety net under the multi-node
+            // eventually-consistent inventory: -24..-27 reduce phantom-ref
+            // formation and ref_validator sweeps the residual, but a query can
+            // still race a not-yet-swept stale ref (e.g. a fresh querier's boot
+            // window); this closes that read-path gap.
+            Arc::new(NotFoundTolerantSource::new(Arc::new(ParquetSource::new(
+                table_parquet_options(),
+            )))),
         )
         .with_file_groups(file_groups)
         .with_statistics(statistics)
