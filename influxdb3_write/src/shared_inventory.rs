@@ -539,6 +539,33 @@ mod tests {
         assert!(inv.all_live_consumers_folded(cid, 100_000, 60_000).await.unwrap());
     }
 
+    /// Boot-race guard: a querier that publishes a heartbeat at the checkpoint
+    /// baseline *before* it finishes loading must block deletion of any
+    /// compaction after that baseline, so the compactor cannot delete inputs the
+    /// booting querier is about to reference. Once the querier folds forward past
+    /// the compaction, the gate unblocks.
+    #[tokio::test]
+    async fn boot_heartbeat_blocks_deletion_until_querier_catches_up() {
+        let inv = SharedInventory::new(Arc::new(InMemory::new()));
+        let baseline = "019ec5e7-0000-7000-8000-000000000000"; // checkpoint baseline
+        let newer = "019ec628-0000-7000-8000-000000000000"; // a compaction after baseline
+
+        // Booting querier registers its liveness at the baseline cursor BEFORE
+        // loading the inventory — fresh heartbeat, cursor < `newer`.
+        inv.write_consumer_heartbeat("q-boot", Some(baseline.to_string()), 1000)
+            .await
+            .unwrap();
+        // The gate must NOT permit deleting `newer`'s inputs: this querier will
+        // load and reference them but has not folded `newer`'s removal yet.
+        assert!(!inv.all_live_consumers_folded(newer, 1000, 60_000).await.unwrap());
+
+        // After the querier's poller has folded past `newer`, the gate unblocks.
+        inv.write_consumer_heartbeat("q-boot", Some(newer.to_string()), 2000)
+            .await
+            .unwrap();
+        assert!(inv.all_live_consumers_folded(newer, 2000, 60_000).await.unwrap());
+    }
+
     fn snap_with(node: &str, seq: u64, file_path: &str) -> PersistedSnapshot {
         let mut s = PersistedSnapshot::new(
             node.to_string(),

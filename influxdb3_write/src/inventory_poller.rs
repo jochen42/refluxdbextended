@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 /// convergence `staleness_ttl` (300s) so that a multi-minute backfill fold can
 /// never age our heartbeat into "stale" — which would make the convergence gate
 /// treat this live querier as dead and delete files we still reference.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct InventoryPollerArgs {

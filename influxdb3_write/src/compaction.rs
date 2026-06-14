@@ -950,11 +950,20 @@ impl CompactionService {
                         Err(e) => warn!("convergence gate check failed: {e}"),
                     }
                     if start.elapsed() >= cfg.max_wait {
+                        // Invariant: never delete a file a live querier may still
+                        // reference. On timeout, PRESERVE the inputs (they become
+                        // orphans — no manifest references them, so storage cost
+                        // only, never data loss) rather than force-delete into a
+                        // phantom ref / 404. A consumer that is
+                        // genuinely gone ages out via `staleness_ttl` above and stops
+                        // blocking; only a live-but-wedged consumer can reach here,
+                        // and stranding it with a missing object is never acceptable.
                         warn!(
                             %compaction_id,
-                            "convergence gate timed out; deleting superseded inputs anyway"
+                            "convergence gate timed out with a live consumer still behind; \
+                             preserving superseded inputs (NOT deleting) to avoid a phantom ref"
                         );
-                        break;
+                        return;
                     }
                     tokio::time::sleep(cfg.poll_interval).await;
                 }

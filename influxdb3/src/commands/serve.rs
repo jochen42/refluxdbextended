@@ -1356,6 +1356,57 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         None
     };
 
+    // Querier boot-race guard (phantom-ref invariant): register a consumer
+    // heartbeat BEFORE the initial inventory load — which can take minutes under
+    // heavy backfill. Without this the querier is invisible to the compactor's
+    // convergence gate during boot, so the compactor could delete a compaction's
+    // inputs that this querier is in the middle of loading → phantom ref / 404.
+    // The cursor we publish is the checkpoint baseline: the gate then blocks
+    // deletion of every compaction *after* that baseline until our inventory
+    // poller's heartbeat advances the cursor. Compactions ≤ baseline are already
+    // reflected as removed in the checkpoint's merged state we load, so claiming
+    // the baseline is safe. The poller's own heartbeat takes over once it spawns
+    // (we stop this one then).
+    let boot_heartbeat_stop = Arc::new(tokio::sync::Notify::new());
+    if matches!(config.mode, NodeMode::Querier) {
+        if let Some(inv) = &shared_inventory {
+            let baseline = inv
+                .load_latest_checkpoint()
+                .await
+                .ok()
+                .flatten()
+                .and_then(|cp| cp.compactions_high_water);
+            let now_ms = time_provider.now().timestamp_millis();
+            if let Err(e) = inv
+                .write_consumer_heartbeat(node_id.as_str(), baseline.clone(), now_ms)
+                .await
+            {
+                warn!(%e, "failed to publish boot consumer heartbeat");
+            }
+            let inv = inv.clone();
+            let node = node_id.clone();
+            let tp = Arc::clone(&time_provider);
+            let stop = Arc::clone(&boot_heartbeat_stop);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.notified() => return,
+                        _ = tokio::time::sleep(
+                            influxdb3_write::inventory_poller::HEARTBEAT_INTERVAL,
+                        ) => {}
+                    }
+                    let now_ms = tp.now().timestamp_millis();
+                    if let Err(e) = inv
+                        .write_consumer_heartbeat(node.as_str(), baseline.clone(), now_ms)
+                        .await
+                    {
+                        warn!(%e, "failed to refresh boot consumer heartbeat");
+                    }
+                }
+            });
+        }
+    }
+
     // Writer lease: ensure no other process is also accepting writes against
     // this bucket. Acquired before WAL replay so a stale predecessor can't
     // race the WAL writer.
@@ -1586,6 +1637,11 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
                     time_provider: Arc::clone(&time_provider),
                 },
             );
+            // The poller's heartbeat now owns liveness (it advances the cursor as
+            // it folds). Stop the boot heartbeat so the two don't race the
+            // consumer file. The poller publishes its first heartbeat immediately
+            // on spawn, so there is no liveness gap at the handoff.
+            boot_heartbeat_stop.notify_one();
         }
     }
 
