@@ -471,7 +471,82 @@ impl CompactionService {
         // can still re-list them). GC against the high-water first so only
         // still-re-addable tombstones are persisted.
         persisted_files.gc_tombstones(&wal_high_water, compactions_high_water.as_deref());
-        let (tombstones, compaction_tombstones) = persisted_files.tombstones_for_checkpoint();
+        let (mut tombstones, compaction_tombstones) = persisted_files.tombstones_for_checkpoint();
+
+        // Survivor tombstones — the direct fix for the phantom-ref recurrence: a
+        // WAL snapshot manifest can outlive the compaction that removed its gen1
+        // files (the writer keeps publishing per-snapshot manifests; the
+        // gen1->gen2 compaction that removed them ages out / is folded into this
+        // checkpoint). A loader folds that surviving manifest (seq >
+        // wal_high_water) ON TOP of our clean `merged` and re-adds the deleted
+        // files — and no reorder-tombstone exists because the compactor removed
+        // them in order (no tombstone formed). So scan every WAL manifest a
+        // loader will still re-fold and tombstone each file it lists that is
+        // absent from `merged` (i.e. compaction already removed it). This
+        // suppresses the re-add at the source. Recomputed every checkpoint, so
+        // the set needs no GC; bounded by the (small) number of live manifests.
+        let merged_paths: std::collections::HashSet<&str> = merged
+            .databases
+            .iter()
+            .flat_map(|(_, db)| db.tables.iter())
+            .flat_map(|(_, files)| files.iter())
+            .map(|f| f.path.as_str())
+            .collect();
+        // Candidates: files a still-foldable WAL manifest lists but `merged`
+        // lacks. A candidate is EITHER compaction-deleted (tombstone it) OR
+        // persisted-but-not-yet-compactor-folded (LIVE — must NOT tombstone, or
+        // we'd silently hide data). `merged` alone can't tell them apart for
+        // manifests above the compactor's fold cursor, so we settle it with
+        // object-store truth below.
+        let mut candidates: Vec<(String, u64)> = Vec::new();
+        let mut prefixes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        match inv.load_all_wal_snapshots(&wal_high_water).await {
+            Ok(live_wal) => {
+                for snap in &live_wal {
+                    let wal_seq = snap.wal_file_sequence_number.as_u64();
+                    for (_, db) in snap.databases.iter() {
+                        for (_, files) in db.tables.iter() {
+                            for f in files {
+                                if !merged_paths.contains(f.path.as_str()) {
+                                    if let Some(p) =
+                                        f.path.split('/').next().filter(|p| !p.is_empty())
+                                    {
+                                        prefixes.insert(p.to_string());
+                                    }
+                                    candidates.push((f.path.clone(), wal_seq));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!(%e, "checkpoint: failed to load live WAL manifests for survivor tombstones"),
+        }
+        drop(merged_paths);
+        // Only tombstone candidates CONFIRMED MISSING from object store; a
+        // candidate that still exists is live (not yet folded) and is left
+        // alone, and a prefix whose listing failed is skipped entirely — both
+        // err toward never hiding a real file.
+        let mut survivor = 0usize;
+        if !candidates.is_empty() {
+            let existing =
+                crate::ref_validator::existing_paths_by_prefix(&self.object_store, prefixes).await;
+            for (path, wal_seq) in candidates {
+                let prefix = path.split('/').next().unwrap_or("");
+                if let Some(Some(present)) = existing.get(prefix)
+                    && !present.contains(&path)
+                {
+                    tombstones.push((path, wal_seq));
+                    survivor += 1;
+                }
+            }
+        }
+        if survivor > 0 {
+            warn!(
+                survivor,
+                "checkpoint: tombstoned compaction-deleted files still listed by live WAL manifests"
+            );
+        }
 
         let cp = crate::shared_inventory::Checkpoint {
             wal_high_water,

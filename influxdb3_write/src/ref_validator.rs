@@ -166,30 +166,7 @@ pub async fn validate_once(
 
     // Per-prefix existing paths; a prefix maps to None when its listing
     // failed — refs under it are skipped, never evicted on partial data.
-    let mut existing: HashMap<String, Option<HashSet<String>>> = HashMap::new();
-    for prefix in prefixes {
-        let dir = ObjPath::from(format!("{prefix}/dbs"));
-        let mut paths: HashSet<String> = HashSet::new();
-        let mut listing = object_store.list(Some(&dir));
-        let mut failed = false;
-        while let Some(item) = listing.next().await {
-            match item {
-                Ok(meta) => {
-                    paths.insert(meta.location.to_string());
-                }
-                Err(e) => {
-                    warn!(
-                        %prefix,
-                        error = %e,
-                        "listing failed during ref validation; skipping prefix"
-                    );
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        existing.insert(prefix, if failed { None } else { Some(paths) });
-    }
+    let existing = existing_paths_by_prefix(object_store, prefixes).await;
 
     let mut summary = ValidationSummary::default();
     for (db_id, table_id, files) in refs {
@@ -220,6 +197,37 @@ pub async fn validate_once(
     }
 
     summary
+}
+
+/// List existing object paths under each `<prefix>/dbs` directory. A prefix maps
+/// to `None` when its listing failed (callers must then skip that prefix — never
+/// act on partial data). One recursive LIST per prefix. Shared by the ref
+/// validator and the compactor's checkpoint survivor-tombstone pass.
+pub(crate) async fn existing_paths_by_prefix(
+    object_store: &Arc<dyn ObjectStore>,
+    prefixes: HashSet<String>,
+) -> HashMap<String, Option<HashSet<String>>> {
+    let mut existing: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+    for prefix in prefixes {
+        let dir = ObjPath::from(format!("{prefix}/dbs"));
+        let mut paths: HashSet<String> = HashSet::new();
+        let mut listing = object_store.list(Some(&dir));
+        let mut failed = false;
+        while let Some(item) = listing.next().await {
+            match item {
+                Ok(meta) => {
+                    paths.insert(meta.location.to_string());
+                }
+                Err(e) => {
+                    warn!(%prefix, error = %e, "listing failed; skipping prefix");
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        existing.insert(prefix, if failed { None } else { Some(paths) });
+    }
+    existing
 }
 
 #[cfg(test)]
