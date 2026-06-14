@@ -44,7 +44,7 @@ freshness layer for sub-second visibility of recent writes.
 - Scoped tokens (`db:<name>:<action>`, wildcards, expiry)
 
 ### Multi-level compaction
-- Generation durations: 1m, 5m, 10m, 30m, 1h, 6h, 12h, 1d, 7d
+- Generation durations: 1m, 5m, 10m, 30m, 1h, 6h, 12h, 1d, 7d, 30d, 90d, 365d
 - Five generation levels with configurable timing and file-count thresholds
 - Crash-safe pipeline: upload → publish manifest (`PersistedSnapshot`) →
   delete inputs, with a delete grace period (default 10m) so in-flight
@@ -64,8 +64,40 @@ freshness layer for sub-second visibility of recent writes.
   into the shared layout
 
 ### Read-your-writes freshness (A/B/C layers)
-- Sub-second visibility of recent writes on the querier without waiting for
-  the writer's snapshot cadence
+- Sub-second visibility of recent writes on a separate querier without waiting
+  for the writer's snapshot cadence. Each query is assembled from three sources,
+  deduplicated so the freshest copy of a row always wins:
+  - **A — persisted Parquet** folded from the shared inventory (the durable base)
+  - **B — remote hot chunks**: an optional query-time RPC to the writer's
+    in-memory buffer (`--writer-urls`, ~100 ms, best-effort)
+  - **C — WAL tail**: the querier follows the writer's un-persisted WAL files
+    from object storage (`--writer-node-ids`), so recent data stays visible even
+    if the writer is offline
+
+## Architecture at a glance
+
+The same `influxdb3` binary runs as a **writer**, **compactor**, or **querier**
+(or `all`, the upstream single-process mode). The roles share nothing but an
+object store — they coordinate through a shared catalog, a shared file
+inventory, and advisory leases, all mediated by conditional object-store writes.
+No node calls another to coordinate durable state (one optional hot-read RPC
+aside).
+
+```mermaid
+graph TB
+    W[write traffic] -->|line protocol| WR["writer<br/>ingest + persist"]
+    Q[query traffic] -->|SQL / FlightSQL| QU["querier x N"]
+    QU -.->|hot-chunks RPC, optional| WR
+    WR -->|WAL + gen1 parquet + manifests| OS[(Object store)]
+    CO["compactor<br/>gen1 to gen5 merge + GC"] <-->|inputs, genN, manifests| OS
+    OS -->|catalog + inventory + WAL tail| QU
+    OS -->|inventory| CO
+```
+
+For the full design — object-store layout, the shared inventory and inventory
+poller, multi-level compaction, convergence-gated deletion, the read-your-writes
+freshness layers, query-planner changes, observability, and a configuration
+reference with sequence diagrams — see **[REFLUXEXTENDED.md](REFLUXEXTENDED.md)**.
 
 ## Quick start
 
@@ -131,7 +163,8 @@ sudo apt-get install build-essential pkg-config libssl-dev clang lld \
     git protobuf-compiler python3 python3-dev python3-pip
 ```
 
-See [PROFILING.md](PROFILING.md) for profiling builds and
+See [REFLUXEXTENDED.md](REFLUXEXTENDED.md) for the detailed architecture,
+[PROFILING.md](PROFILING.md) for profiling builds, and
 [README_processing_engine.md](README_processing_engine.md) for notes on the
 embedded Python processing engine.
 
