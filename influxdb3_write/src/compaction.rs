@@ -47,6 +47,12 @@ pub struct CompactionConfig {
     /// `consumer_convergence` set this need only exceed the longest query
     /// duration (not the querier convergence time — the gate handles that).
     pub delete_grace: Duration,
+    /// Keep superseded gen{N-1} objects for at least this long after the
+    /// compaction publishes before physically deleting them — sized to outlast
+    /// the querier WAL re-fold window so a re-listed gen1 still resolves (no
+    /// silent-empty / 404). Gated on wall-clock since compaction, not data time.
+    /// `Duration::ZERO` (default) keeps the prior eager-delete behavior.
+    pub keep_generations_trailing_window: Duration,
     /// When set, gate deletion of superseded files on every live querier having
     /// folded this compaction (via consumer heartbeats) — not just the fixed
     /// `delete_grace`. This is what makes deletion safe under heavy churn
@@ -86,6 +92,7 @@ impl Default for CompactionConfig {
             max_concurrent_compactions: 4,
             generation_durations: HashMap::new(),
             delete_grace: Duration::from_secs(600), // 10 minutes
+            keep_generations_trailing_window: Duration::ZERO,
             consumer_convergence: None,
             checkpoint_every_n_cycles: 10,
             claim_ttl: Duration::from_secs(30 * 60), // 30 minutes
@@ -1004,9 +1011,12 @@ impl CompactionService {
         // and a missing successor. Surviving objects after retries become orphans
         // (no manifest references them) — they don't cause data loss.
         let grace = self.config.delete_grace;
+        let keep_window = self.config.keep_generations_trailing_window;
         let convergence = self.config.consumer_convergence.clone();
         let inv = self.shared_inventory.clone();
         let time_provider = Arc::clone(&self.time_provider);
+        // Wall-clock at publish; the cold gate keeps inputs `keep_window` past this.
+        let publish_ms = self.time_provider.now().timestamp_millis();
         let compaction_id = compaction_id.to_string();
         let old_paths: Vec<ObjPath> =
             old_files.iter().map(|f| ObjPath::from(f.path.clone())).collect();
@@ -1048,6 +1058,23 @@ impl CompactionService {
                         return;
                     }
                     tokio::time::sleep(cfg.poll_interval).await;
+                }
+            }
+            // Cold gate: keep the superseded inputs until `keep_window` has elapsed
+            // since this compaction published, so a querier that re-lists a still
+            // WAL-foldable gen1 finds the object present (returns data) instead of a
+            // silent-empty / 404. Measured on wall-clock since publish — NOT data
+            // timestamp — so it also protects backfilled old data whose WAL is recent.
+            // A restart during this wait leaves the inputs as orphans (storage only,
+            // no data loss), same class as the delete-grace leak above.
+            if !keep_window.is_zero() {
+                let elapsed_ms = time_provider
+                    .now()
+                    .timestamp_millis()
+                    .saturating_sub(publish_ms);
+                let remaining_ms = (keep_window.as_millis() as i64).saturating_sub(elapsed_ms);
+                if remaining_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(remaining_ms as u64)).await;
                 }
             }
             for path in old_paths {

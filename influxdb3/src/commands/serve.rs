@@ -559,6 +559,26 @@ pub struct Config {
     )]
     pub compaction_delete_grace: humantime::Duration,
 
+    /// Keep superseded gen{N-1} parquet objects on disk for at least this long
+    /// *after the compaction that replaced them published*, before physically
+    /// deleting them. Unlike `--compaction-delete-grace` (a short in-flight
+    /// backstop), this is sized to outlast the querier WAL re-fold window
+    /// (`--gen1-lookback-duration`): while a querier may re-list a now-superseded
+    /// gen1 from a still-foldable WAL snapshot, the object stays present so the
+    /// read returns data instead of a silent-empty / 404. Gated on wall-clock
+    /// since compaction (NOT data timestamp), so it protects backfilled old data
+    /// whose WAL is recent. `0s` (default) preserves prior eager-delete behavior.
+    /// Note: superseded inputs not deleted before a compactor restart become
+    /// orphans (storage cost only, no data loss) — same class as the existing
+    /// delete-grace leak.
+    #[clap(
+        long = "keep-generations-trailing-window",
+        env = "INFLUXDB3_KEEP_GENERATIONS_TRAILING_WINDOW",
+        default_value = "0s",
+        action
+    )]
+    pub keep_generations_trailing_window: humantime::Duration,
+
     /// The amount of time that the server looks back on startup when populating the in-memory
     /// index of gen1 files.
     ///
@@ -1785,6 +1805,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             max_concurrent_compactions: config.max_concurrent_compactions,
             generation_durations,
             delete_grace: config.compaction_delete_grace.into(),
+            keep_generations_trailing_window: config.keep_generations_trailing_window.into(),
             // Gate deletion of superseded files on queriers having folded the
             // compaction — robust to convergence lag under backfill, where a
             // fixed grace is insufficient. `delete_grace` stays as the small
