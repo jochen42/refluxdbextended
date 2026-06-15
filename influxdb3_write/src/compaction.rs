@@ -4,6 +4,7 @@ use crate::shared_inventory::SharedInventory;
 use crate::write_buffer::persisted_files::PersistedFiles;
 use crate::{DatabaseTables, ParquetFile, ParquetFileId, PersistedSnapshot, WriteBuffer};
 use bytes::Bytes;
+use futures_util::StreamExt;
 use object_store::{PutMode, PutOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -53,6 +54,11 @@ pub struct CompactionConfig {
     /// silent-empty / 404). Gated on wall-clock since compaction, not data time.
     /// `Duration::ZERO` (default) keeps the prior eager-delete behavior.
     pub keep_generations_trailing_window: Duration,
+    /// Enable the cold-GC sweep (durable cleanup of superseded gen1 objects that
+    /// leaked past the in-task cold-gate). `false` (default) disables it.
+    pub cold_gc_enabled: bool,
+    /// Upper bound on objects cold-GC deletes per sweep.
+    pub cold_gc_max_deletes_per_run: usize,
     /// When set, gate deletion of superseded files on every live querier having
     /// folded this compaction (via consumer heartbeats) — not just the fixed
     /// `delete_grace`. This is what makes deletion safe under heavy churn
@@ -93,6 +99,8 @@ impl Default for CompactionConfig {
             generation_durations: HashMap::new(),
             delete_grace: Duration::from_secs(600), // 10 minutes
             keep_generations_trailing_window: Duration::ZERO,
+            cold_gc_enabled: false,
+            cold_gc_max_deletes_per_run: 5000,
             consumer_convergence: None,
             checkpoint_every_n_cycles: 10,
             claim_ttl: Duration::from_secs(30 * 60), // 30 minutes
@@ -143,6 +151,8 @@ struct CompactionMetrics {
     /// against storage. Zero when the cold-gate is disabled (`0s`).
     cold_retained_files: metric::U64Gauge,
     cold_retained_bytes: metric::U64Gauge,
+    /// Cold-GC sweep deletions of leaked superseded gen1 objects, by result.
+    cold_gc_deletes: metric::Metric<metric::U64Counter>,
 }
 
 impl CompactionMetrics {
@@ -208,6 +218,10 @@ impl CompactionMetrics {
                      cold-gate, awaiting deletion",
                 )
                 .recorder(&[]),
+            cold_gc_deletes: registry.register_metric::<metric::U64Counter>(
+                "influxdb3_compaction_cold_gc_deletes",
+                "cold-GC sweep deletions of leaked superseded gen1 objects, by result",
+            ),
         }
     }
 
@@ -220,6 +234,24 @@ impl CompactionMetrics {
     fn record_claim(&self, result: &'static str) {
         self.claims.recorder(&[("result", result)]).inc(1);
     }
+}
+
+/// Whether the cold-GC sweep may delete `path`. True only when ALL hold, each an
+/// independent guard against deleting a still-referenced file:
+/// - gen1 path — compacted (gen2+) objects contain a `/gen` segment; cold-GC
+///   only reclaims the writer-relist leak class.
+/// - physically cold — `last_modified_ms <= cutoff_ms` (older than the trailing
+///   window), so the object is beyond every querier's WAL re-list window and no
+///   live consumer can still reference it regardless of fold/convergence lag.
+/// - superseded — absent from `live` (the compactor's authoritative live set; a
+///   genuinely live gen1 would be present).
+fn cold_gc_should_delete(
+    path: &str,
+    last_modified_ms: i64,
+    cutoff_ms: i64,
+    live: &std::collections::HashSet<&str>,
+) -> bool {
+    !path.contains("/gen") && last_modified_ms <= cutoff_ms && !live.contains(path)
 }
 
 #[derive(Debug)]
@@ -580,6 +612,82 @@ impl CompactionService {
                 survivor,
                 "checkpoint: tombstoned compaction-deleted files still listed by live WAL manifests"
             );
+        }
+
+        // Cold-GC: durably reclaim superseded gen1 objects that leaked past the
+        // in-task cold-gate (e.g. a compactor restart killed the delete task
+        // before its trailing window elapsed). Recomputed from object-store truth
+        // each checkpoint, so it needs no persisted queue. Each candidate is
+        // gated by `cold_gc_should_delete` against `merged` (live set) + physical
+        // age; gen1-only, bounded per run. Off unless `cold_gc_enabled` and a
+        // window is set.
+        if self.config.cold_gc_enabled
+            && !self.config.keep_generations_trailing_window.is_zero()
+        {
+            let live: std::collections::HashSet<&str> = merged
+                .databases
+                .iter()
+                .flat_map(|(_, db)| db.tables.iter())
+                .flat_map(|(_, files)| files.iter())
+                .map(|f| f.path.as_str())
+                .collect();
+            let prefixes: std::collections::HashSet<String> = live
+                .iter()
+                .filter_map(|p| {
+                    p.split('/').next().filter(|s| !s.is_empty()).map(str::to_string)
+                })
+                .collect();
+            let cutoff_ms = self.time_provider.now().timestamp_millis()
+                - self.config.keep_generations_trailing_window.as_millis() as i64;
+            let max_deletes = self.config.cold_gc_max_deletes_per_run;
+            let mut swept = 0usize;
+            'sweep: for prefix in prefixes {
+                let dir = ObjPath::from(format!("{prefix}/dbs"));
+                let mut listing = self.object_store.list(Some(&dir));
+                while let Some(item) = listing.next().await {
+                    if swept >= max_deletes {
+                        break 'sweep;
+                    }
+                    let meta = match item {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!(%prefix, %e, "cold-gc: listing failed; skipping prefix");
+                            break;
+                        }
+                    };
+                    let path = meta.location.to_string();
+                    if !cold_gc_should_delete(
+                        &path,
+                        meta.last_modified.timestamp_millis(),
+                        cutoff_ms,
+                        &live,
+                    ) {
+                        continue;
+                    }
+                    match self.object_store.delete(&meta.location).await {
+                        Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                            swept += 1;
+                            self.metrics
+                                .cold_gc_deletes
+                                .recorder(&[("result", "ok")])
+                                .inc(1);
+                        }
+                        Err(e) => {
+                            warn!(%path, %e, "cold-gc: delete failed");
+                            self.metrics
+                                .cold_gc_deletes
+                                .recorder(&[("result", "failed")])
+                                .inc(1);
+                        }
+                    }
+                }
+            }
+            if swept > 0 {
+                warn!(
+                    swept,
+                    "cold-gc: reclaimed leaked superseded gen1 objects past trailing window"
+                );
+            }
         }
 
         let cp = crate::shared_inventory::Checkpoint {
@@ -1390,6 +1498,41 @@ mod tests {
     use super::*;
     use object_store::memory::InMemory;
     use std::time::Duration;
+
+    #[test]
+    fn cold_gc_predicate_only_deletes_cold_superseded_gen1() {
+        let cutoff = 1_000i64; // now - window
+        let gen1 = "main-writer-0/dbs/27/1/2026-03-23/12-00/0000035008.parquet";
+        let gen2 = "main-compactor-0/dbs/27/1/gen2/2026-03-23/00-00/019ec.parquet";
+        let mut live = std::collections::HashSet::new();
+        live.insert(gen1); // a live gen1 path
+
+        // superseded (not live) + cold (older than cutoff) + gen1 -> delete
+        assert!(cold_gc_should_delete(
+            "main-writer-0/dbs/27/1/2026-03-23/09-00/0000099999.parquet",
+            500,
+            cutoff,
+            &live
+        ));
+        // live (in set) -> never
+        assert!(!cold_gc_should_delete(gen1, 500, cutoff, &live));
+        // not cold (last_modified after cutoff) -> never (even if superseded)
+        assert!(!cold_gc_should_delete(
+            "main-writer-0/dbs/27/1/2026-03-23/09-00/0000099999.parquet",
+            1500,
+            cutoff,
+            &live
+        ));
+        // compacted (gen2+) path -> never (not the leak class)
+        assert!(!cold_gc_should_delete(gen2, 500, cutoff, &live));
+        // boundary: last_modified == cutoff is cold (<=)
+        assert!(cold_gc_should_delete(
+            "main-writer-0/dbs/27/1/x/y/0000000001.parquet",
+            cutoff,
+            cutoff,
+            &live
+        ));
+    }
 
     #[test]
     fn chunk_files_for_jobs_bounds_job_size_oldest_first() {

@@ -579,6 +579,30 @@ pub struct Config {
     )]
     pub keep_generations_trailing_window: humantime::Duration,
 
+    /// Enable cold-GC: a bounded sweep at inventory-checkpoint time that deletes
+    /// superseded gen1 objects which leaked past the in-task cold-gate (e.g. a
+    /// compactor restart killed the delete task before its window elapsed).
+    /// Default off. An object is deleted only if it is absent from the compactor's
+    /// live file set AND physically older than
+    /// `--keep-generations-trailing-window` (so beyond every querier's WAL
+    /// re-list window) — never a live or hot file. Requires the window > 0.
+    #[clap(
+        long = "cold-gc-enabled",
+        env = "INFLUXDB3_COLD_GC_ENABLED",
+        default_value_t = false,
+        action
+    )]
+    pub cold_gc_enabled: bool,
+
+    /// Maximum gen1 objects cold-GC deletes per sweep, bounding object-store load.
+    #[clap(
+        long = "cold-gc-max-deletes-per-run",
+        env = "INFLUXDB3_COLD_GC_MAX_DELETES_PER_RUN",
+        default_value_t = 5000,
+        action
+    )]
+    pub cold_gc_max_deletes_per_run: usize,
+
     /// The amount of time that the server looks back on startup when populating the in-memory
     /// index of gen1 files.
     ///
@@ -1806,6 +1830,8 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             generation_durations,
             delete_grace: config.compaction_delete_grace.into(),
             keep_generations_trailing_window: config.keep_generations_trailing_window.into(),
+            cold_gc_enabled: config.cold_gc_enabled,
+            cold_gc_max_deletes_per_run: config.cold_gc_max_deletes_per_run,
             // Gate deletion of superseded files on queriers having folded the
             // compaction — robust to convergence lag under backfill, where a
             // fixed grace is insufficient. `delete_grace` stays as the small

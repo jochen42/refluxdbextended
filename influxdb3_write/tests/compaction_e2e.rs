@@ -145,6 +145,8 @@ async fn compaction_publishes_and_replaces_files() {
             // Delete immediately so the test can assert deletion happened.
             delete_grace: Duration::ZERO,
             keep_generations_trailing_window: Duration::ZERO,
+            cold_gc_enabled: false,
+            cold_gc_max_deletes_per_run: 5000,
             consumer_convergence: None,
             // Off for the test — no inventory wired.
             checkpoint_every_n_cycles: 0,
