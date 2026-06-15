@@ -49,8 +49,12 @@ freshness layer for sub-second visibility of recent writes.
 - Crash-safe pipeline: upload → publish manifest (`PersistedSnapshot`) →
   delete inputs, with a delete grace period (default 10m) so in-flight
   queriers do not 404
-- Per-table compactor claims via conditional object-store puts so several
-  compactors can work in parallel
+- Per-table compactor claims via conditional object-store puts; the leader
+  runs distinct table jobs in parallel, bounded by `--max-concurrent-compactions`
+- **Cold-gated retention** (`--keep-generations-trailing-window`): keep
+  superseded gen1 until it is provably cold so a lagging querier never reads a
+  deleted file (no silent-empty / 404), with a durable cold-GC sweep
+  (`--cold-gc-enabled`) to reclaim the overhang
 
 ### Multi-node deployment
 - Split-mode binary: `serve --mode writer | compactor | querier`
@@ -71,6 +75,17 @@ freshness layer for sub-second visibility of recent writes.
   - **C — WAL tail**: the querier follows the writer's un-persisted WAL files
     from object storage (`--writer-node-ids`), so recent data stays visible
     before its snapshot lands and even if the writer is offline
+
+### Query resilience
+- **Disk spill** (`--exec-spill-enabled` / `--exec-spill-dir`): heavy
+  dedup/sort over backfill-overlap can exceed a querier's RAM; spilling to disk
+  turns an OOM-kill (and the autoheal cascade it triggers) into a slower query
+  that completes
+- **NotFound-tolerant reads**: a query that resolves a just-deleted parquet ref
+  skips it as empty instead of failing — the superseding generation is already
+  in the plan; the cold-gate above prevents this from silently hiding data
+- Prometheus metrics for the spill pool, cold-gate overhang, cold-GC, and
+  tolerated reads on `/metrics`
 
 ## Architecture at a glance
 

@@ -333,8 +333,9 @@ A cycle (`compaction.rs`):
    `_compactor/claims/<db>-<table>-genX-to-genY.claim` with `PutMode::Create`.
    Success → this compactor owns that table's job; `AlreadyExists` with a fresh
    claim → skip; `AlreadyExists` but older than `claim_ttl` → take over. Distinct
-   tables are claimed independently, so **multiple compactors run in parallel**,
-   one per table-generation. A `ClaimGuard` deletes the claim on drop.
+   tables are claimed independently, so the leader runs **multiple
+   table-generation jobs in parallel** (bounded by `--max-concurrent-compactions`;
+   see *Concurrency* below). A `ClaimGuard` deletes the claim on drop.
 3. **Execute** (`execute_compaction_job`, `:627`): wrap inputs as chunks with
    their declared sort key, build a `ReorgPlanner::compact_plan`, run it through
    DataFusion. Because the inputs are already sorted by the table sort key, the
@@ -359,6 +360,7 @@ sequenceDiagram
     CO->>GC: spawn delete task for the input files
     GC->>GC: sleep delete_grace (10m)
     GC->>GC: wait for consumer convergence (§9)
+    GC->>GC: wait until cold (§9, if keep-generations-trailing-window > 0)
     GC->>Store: delete input files (NotFound-tolerant)
 ```
 
@@ -366,6 +368,14 @@ The sequence is crash-safe: the manifest is the commit point. If the process
 dies before the delete task runs, the inputs are simply still present and the
 next cycle is idempotent. The delete is deliberately **deferred** so in-flight
 queriers that planned against the old inputs do not get a 404.
+
+**Concurrency.** The compactor runs under a **singleton lease** (`compaction.rs`
+`is_leader`): only one process compacts at a time; peers are warm standbys, not
+extra throughput. Within the leader, distinct table-generation claim groups run
+in parallel up to `--max-concurrent-compactions` (default 4); jobs within one
+claim group run sequentially. Raise the cap only with more compactor vCPUs —
+four concurrent DataFusion merges already saturate four cores. To scale
+horizontally you would need to shard the singleton lease (not yet implemented).
 
 ---
 
@@ -423,6 +433,37 @@ Remaining hardening (not yet shipped): treat a *fresh* heartbeat with a
 *lagging* cursor as an explicit **block** (distinguish "alive but behind" from
 "silently dead"), and prune/skip the unbounded `_inventory/compactions/`
 directory so per-tick fold work stays well under the grace.
+
+### Cold-gated generation retention (the silent-gap fix)
+
+The convergence gate governs deletion *timing* but cannot help a **future**
+querier that boots later and re-folds an old WAL snapshot which still re-lists a
+since-deleted gen1. With NotFound-tolerant reads (§10) live, that no longer 404s
+— it **silently empties** whole historical partitions (the read is swallowed to
+empty), until a querier reboot rebuilds its inventory. The exposure tracks **WAL
+recency, not data timestamp**, so it also hits *backfilled old data* whose WAL
+snapshots are recent.
+
+The **cold-gate** (`--keep-generations-trailing-window`, `compaction.rs`
+`keep_generations_trailing_window`) closes this structurally: after the grace +
+convergence gate, the delete task additionally waits until
+`now ≥ publish_time + window` before physically deleting the superseded inputs —
+so a re-listed gen1 still resolves and returns data. The gate is **wall-clock
+since the compaction published** (not `max_time`), which is what protects
+recently-written-but-old-timestamp backfill data. `0s` (default) preserves the
+prior eager-delete behavior. Size the window to outlast the WAL re-fold window
+(`--gen1-lookback-duration`); larger window = more retained gen1 = more storage,
+tracked by the `_cold_retained_{files,bytes}` gauges (§13).
+
+The in-task wait is in-process: a **compactor restart mid-window** leaves the
+inputs as orphans (storage only, no data loss — same class as the existing
+delete-grace leak). **Cold-GC** (`--cold-gc-enabled`) is the durable cleanup: at
+inventory-checkpoint time it lists gen1 objects and deletes any that are (1) a
+gen1 path, (2) physically older than the window by object `last_modified` (beyond
+every querier's re-list window), and (3) absent from the freshly-built live set —
+three independent guards (`cold_gc_should_delete`), recomputed from object-store
+truth each checkpoint, bounded by `--cold-gc-max-deletes-per-run`. It does **not**
+delete not-yet-cold files (that would reintroduce the phantom/silent-gap risk).
 
 ---
 
@@ -535,6 +576,26 @@ unsorted (no false claim). Safe under schema evolution: new series-key columns
 append before `time` and read as constant-null in older files. (The earlier
 full-sort was the dominant cost in a measured 6.4 M-row aggregation.)
 
+### Query disk spill
+
+The querier serves parquet from object store into memory; query execution
+(sort / `DeduplicateExec` / aggregation) runs **in memory**, bounded only by the
+DataFusion memory pool (`--exec-mem-pool-bytes`). The DataFusion `DiskManager`
+defaults to **`Disabled`** (`core/iox_query/src/exec.rs`), so a heavy
+backfill-overlap dedup that exceeds the pool has nowhere to spill: untracked
+arrow/parquet/output allocations push RSS past the VM limit and the kernel
+OOM-kills the process — which fails the health probe, triggers an autoheal
+recreate, and with few queriers cascades into a query outage.
+
+`--exec-spill-enabled` switches the `DiskManager` to `OsTmpDirectory` (spill to
+`/tmp`); `--exec-spill-dir=<path>` uses a specific dir instead (point at a fast
+local SSD — but it **must exist and be writable**, or `create_local_dirs` fails
+and the process won't start, §16). Either converts an OOM-kill into a *slower*
+spilling query that completes — the node survives. `--exec-spill-max-mb` caps
+total spill disk (`0` = DataFusion's 100 GB default). Spill is **opt-in**
+(default `Disabled` preserves prior behavior). The write/persist executor keeps
+an unbounded pool and never spills.
+
 ---
 
 ## 13. Observability
@@ -546,7 +607,8 @@ per-db / per-table label explosion):
 
 | Subsystem | Metrics (selected) |
 |-----------|--------------------|
-| Compaction (`compaction.rs:114`) | `influxdb3_compaction_cycles`, `_jobs`, `_bytes`, `_files`, `_rows`, `_cycle_duration`, `_job_duration`, `_claims`, `_checkpoint_writes`, `_input_deletes` |
+| Compaction (`compaction.rs:114`) | `influxdb3_compaction_cycles`, `_jobs`, `_bytes`, `_files`, `_rows`, `_cycle_duration`, `_job_duration`, `_claims`, `_checkpoint_writes`, `_input_deletes`, `_cold_retained_files`/`_cold_retained_bytes` (gauges — cold-gate overhang, §9), `_cold_gc_deletes{result}` (cold-GC sweep, §9) |
+| Read path (`not_found_tolerant.rs`) | `influxdb3_parquet_notfound_tolerated{phase}` — parquet objects skipped as empty because the object was `NotFound` (stale ref / compaction-deleted before ref validation); `phase=open`/`mid_scan` (§10) |
 | Inventory poller (`inventory_poller.rs:89`) | `influxdb3_inventory_poll_ticks`, `_inventory_folded{kind}`, `_inventory_poll_duration` |
 | Shared inventory (`shared_inventory.rs:103`) | `influxdb3_shared_inventory_publish{kind,result}` |
 | WAL tail (`wal_tail.rs:176`) | `influxdb3_wal_tail_files{result}` |
@@ -592,7 +654,14 @@ Extension flags added/changed by this fork (defaults in parentheses):
 | `--compaction-interval` | `INFLUXDB3_COMPACTION_INTERVAL` | `1h` | compactor | cycle cadence |
 | `--max-compaction-files` | `INFLUXDB3_MAX_COMPACTION_FILES` | `100` | compactor | inputs per job |
 | `--min-files-for-compaction` | `INFLUXDB3_MIN_FILES_FOR_COMPACTION` | `10` | compactor | trigger threshold |
+| `--max-concurrent-compactions` | `INFLUXDB3_MAX_CONCURRENT_COMPACTIONS` | `4` | compactor | distinct-table compaction jobs the leader runs in parallel per cycle; raise only with more vCPUs (§8) |
 | `--compaction-delete-grace` | `INFLUXDB3_COMPACTION_DELETE_GRACE` | `10m` | compactor | defer input delete |
+| `--keep-generations-trailing-window` | `INFLUXDB3_KEEP_GENERATIONS_TRAILING_WINDOW` | `0s` | compactor | **cold-gate**: keep superseded gen{N-1} objects this long *after the compaction publishes* before deleting, so a querier re-listing a still-foldable gen1 still resolves (§9). `0s` = eager delete. Size ≥ the WAL re-fold window. |
+| `--cold-gc-enabled` | `INFLUXDB3_COLD_GC_ENABLED` | `false` | compactor | durable sweep of superseded gen1 that leaked past the cold-gate (e.g. compactor restart); requires the window > 0 (§9) |
+| `--cold-gc-max-deletes-per-run` | `INFLUXDB3_COLD_GC_MAX_DELETES_PER_RUN` | `5000` | compactor | bound per cold-GC sweep |
+| `--exec-spill-enabled` | `INFLUXDB3_EXEC_SPILL_ENABLED` | `false` | querier | DataFusion disk spill to the OS temp dir; converts a query-OOM into a slower spilling query (§12) |
+| `--exec-spill-dir` | `INFLUXDB3_EXEC_SPILL_DIR` | (unset) | querier | spill to this dir instead of OS temp; **must exist and be writable** by the process (else startup fails) — implies enabled (§12) |
+| `--exec-spill-max-mb` | `INFLUXDB3_EXEC_SPILL_MAX_MB` | `0` | querier | cap total spill on disk; `0` = DataFusion default (100 GB) |
 | `--writer-lease-ttl` | `INFLUXDB3_WRITER_LEASE_TTL` | `60s` | writer | `0s` disables |
 | `--compactor-lease-ttl` | `INFLUXDB3_COMPACTOR_LEASE_TTL` | `60s` | compactor | `0s` disables |
 | `--inventory-poll-interval` | `INFLUXDB3_INVENTORY_POLL_INTERVAL` | `2s` | querier/compactor | fold cadence |
@@ -616,6 +685,9 @@ rejected at startup.
 | `gen1` stuck at `10m` despite `--gen1-duration=1h` | catalog set-once won by an earlier node (often a querier with the default) (§3) | set `--gen1-duration` on **all** roles; recreate the bucket to change |
 | Compactor mis-buckets gen1 | compactor's `generation_durations[1]` reads the **flag**, not the catalog value | keep `--gen1-duration` identical to the writer/catalog on the compactor |
 | Slow wide aggregations under backfill | global dedup not split because backfill overlaps compacted data (§12) | compact the backfill window faster (shrinks the overlapping un-compacted set) |
+| Whole historical window silently empty until querier reboot | querier re-lists a compaction-deleted gen1 from a still-foldable WAL snapshot; NotFound-tolerant reads swallow it to empty (§9/§10). Tracks WAL recency, so hits backfilled old data too | enable the cold-gate `--keep-generations-trailing-window` ≥ the WAL re-fold window; watch `_parquet_notfound_tolerated`; reboot queriers to clear an existing gap |
+| Querier OOM-killed → autoheal recreate → cascade/outage | heavy `DeduplicateExec`/sort over backfill-overlap exceeds RAM; no disk spill (§12). With few queriers the load shifts to the survivor, which OOMs too | `--exec-spill-enabled` (query spills instead of OOM); more querier replicas / RAM; compact faster to shrink the overlap |
+| New queriers autoheal-loop ~`initialDelaySec` after boot, healthy ones stay | `--exec-spill-dir` points at a missing/unwritable path → DataFusion `create_local_dirs` fails → process won't start → fails health (§12) | make the dir exist + writable, or use `--exec-spill-enabled` (OS temp), or point at a writable mount |
 | Node killed during startup by autohealing | health check failed during catalog/WAL replay | startup probe (§13) answers health 200 before readiness — ensure probe path is the LB health path |
 
 ---
