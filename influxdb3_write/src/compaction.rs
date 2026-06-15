@@ -137,6 +137,12 @@ struct CompactionMetrics {
     claims: metric::Metric<metric::U64Counter>,
     checkpoint_writes: metric::Metric<metric::U64Counter>,
     input_deletes: metric::Metric<metric::U64Counter>,
+    /// Superseded gen{N-1} files currently held by the cold-gate (kept past
+    /// their compaction, awaiting `keep_generations_trailing_window` before
+    /// deletion). The retained-overhang gauges: watch these to size the window
+    /// against storage. Zero when the cold-gate is disabled (`0s`).
+    cold_retained_files: metric::U64Gauge,
+    cold_retained_bytes: metric::U64Gauge,
 }
 
 impl CompactionMetrics {
@@ -188,6 +194,20 @@ impl CompactionMetrics {
                 "influxdb3_compaction_input_deletes",
                 "post-grace deletions of compaction input objects by result",
             ),
+            cold_retained_files: registry
+                .register_metric::<metric::U64Gauge>(
+                    "influxdb3_compaction_cold_retained_files",
+                    "superseded gen{N-1} input files currently retained by the cold-gate, \
+                     awaiting the keep-generations trailing window before deletion",
+                )
+                .recorder(&[]),
+            cold_retained_bytes: registry
+                .register_metric::<metric::U64Gauge>(
+                    "influxdb3_compaction_cold_retained_bytes",
+                    "bytes of superseded gen{N-1} input files currently retained by the \
+                     cold-gate, awaiting deletion",
+                )
+                .recorder(&[]),
         }
     }
 
@@ -1022,6 +1042,11 @@ impl CompactionService {
             old_files.iter().map(|f| ObjPath::from(f.path.clone())).collect();
         let object_store = Arc::clone(&self.object_store);
         let deletes = self.metrics.input_deletes.clone();
+        // Retained-overhang gauges: how much gen{N-1} the cold-gate is holding.
+        let cold_files_n = old_files.len() as u64;
+        let cold_bytes_n = old_files.iter().map(|f| f.size_bytes).sum::<u64>();
+        let cold_retained_files = self.metrics.cold_retained_files.clone();
+        let cold_retained_bytes = self.metrics.cold_retained_bytes.clone();
         tokio::spawn(async move {
             // In-flight backstop: let queries planned before the manifest landed
             // finish reading the old paths.
@@ -1068,6 +1093,9 @@ impl CompactionService {
             // A restart during this wait leaves the inputs as orphans (storage only,
             // no data loss), same class as the delete-grace leak above.
             if !keep_window.is_zero() {
+                // Mark these inputs as retained overhang while we hold them.
+                cold_retained_files.inc(cold_files_n);
+                cold_retained_bytes.inc(cold_bytes_n);
                 let elapsed_ms = time_provider
                     .now()
                     .timestamp_millis()
@@ -1096,6 +1124,11 @@ impl CompactionService {
                 deletes
                     .recorder(&[("result", if deleted { "ok" } else { "failed" })])
                     .inc(1);
+            }
+            if !keep_window.is_zero() {
+                // Released: these inputs are deleted, no longer retained overhang.
+                cold_retained_files.dec(cold_files_n);
+                cold_retained_bytes.dec(cold_bytes_n);
             }
         });
 
