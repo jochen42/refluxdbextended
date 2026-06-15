@@ -328,6 +328,8 @@ pub(crate) fn make_exec() -> Arc<Executor> {
             // Default to 1gb
             mem_pool_size: 1024 * 1024 * 1024, // 1024 (b/kb) * 1024 (kb/mb) * 1024 (mb/gb)
             heap_memory_limit: None,
+            disk_manager_mode: iox_query::exec::DiskManagerMode::Disabled,
+            disk_spill_max_bytes: None,
             per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
         },
         DedicatedExecutor::new_testing(),

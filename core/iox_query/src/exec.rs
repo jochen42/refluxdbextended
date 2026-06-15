@@ -22,7 +22,7 @@ use std::{collections::HashMap, fmt::Display, num::NonZeroUsize, sync::Arc};
 use datafusion::{
     self,
     execution::{
-        disk_manager::{DiskManagerBuilder, DiskManagerMode},
+        disk_manager::DiskManagerBuilder,
         memory_pool::{MemoryPool, UnboundedMemoryPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
@@ -116,7 +116,21 @@ pub struct ExecutorConfig {
 
     /// Optional heap memory limit in bytes.
     pub heap_memory_limit: Option<usize>,
+
+    /// Disk-spill mode for the DataFusion runtime. `Disabled` (default) keeps all
+    /// query execution in memory — a heavy sort/dedup that exceeds the memory pool
+    /// then errors or OOM-kills the process. `OsTmpDirectory` / `Directories` let
+    /// spilling operators write intermediate data to disk instead.
+    pub disk_manager_mode: DiskManagerMode,
+
+    /// Optional cap (bytes) on total spill data across the temp directories.
+    /// `None` uses the DataFusion default (100 GB). Ignored when spill is disabled.
+    pub disk_spill_max_bytes: Option<u64>,
 }
+
+/// Re-export so callers configuring [`ExecutorConfig`] need not depend on
+/// `datafusion` directly.
+pub use datafusion::execution::disk_manager::DiskManagerMode;
 
 impl ExecutorConfig {
     pub fn testing() -> Self {
@@ -127,6 +141,8 @@ impl ExecutorConfig {
             mem_pool_size: TESTING_MEM_POOL_SIZE,
             per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
             heap_memory_limit: None,
+            disk_manager_mode: DiskManagerMode::Disabled,
+            disk_spill_max_bytes: None,
         }
     }
 
@@ -143,6 +159,8 @@ impl ExecutorConfig {
                 max_concurrent_queries: TESTING_MAX_CONCURRENT_QUERIES,
             },
             heap_memory_limit: None,
+            disk_manager_mode: DiskManagerMode::Disabled,
+            disk_spill_max_bytes: None,
         }
     }
 }
@@ -224,10 +242,13 @@ impl Executor {
             }
         };
 
+        let mut disk_manager_builder =
+            DiskManagerBuilder::default().with_mode(config.disk_manager_mode.clone());
+        if let Some(max_bytes) = config.disk_spill_max_bytes {
+            disk_manager_builder = disk_manager_builder.with_max_temp_directory_size(max_bytes);
+        }
         let mut builder = RuntimeEnvBuilder::new()
-            .with_disk_manager_builder(
-                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
-            )
+            .with_disk_manager_builder(disk_manager_builder)
             .with_memory_limit(central_mem_pool_limit, 1.0);
 
         if let Some(heap_memory_limit) = config.heap_memory_limit {

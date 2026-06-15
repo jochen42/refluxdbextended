@@ -1296,6 +1296,8 @@ async fn setup_server(start_time: i64) -> (String, CancellationToken, Arc<dyn Wr
             mem_pool_size: usize::MAX,
             per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
             heap_memory_limit: None,
+            disk_manager_mode: iox_query::exec::DiskManagerMode::Disabled,
+            disk_spill_max_bytes: None,
         },
         DedicatedExecutor::new_testing(),
     ));

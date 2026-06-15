@@ -295,6 +295,35 @@ pub struct Config {
     )]
     pub exec_mem_pool_bytes: MemorySizeMb,
 
+    /// Enable DataFusion disk spill for query execution. When off (default), a
+    /// heavy sort/dedup that exceeds `--exec-mem-pool-bytes` errors or OOM-kills
+    /// the process; when on, such operators spill intermediate data to disk
+    /// instead (slower, but the node survives). Implied when `--exec-spill-dir`
+    /// is set.
+    #[clap(
+        long = "exec-spill-enabled",
+        env = "INFLUXDB3_EXEC_SPILL_ENABLED",
+        default_value_t = false,
+        action
+    )]
+    pub exec_spill_enabled: bool,
+
+    /// Directory for DataFusion query spill files. When set, enables disk spill
+    /// and writes temp files here — point this at a fast local disk / SSD. When
+    /// unset and `--exec-spill-enabled` is true, the OS temp directory is used.
+    #[clap(long = "exec-spill-dir", env = "INFLUXDB3_EXEC_SPILL_DIR", action)]
+    pub exec_spill_dir: Option<PathBuf>,
+
+    /// Cap on total query spill data on disk, in megabytes. `0` (default) uses
+    /// the DataFusion default (100 GB). Bounds spill so it can't fill the volume.
+    #[clap(
+        long = "exec-spill-max-mb",
+        env = "INFLUXDB3_EXEC_SPILL_MAX_MB",
+        default_value_t = 0,
+        action
+    )]
+    pub exec_spill_max_mb: u64,
+
     /// Flag to indicate that server should start without auth
     #[clap(long = "without-auth", env = "INFLUXDB3_START_WITHOUT_AUTH", action)]
     pub without_auth: bool,
@@ -505,6 +534,18 @@ pub struct Config {
         action
     )]
     pub min_files_for_compaction: usize,
+
+    /// Maximum number of compaction jobs (distinct tables) the compactor leader
+    /// runs concurrently. Higher increases gen1→genN throughput on a backlog but
+    /// uses more CPU/RAM per node; size it to the compactor's cores. Jobs within
+    /// a single table still run sequentially. Default `4` preserves prior behavior.
+    #[clap(
+        long = "max-concurrent-compactions",
+        env = "INFLUXDB3_MAX_CONCURRENT_COMPACTIONS",
+        default_value_t = 4,
+        action
+    )]
+    pub max_concurrent_compactions: usize,
 
     /// Wait this long after a compaction manifest is published before deleting the
     /// original gen{N-1} parquet files. Prevents 404 errors in queries that resolved
@@ -1138,6 +1179,19 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         "Creating shared query executor"
     );
 
+    // Resolve query disk-spill mode from flags. `Disabled` (default) preserves
+    // the in-memory-only behavior; a spill dir or `--exec-spill-enabled` turns it
+    // on so heavy sort/dedup spills to disk instead of OOM-killing the process.
+    let query_disk_manager_mode = if let Some(dir) = config.exec_spill_dir.clone() {
+        iox_query::exec::DiskManagerMode::Directories(vec![dir])
+    } else if config.exec_spill_enabled {
+        iox_query::exec::DiskManagerMode::OsTmpDirectory
+    } else {
+        iox_query::exec::DiskManagerMode::Disabled
+    };
+    let query_disk_spill_max_bytes = (config.exec_spill_max_mb > 0)
+        .then(|| config.exec_spill_max_mb.saturating_mul(1024 * 1024));
+
     let exec = Arc::new(Executor::new_with_config_and_executor(
         ExecutorConfig {
             target_query_partitions: tokio_datafusion_config.num_threads.unwrap(),
@@ -1150,6 +1204,8 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             // TODO: need to make these configurable?
             per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
             heap_memory_limit: None,
+            disk_manager_mode: query_disk_manager_mode,
+            disk_spill_max_bytes: query_disk_spill_max_bytes,
         },
         DedicatedExecutor::new(
             "datafusion",
@@ -1177,6 +1233,9 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             metric_registry: Arc::clone(&write_path_metrics),
             // use as much memory for persistence, can this be UnboundedMemoryPool?
             mem_pool_size: usize::MAX,
+            // Write/persist path has an unbounded pool, so it never spills.
+            disk_manager_mode: iox_query::exec::DiskManagerMode::Disabled,
+            disk_spill_max_bytes: None,
             // These are new additions, just skimming through the code it does not look like we can
             // achieve the same effect as having a separate executor. It looks like it's for "all"
             // queries, it'd be nice to have a filter to say when the query matches this pattern
@@ -1723,6 +1782,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             interval: config.compaction_interval.into(),
             max_files_per_run: config.max_compaction_files,
             min_files_for_compaction: config.min_files_for_compaction,
+            max_concurrent_compactions: config.max_concurrent_compactions,
             generation_durations,
             delete_grace: config.compaction_delete_grace.into(),
             // Gate deletion of superseded files on queriers having folded the

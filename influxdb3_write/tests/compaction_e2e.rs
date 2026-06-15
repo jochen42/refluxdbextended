@@ -140,6 +140,7 @@ async fn compaction_publishes_and_replaces_files() {
             interval: Duration::from_secs(1),
             max_files_per_run: 10,
             min_files_for_compaction: 2,
+            max_concurrent_compactions: 4,
             generation_durations: gen_durations,
             // Delete immediately so the test can assert deletion happened.
             delete_grace: Duration::ZERO,

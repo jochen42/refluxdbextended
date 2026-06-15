@@ -35,6 +35,10 @@ pub struct CompactionConfig {
     pub max_files_per_run: usize,
     /// Minimum number of files required before triggering compaction
     pub min_files_for_compaction: usize,
+    /// Maximum number of compaction jobs (distinct claim groups / tables) the
+    /// leader runs concurrently per cycle. Higher drains a gen1 backlog faster
+    /// but uses more CPU/RAM. Jobs within one claim group still run sequentially.
+    pub max_concurrent_compactions: usize,
     /// Generation durations for each level
     pub generation_durations: HashMap<u8, Duration>,
     /// Small backstop wait after publishing a compaction manifest before
@@ -79,6 +83,7 @@ impl Default for CompactionConfig {
             interval: Duration::from_secs(3600), // 1 hour
             max_files_per_run: 100,
             min_files_for_compaction: 10,
+            max_concurrent_compactions: 4,
             generation_durations: HashMap::new(),
             delete_grace: Duration::from_secs(600), // 10 minutes
             consumer_convergence: None,
@@ -342,7 +347,9 @@ impl CompactionService {
 
         let mut set = JoinSet::new();
         let mut completed_jobs = 0;
-        let max_concurrent = std::cmp::min(groups.len(), 4); // Limit concurrent compactions
+        // Limit concurrent compactions to the configured cap (>=1).
+        let max_concurrent =
+            std::cmp::min(groups.len(), self.config.max_concurrent_compactions.max(1));
 
         for (claim_path, group) in groups {
             if set.len() >= max_concurrent {
