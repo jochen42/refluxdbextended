@@ -288,6 +288,54 @@ fn test_tombstone_suppresses_reordered_readd() {
     );
 }
 
+/// The 469K-eviction churn: a long-superseded gen1 gets relisted by a later
+/// fold whose WAL seq is far ABOVE the file's own (a periodic full re-fold), so
+/// a reorder tombstone keyed to the file's seq would be GC'd by the high-water
+/// and let the phantom resurrect, evict, and resurrect again every pass. A
+/// validator eviction-tombstone (`ObjectGone`) must survive high-water GC and
+/// keep suppressing the re-add — object paths are write-once, so this can never
+/// hide live data.
+#[test_log::test(test)]
+fn test_eviction_tombstone_survives_gc_and_suppresses_readd() {
+    let gen1 = ParquetFile {
+        id: ParquetFileId::from(1),
+        // file stem encodes wal_seq 1800
+        path: "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".to_owned(),
+        size_bytes: 50,
+        row_count: 5,
+        chunk_time: 0,
+        min_time: 0,
+        max_time: 100,
+    };
+
+    let persisted = PersistedFiles::new(None);
+
+    // Validator confirmed the object gone and evicted it -> durable tombstone.
+    persisted.tombstone_evicted_paths([gen1.path.clone()]);
+    assert_eq!(persisted.tombstone_count(), 1);
+
+    // High-water GC far past the file's own wal_seq (1800) must NOT drop it; a
+    // reorder tombstone keyed to 1800 would be collected here.
+    persisted.gc_tombstones(
+        &std::collections::HashMap::from([("main-writer-0".to_string(), 9_999_999u64)]),
+        None,
+    );
+    assert_eq!(
+        persisted.tombstone_count(),
+        1,
+        "eviction tombstone must survive high-water GC"
+    );
+
+    // A later fold relisting the gen1 (seq above the file's own) is suppressed.
+    persisted.add_persisted_snapshot_files(build_snapshot(vec![gen1.clone()], 9999, 9999, 9999));
+    assert!(
+        persisted
+            .get_files(DbId::from(0), TableId::from(0))
+            .is_empty(),
+        "eviction-tombstoned gen1 resurrected by a later re-fold (the 469K churn)"
+    );
+}
+
 /// A tombstone is dropped once the writer's WAL high-water passes the source
 /// snapshot (it can never be re-folded after that, so the file can't re-add).
 /// Below the mark it is retained; at/above it is collected.

@@ -245,6 +245,8 @@ impl PersistedFiles {
                 TombstoneGc::Compaction { removing_id } => {
                     compaction.push((path.clone(), removing_id.clone()))
                 }
+                // Not serialized: re-derived by the validator after restart.
+                TombstoneGc::ObjectGone => {}
             }
         }
         (gen1, compaction)
@@ -263,6 +265,14 @@ impl PersistedFiles {
     /// Number of live removed-file tombstones (test/observability helper).
     pub fn tombstone_count(&self) -> usize {
         self.inner.read().removed_tombstones.len()
+    }
+
+    /// Record validator-confirmed missing object paths as durable suppression
+    /// tombstones, so a later fold (e.g. a periodic full re-fold relisting a
+    /// long-superseded gen1) cannot resurrect them into a phantom ref. Safe
+    /// because object-store paths are write-once. Bounded by FIFO.
+    pub fn tombstone_evicted_paths(&self, paths: impl IntoIterator<Item = String>) {
+        self.inner.write().tombstone_evicted(paths);
     }
 
     /// Get the list of files for a given database and table, always return in descending order of min_time
@@ -441,7 +451,18 @@ struct Inner {
     /// write-once, so tombstoning one can never hide a live file — only a stale
     /// re-listing of a deleted one.
     pub removed_tombstones: HashMap<String, TombstoneGc>,
+    /// Insertion order of [`TombstoneGc::ObjectGone`] tombstones, used to bound
+    /// their count: they have no high-water GC trigger, so the oldest are
+    /// dropped once `MAX_EVICTION_TOMBSTONES` is exceeded.
+    pub eviction_tombstones: std::collections::VecDeque<String>,
 }
+
+/// Upper bound on retained [`TombstoneGc::ObjectGone`] tombstones. At the prod
+/// cold-GC deletion rate (~2.4k gen1/day) this is ~80 days of headroom; the
+/// FIFO only drops the oldest under genuine pathology, and a dropped-then-
+/// re-added path is simply re-evicted and re-tombstoned by the next validator
+/// pass.
+const MAX_EVICTION_TOMBSTONES: usize = 200_000;
 
 /// When a removed-file tombstone may be dropped: once the relevant high-water
 /// mark passes the point at which any manifest could re-add the file.
@@ -455,6 +476,18 @@ pub(crate) enum TombstoneGc {
     /// compaction that *adds* the file is older still, so once the high-water
     /// passes the remover it has also passed the adder and the file can't recur.
     Compaction { removing_id: String },
+    /// A ref the validator confirmed gone from object store (the object's
+    /// prefix LIST does not contain it). Unlike the two reorder cases above, the
+    /// re-adding snapshot can carry a *higher* WAL seq than the file's own
+    /// (e.g. a periodic full re-fold relists a long-superseded gen1), so there
+    /// is no high-water that bounds it — keying by the file's seq would GC the
+    /// tombstone before the re-add and let the phantom resurrect, evict, and
+    /// resurrect again (the 469K-eviction churn). Paths are write-once, so
+    /// suppressing a confirmed-gone one can never hide live data. Not GC'd by a
+    /// high-water; bounded instead by a FIFO cap (see `eviction_tombstones`) and
+    /// re-derived by the validator after restart, so it is never serialized into
+    /// a checkpoint.
+    ObjectGone,
 }
 
 /// Parse a writer gen1 parquet path into `(node_id, wal_seq)`.
@@ -530,6 +563,7 @@ impl Inner {
             parquet_files_size_mb: size_in_mb,
             deleted_data: HashMap::new(),
             removed_tombstones,
+            eviction_tombstones: std::collections::VecDeque::new(),
         }
     }
 
@@ -640,7 +674,39 @@ impl Inner {
                 // ULIDs are lexicographically time-ordered.
                 compactions_high_water.is_none_or(|hw| hw < removing_id.as_str())
             }
+            // No high-water bounds an ObjectGone re-add; kept until the FIFO cap
+            // evicts it (see `tombstone_evicted`).
+            TombstoneGc::ObjectGone => true,
         });
+    }
+
+    /// Record confirmed-gone paths as [`TombstoneGc::ObjectGone`] tombstones so
+    /// a later fold cannot resurrect them. Bounded by `MAX_EVICTION_TOMBSTONES`
+    /// via FIFO. A path already carrying a (reorder) tombstone is left as-is —
+    /// that one has a proper high-water GC key and need not become unbounded.
+    fn tombstone_evicted(&mut self, paths: impl IntoIterator<Item = String>) {
+        for path in paths {
+            if self.removed_tombstones.contains_key(&path) {
+                continue;
+            }
+            self.removed_tombstones
+                .insert(path.clone(), TombstoneGc::ObjectGone);
+            self.eviction_tombstones.push_back(path);
+        }
+        while self.eviction_tombstones.len() > MAX_EVICTION_TOMBSTONES {
+            let Some(oldest) = self.eviction_tombstones.pop_front() else {
+                break;
+            };
+            // Only drop it if it is still the ObjectGone tombstone we inserted —
+            // a later compaction removal may have overwritten it with a
+            // high-water-GC'd key, which manages its own lifetime.
+            if matches!(
+                self.removed_tombstones.get(&oldest),
+                Some(TombstoneGc::ObjectGone)
+            ) {
+                self.removed_tombstones.remove(&oldest);
+            }
+        }
     }
 
     /// Seed tombstones loaded from a shared-inventory checkpoint, so a freshly
@@ -694,6 +760,7 @@ impl From<PersistedSnapshotCheckpoint> for Inner {
             parquet_files_row_count: checkpoint.row_count,
             deleted_data: HashMap::new(),
             removed_tombstones: HashMap::new(),
+            eviction_tombstones: std::collections::VecDeque::new(),
         }
     }
 }

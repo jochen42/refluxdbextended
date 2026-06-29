@@ -193,6 +193,14 @@ pub async fn validate_once(
         if !missing.is_empty() {
             summary.evicted += missing.len();
             persisted_files.remove_persisted_files(&db_id, &table_id, &missing);
+            // Durably suppress re-adds: the object is confirmed gone (write-once
+            // path), but a later fold can relist it (a periodic full re-fold of
+            // a long-superseded gen1 carries a WAL seq above the file's own, so
+            // the reorder tombstone's high-water GC can't bound it). Without
+            // this the phantom resurrects and is re-evicted every pass — the
+            // 469K-eviction churn.
+            persisted_files
+                .tombstone_evicted_paths(missing.into_iter().map(|f| f.path));
         }
     }
 
@@ -278,6 +286,32 @@ mod tests {
         let remaining = persisted.get_files(db, table);
         assert_eq!(remaining.len(), 2);
         assert!(remaining.iter().all(|f| !f.path.contains("phantom")));
+    }
+
+    #[tokio::test]
+    async fn eviction_records_suppression_tombstone() {
+        // A confirmed-gone ref must leave a tombstone so a later fold can't
+        // resurrect it (the 469K re-evict churn). Fold-suppression itself is
+        // covered in persisted_files tests; here we assert the wiring.
+        let store = Arc::new(InMemory::new());
+        put(&store, "node-a/dbs/1/0/f1.parquet").await;
+        // phantom.parquet intentionally absent from the store
+
+        let persisted = PersistedFiles::default();
+        let db = DbId::from(1);
+        let table = TableId::from(0);
+        persisted.add_persisted_file(&db, &table, &file(1, "node-a/dbs/1/0/f1.parquet"));
+        persisted.add_persisted_file(&db, &table, &file(3, "node-a/dbs/1/0/phantom.parquet"));
+
+        let store: Arc<dyn ObjectStore> = store;
+        let summary = validate_once(&store, &persisted).await;
+
+        assert_eq!(summary.evicted, 1);
+        assert_eq!(
+            persisted.tombstone_count(),
+            1,
+            "eviction must record a suppression tombstone"
+        );
     }
 
     #[tokio::test]

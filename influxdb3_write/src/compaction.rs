@@ -254,6 +254,20 @@ fn cold_gc_should_delete(
     !path.contains("/gen") && last_modified_ms <= cutoff_ms && !live.contains(path)
 }
 
+/// Whether `publish_compaction` should defer superseded-input deletion entirely
+/// to cold-GC, skipping the in-process keep_window delete task.
+///
+/// True exactly when cold-GC is the enabled timed deleter (`cold_gc_enabled`
+/// with a non-zero trailing window). In that config cold-GC reclaims the same
+/// objects durably from object-store truth each checkpoint — and survives
+/// restarts — so an in-process task that sleeps `keep_window` per compaction
+/// only races it (cold-GC's write-time cutoff always trips before the task's
+/// publish-time timer) and piles up one idle task per compaction. When cold-GC
+/// is off, or the window is zero, the in-process task is still the deleter.
+fn defer_deletion_to_cold_gc(cold_gc_enabled: bool, keep_window: Duration) -> bool {
+    cold_gc_enabled && !keep_window.is_zero()
+}
+
 #[derive(Debug)]
 pub struct CompactionService {
     config: CompactionConfig,
@@ -614,13 +628,15 @@ impl CompactionService {
             );
         }
 
-        // Cold-GC: durably reclaim superseded gen1 objects that leaked past the
-        // in-task cold-gate (e.g. a compactor restart killed the delete task
-        // before its trailing window elapsed). Recomputed from object-store truth
-        // each checkpoint, so it needs no persisted queue. Each candidate is
-        // gated by `cold_gc_should_delete` against `merged` (live set) + physical
-        // age; gen1-only, bounded per run. Off unless `cold_gc_enabled` and a
-        // window is set.
+        // Cold-GC: the durable timed deleter for superseded gen1 objects when
+        // enabled. `publish_compaction` defers to this path (rather than holding
+        // each compaction's inputs in an in-process keep_window sleep), so in
+        // steady state this is the routine deletion mechanism — not just a
+        // leak-recovery backstop for the restart case. Recomputed from
+        // object-store truth each checkpoint, so it needs no persisted queue.
+        // Each candidate is gated by `cold_gc_should_delete` against `merged`
+        // (live set) + physical age; gen1-only, bounded per run. Off unless
+        // `cold_gc_enabled` and a window is set.
         if self.config.cold_gc_enabled
             && !self.config.keep_generations_trailing_window.is_zero()
         {
@@ -683,9 +699,12 @@ impl CompactionService {
                 }
             }
             if swept > 0 {
-                warn!(
+                // Routine when cold-GC is the timed deleter (see comment above):
+                // this is expected steady-state deletion, not a leak. INFO so it
+                // doesn't read as an error.
+                info!(
                     swept,
-                    "cold-gc: reclaimed leaked superseded gen1 objects past trailing window"
+                    "cold-gc: swept superseded gen1 objects past trailing window"
                 );
             }
         }
@@ -1133,6 +1152,22 @@ impl CompactionService {
             }
         }
 
+        // When cold-GC is the enabled timed deleter, defer superseded-input
+        // deletion to it entirely. cold-GC reclaims these objects durably from
+        // object-store truth on each checkpoint and survives restarts, whereas
+        // the in-process task below sleeps the full `keep_window` and is lost on
+        // restart. The two also race: cold-GC's `last_modified <= now - window`
+        // cutoff (write time) always trips before this task's `publish + window`
+        // timer (publish time is strictly later), so cold-GC deletes everything
+        // first and this task only ever finds the objects already gone — while
+        // accumulating one idle task per compaction. Skip it in that config.
+        if defer_deletion_to_cold_gc(
+            self.config.cold_gc_enabled,
+            self.config.keep_generations_trailing_window,
+        ) {
+            return Ok(());
+        }
+
         // Delete the superseded inputs in one task: a small in-flight backstop,
         // then (if configured) wait until every live querier has folded this
         // compaction before deleting — so no consumer is left with a phantom ref
@@ -1532,6 +1567,19 @@ mod tests {
             cutoff,
             &live
         ));
+    }
+
+    #[test]
+    fn defer_deletion_to_cold_gc_only_when_cold_gc_is_timed_deleter() {
+        // cold-GC enabled + non-zero window: cold-GC owns timed deletion, so
+        // publish_compaction must skip the in-process delete task.
+        assert!(defer_deletion_to_cold_gc(true, Duration::from_secs(86_400)));
+        // cold-GC disabled: in-process task is the only deleter — must run.
+        assert!(!defer_deletion_to_cold_gc(false, Duration::from_secs(86_400)));
+        // window zero: cold-GC sweep is gated off, in-process task deletes
+        // immediately after grace+convergence — must run.
+        assert!(!defer_deletion_to_cold_gc(true, Duration::ZERO));
+        assert!(!defer_deletion_to_cold_gc(false, Duration::ZERO));
     }
 
     #[test]
