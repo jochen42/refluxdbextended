@@ -934,3 +934,34 @@ fn test_new_from_checkpoints_pending_removed_missing_db() {
     let (file_count, _, _) = persisted_files.get_metrics();
     assert_eq!(0, file_count);
 }
+
+#[test]
+fn parse_gen1_path_accepts_split_chunk_ordinal_suffix() {
+    assert_eq!(
+        parse_gen1_path("writer-a/dbs/1/2/2026-09-05/14-00/0000001337.parquet"),
+        Some(("writer-a".to_string(), 1337))
+    );
+    // upstream >= 3.9.11: the n-th split chunk of one snapshot appends `-n`
+    // and shares the WAL sequence with its siblings
+    assert_eq!(
+        parse_gen1_path("writer-a/dbs/1/2/2026-09-05/14-00/0000001337-2.parquet"),
+        Some(("writer-a".to_string(), 1337))
+    );
+    // compactor output (ULID stem under genN) and malformed stems never parse
+    assert_eq!(
+        parse_gen1_path("compactor/dbs/1-x/2-y/gen2/2026-09-05/14-00/01J8ZK9Q7YV4S.parquet"),
+        None
+    );
+    assert_eq!(
+        parse_gen1_path("writer-a/dbs/1/2/2026-09-05/14-00/0000001337-.parquet"),
+        None
+    );
+    assert_eq!(
+        parse_gen1_path("writer-a/dbs/1/2/2026-09-05/14-00/0000001337-x.parquet"),
+        None
+    );
+    assert_eq!(
+        parse_gen1_path("/dbs/1/2/2026-09-05/14-00/0000001337.parquet"),
+        None
+    );
+}

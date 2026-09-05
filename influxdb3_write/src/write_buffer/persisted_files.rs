@@ -490,24 +490,31 @@ pub(crate) enum TombstoneGc {
     ObjectGone,
 }
 
-/// Parse a writer gen1 parquet path into `(node_id, wal_seq)`.
+/// Parse a writer-persisted gen1 parquet path,
+/// `<node_id>/dbs/<db>/<table>/<date>/<hour>/<wal_seq:010>[-<ordinal>].parquet`,
+/// into `(node_id, wal_seq)`. Anything else — compactor output lives under
+/// `.../genN/...` with a ULID stem — yields `None`.
 ///
-/// Writer gen1 files are laid out as
-/// `<node_id>/dbs/<db>/<table>/<date>/<hour>/<wal_seq:010>.parquet`, so the
-/// leading path segment is the node id and the file stem is the zero-padded
-/// WAL `snapshot_sequence_number`. Compactor outputs (gen2+) use a ULID stem
-/// and a `<uuid>-<id>` directory scheme and so do not parse here — their
-/// tombstones are GC'd against the compaction high-water instead.
+/// Since upstream 3.9.11 a gen1 chunk that splits into several buffer chunks
+/// (a string column at the Arrow varchar limit) persists one file per split:
+/// `<wal_seq:010>-<ordinal>.parquet` for ordinal >= 1, the bare name for
+/// ordinal 0. Every split of one snapshot shares the WAL sequence, which is
+/// the only part the tombstone GC keys on.
 fn parse_gen1_path(path: &str) -> Option<(String, u64)> {
     let node_id = path.split('/').next()?.to_string();
     if node_id.is_empty() {
         return None;
     }
     let stem = path.strip_suffix(".parquet")?.rsplit('/').next()?;
-    if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_digit()) {
+    let (seq, ordinal) = match stem.split_once('-') {
+        Some((seq, ordinal)) => (seq, Some(ordinal)),
+        None => (stem, None),
+    };
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !all_digits(seq) || ordinal.is_some_and(|o| !all_digits(o)) {
         return None;
     }
-    let wal_seq = stem.parse::<u64>().ok()?;
+    let wal_seq = seq.parse::<u64>().ok()?;
     Some((node_id, wal_seq))
 }
 
