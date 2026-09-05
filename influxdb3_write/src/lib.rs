@@ -156,11 +156,8 @@ impl Serialize for WriteLineError {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("WriteLineError", 3)?;
         const TRUNCATE_LIMIT: usize = 20;
-        let truncated_line = if self.original_line.len() > TRUNCATE_LIMIT {
-            &self.original_line[..TRUNCATE_LIMIT]
-        } else {
-            &self.original_line
-        };
+        let truncated_line =
+            &self.original_line[..self.original_line.floor_char_boundary(TRUNCATE_LIMIT)];
         state.serialize_field("error_message", &self.error_message)?;
         state.serialize_field("line_number", &self.line_number)?;
         state.serialize_field("original_line", truncated_line)?;
@@ -290,6 +287,56 @@ impl PersistedSnapshot {
             });
         }
         (db_count, table_count, file_count)
+    }
+
+    /// Count `(databases, tables, files)` in the `removed_files` collection.
+    pub fn removed_db_table_and_file_count(&self) -> (u64, u64, u64) {
+        let mut db_count = 0;
+        let mut table_count = 0;
+        let mut file_count = 0;
+        for (_, db_tables) in &self.removed_files {
+            db_count += 1;
+            table_count += db_tables.tables.len() as u64;
+            file_count += db_tables.tables.values().fold(0, |mut acc, files| {
+                acc += files.len() as u64;
+                acc
+            });
+        }
+        (db_count, table_count, file_count)
+    }
+
+    /// The `(database, table)` holding the most parquet files across both the
+    /// persisted and removed collections, with that file count. Used to point
+    /// at the source of an unusually large snapshot manifest.
+    pub fn largest_table_by_file_count(&self) -> Option<(DbId, TableId, u64)> {
+        let mut worst: Option<(DbId, TableId, u64)> = None;
+        for map in [&self.databases, &self.removed_files] {
+            for (db_id, db_tables) in map {
+                for (table_id, files) in &db_tables.tables {
+                    let count = files.len() as u64;
+                    if worst.is_none_or(|(_, _, wc)| count > wc) {
+                        worst = Some((*db_id, *table_id, count));
+                    }
+                }
+            }
+        }
+        worst
+    }
+
+    /// The number of distinct gen1 time buckets (parquet `chunk_time` values)
+    /// spanned by the persisted files. A large value alongside many tables
+    /// indicates a wide time range (e.g. a historical backfill) fanned out
+    /// across tables, which multiplies the file count in a single snapshot.
+    pub fn distinct_chunk_time_count(&self) -> usize {
+        let mut times = std::collections::HashSet::new();
+        for (_, db_tables) in &self.databases {
+            for (_, files) in &db_tables.tables {
+                for file in files {
+                    times.insert(file.chunk_time);
+                }
+            }
+        }
+        times.len()
     }
 
     pub fn overall_db_table_file_counts(host_snapshots: &[PersistedSnapshot]) -> (u64, u64, u64) {

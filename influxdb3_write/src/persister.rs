@@ -35,9 +35,9 @@ use futures_util::stream::{FuturesOrdered, StreamExt};
 use influxdb3_cache::parquet_cache::ParquetFileDataToCache;
 use influxdb3_wal::SnapshotSequenceNumber;
 use iox_time::TimeProvider;
-use object_store::ObjectStore;
 use object_store::path::Path as ObjPath;
-use object_store_utils::AdaptivePutExt;
+use object_store::{ObjectMeta, ObjectStore};
+use object_store_utils::{AdaptiveGetExt, AdaptivePutExt};
 use observability_deps::tracing::{debug, error, info, trace, warn};
 use parking_lot::RwLock;
 use parquet::arrow::ArrowWriter;
@@ -99,6 +99,13 @@ pub const DEFAULT_OBJECT_STORE_URL: &str = "iox://influxdb3/";
 const MAX_CONCURRENT_CHECKPOINT_LOADS: usize = 10;
 /// Number of checkpoints to retain per month when cleaning up (latest + previous for safety)
 const CHECKPOINTS_TO_RETAIN_PER_MONTH: usize = 2;
+/// Default number of snapshot manifests fetched concurrently during startup
+/// restore. Matches the default object-store connection limit so small
+/// manifests keep loading at full concurrency (no startup regression); large
+/// manifests fan out into ranged GETs that share that same connection-limit
+/// semaphore, so peak in-flight requests are bounded regardless. The effective
+/// limit is capped by the object-store connection limit at startup.
+pub const DEFAULT_MAX_CONCURRENT_SNAPSHOT_LOADS: usize = 64;
 
 /// Cached checkpoint with its file index for efficient incremental updates.
 ///
@@ -131,6 +138,8 @@ pub struct Persister {
     last_checkpoint_time: RwLock<Option<Instant>>,
     /// Cached checkpoint for the current month to avoid reloading from object store.
     cached_checkpoint: RwLock<Option<CachedCheckpoint>>,
+    /// Max snapshot manifests fetched concurrently during startup restore.
+    snapshot_load_concurrency: usize,
 }
 
 impl Persister {
@@ -157,7 +166,15 @@ impl Persister {
             checkpoint_interval,
             last_checkpoint_time: RwLock::new(None),
             cached_checkpoint: RwLock::new(None),
+            snapshot_load_concurrency: DEFAULT_MAX_CONCURRENT_SNAPSHOT_LOADS,
         }
+    }
+
+    /// Override the number of snapshot manifests fetched concurrently during
+    /// startup restore. Defaults to [`DEFAULT_MAX_CONCURRENT_SNAPSHOT_LOADS`].
+    pub fn with_snapshot_load_concurrency(mut self, concurrency: usize) -> Self {
+        self.snapshot_load_concurrency = concurrency.max(1);
+        self
     }
 
     /// Get the Object Store URL
@@ -200,7 +217,7 @@ impl Persister {
             node_identifier_prefix = %self.node_identifier_prefix,
             "load_snapshots: starting"
         );
-        let mut futures = FuturesOrdered::new();
+        let mut fetches = Vec::new();
         let mut offset: Option<ObjPath> = None;
 
         while most_recent_n > 0 {
@@ -245,9 +262,15 @@ impl Persister {
             async fn get_snapshot(
                 location: ObjPath,
                 last_modified: DateTime<Utc>,
+                object_size: u64,
                 object_store: Arc<dyn ObjectStore>,
             ) -> Result<(usize, PersistedSnapshotVersion)> {
-                let bytes = object_store.get(&location).await?.bytes().await?;
+                // Manifests can be multi-GiB; get_adaptive chunks large
+                // reads. Size is known from list(), so pass it to skip a
+                // HEAD.
+                let bytes = object_store
+                    .get_adaptive(&location, Some(object_size))
+                    .await?;
                 let size = bytes.len();
                 let mut snapshot: PersistedSnapshotVersion = serde_json::from_slice(&bytes)?;
                 match &mut snapshot {
@@ -261,9 +284,10 @@ impl Persister {
 
             trace!(count = end, "load_snapshots: queueing snapshot fetches");
             for item in &list[0..end] {
-                futures.push_back(get_snapshot(
+                fetches.push(get_snapshot(
                     item.location.clone(),
                     item.last_modified,
+                    item.size,
                     Arc::clone(&self.object_store),
                 ));
             }
@@ -278,14 +302,24 @@ impl Persister {
             offset = Some(list[end - 1].location.clone());
         }
 
+        // Fetch with bounded concurrency: each in-flight manifest holds a
+        // reassembly buffer, so an unbounded fan-out over many (potentially
+        // multi-GiB) manifests can exhaust memory at startup. buffered() keeps
+        // at most snapshot_load_concurrency requests in flight while preserving
+        // input order.
         trace!(
-            pending_fetches = futures.len(),
+            pending_fetches = fetches.len(),
+            snapshot_load_concurrency = self.snapshot_load_concurrency,
             "load_snapshots: fetching snapshot contents"
         );
-        let mut results = Vec::new();
+        let results_with_size: Vec<(usize, PersistedSnapshotVersion)> =
+            futures_util::stream::iter(fetches)
+                .buffered(self.snapshot_load_concurrency)
+                .try_collect()
+                .await?;
+        let mut results = Vec::with_capacity(results_with_size.len());
         let mut total_bytes = 0usize;
-        while let Some(result) = futures.next().await {
-            let (size, snapshot) = result?;
+        for (size, snapshot) in results_with_size {
             total_bytes += size;
             results.push(snapshot);
         }
@@ -356,12 +390,48 @@ impl Persister {
         let snapshot_file_path =
             SnapshotInfoFilePath::new(self.node_identifier_prefix.as_str(), seq);
         let json = serde_json::to_vec_pretty(persisted_snapshot)?;
+        let manifest_bytes = json.len();
+
+        // A healthy snapshot manifest is small (KB to a few MB). A large one
+        // indicates a pathological number of files and risks exceeding object
+        // store limits, so warn with a breakdown (added vs removed files and
+        // the worst offending table) to identify the cause. The breakdown is
+        // only computed above the threshold to keep the common path cheap.
+        const LARGE_SNAPSHOT_MANIFEST_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
+        if manifest_bytes >= LARGE_SNAPSHOT_MANIFEST_BYTES {
+            let (added_dbs, added_tables, added_files) = snapshot.db_table_and_file_count();
+            let (removed_dbs, removed_tables, removed_files) =
+                snapshot.removed_db_table_and_file_count();
+            warn!(
+                snapshot_sequence_number = seq.as_u64(),
+                manifest_bytes,
+                added_dbs,
+                added_tables,
+                added_files,
+                removed_dbs,
+                removed_tables,
+                removed_files,
+                parquet_size_bytes = snapshot.parquet_size_bytes,
+                row_count = snapshot.row_count,
+                time_span_ns = snapshot.max_time.saturating_sub(snapshot.min_time),
+                gen1_buckets = snapshot.distinct_chunk_time_count(),
+                worst_table = ?snapshot.largest_table_by_file_count(),
+                "persisting unusually large snapshot manifest"
+            );
+        }
+
+        // Use an adaptive put: snapshot manifests are usually small, but with
+        // very large numbers of files they can exceed the object store's
+        // single-PUT limit (e.g. Azure's 5 GiB cap), which fails the snapshot
+        // and stalls the WAL. put_adaptive routes oversized payloads through a
+        // multipart upload instead of a single PUT.
         self.object_store
-            .put(snapshot_file_path.as_ref(), json.into())
+            .put_adaptive(snapshot_file_path.as_ref(), json.into())
             .await?;
 
         debug!(
             snapshot_sequence_number = seq.as_u64(),
+            manifest_bytes,
             path = %snapshot_file_path.as_ref(),
             "persist_snapshot: completed"
         );
@@ -559,7 +629,7 @@ impl Persister {
     pub async fn list_latest_checkpoints_per_month(
         &self,
         min_sequence: Option<SnapshotSequenceNumber>,
-    ) -> Result<Vec<ObjPath>> {
+    ) -> Result<Vec<ObjectMeta>> {
         debug!(
             node_identifier_prefix = %self.node_identifier_prefix,
             ?min_sequence,
@@ -569,18 +639,16 @@ impl Persister {
         let checkpoint_dir = SnapshotCheckpointPath::dir(&self.node_identifier_prefix);
         let mut checkpoint_list = self.object_store.list(Some(&checkpoint_dir));
 
-        // Collect all checkpoint paths
-        let mut paths_by_month: HashMap<YearMonth, Vec<ObjPath>> = HashMap::new();
+        // Collect all checkpoint metas (kept whole so the size from the LIST is
+        // threaded to the loader, letting it size the read without a HEAD).
+        let mut metas_by_month: HashMap<YearMonth, Vec<ObjectMeta>> = HashMap::new();
 
         while let Some(item) = checkpoint_list.next().await {
             match item {
                 Ok(meta) => {
                     let path_str = meta.location.as_ref();
                     if let Some(year_month) = SnapshotCheckpointPath::parse_year_month(path_str) {
-                        paths_by_month
-                            .entry(year_month)
-                            .or_default()
-                            .push(meta.location);
+                        metas_by_month.entry(year_month).or_default().push(meta);
                     }
                 }
                 Err(e) => {
@@ -594,12 +662,12 @@ impl Persister {
         }
 
         // For each month, select only the latest checkpoint
-        let mut result: Vec<(YearMonth, ObjPath)> = paths_by_month
+        let mut result: Vec<(YearMonth, ObjectMeta)> = metas_by_month
             .into_iter()
-            .map(|(month, mut paths)| {
-                paths.sort();
+            .map(|(month, mut metas)| {
+                metas.sort_by(|a, b| a.location.cmp(&b.location));
                 // First path after sorting is the latest due to inverted sequence numbers
-                (month, paths.into_iter().next().unwrap())
+                (month, metas.into_iter().next().unwrap())
             })
             .collect();
 
@@ -610,9 +678,9 @@ impl Persister {
             let min_seq_u64 = min_seq.as_u64();
             let with_seqs: Vec<_> = result
                 .iter()
-                .filter_map(|(month, path)| {
-                    SnapshotCheckpointPath::parse_sequence_number(path.as_ref())
-                        .map(|seq| (*month, path.clone(), seq.as_u64()))
+                .filter_map(|(month, meta)| {
+                    SnapshotCheckpointPath::parse_sequence_number(meta.location.as_ref())
+                        .map(|seq| (*month, meta.clone(), seq.as_u64()))
                 })
                 .collect();
 
@@ -631,7 +699,7 @@ impl Persister {
                         .map(|(_, _, next_seq)| *next_seq >= min_seq_u64)
                         .unwrap_or(false)
                 })
-                .map(|(_, (month, path, _))| (*month, path.clone()))
+                .map(|(_, (month, meta, _))| (*month, meta.clone()))
                 .collect();
 
             debug!(
@@ -641,37 +709,41 @@ impl Persister {
             );
         }
 
-        let paths: Vec<ObjPath> = result.into_iter().map(|(_, path)| path).collect();
+        let metas: Vec<ObjectMeta> = result.into_iter().map(|(_, meta)| meta).collect();
 
         debug!(
-            count = paths.len(),
+            count = metas.len(),
             "list_latest_checkpoints_per_month: completed"
         );
-        Ok(paths)
+        Ok(metas)
     }
 
-    /// Loads checkpoints from the given paths.
+    /// Loads checkpoints from the given object metas.
     ///
-    /// Use with paths returned from `list_latest_checkpoints_per_month()`.
+    /// Use with the metas returned from `list_latest_checkpoints_per_month()`.
     /// Limits concurrency to avoid overwhelming the object store.
     pub async fn load_checkpoints(
         &self,
-        paths: Vec<ObjPath>,
+        metas: Vec<ObjectMeta>,
     ) -> Result<Vec<PersistedSnapshotCheckpointVersion>> {
-        debug!(count = paths.len(), "load_checkpoints: starting");
+        debug!(count = metas.len(), "load_checkpoints: starting");
 
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CHECKPOINT_LOADS));
         let mut futures = FuturesOrdered::new();
 
-        for path in paths {
+        for meta in metas {
             let object_store = Arc::clone(&self.object_store);
             let semaphore = Arc::clone(&semaphore);
-            let path_clone = path.clone();
 
             futures.push_back(async move {
                 let _permit = semaphore.acquire().await.expect("semaphore not closed");
-                trace!(path = %path_clone, "loading checkpoint");
-                let bytes = object_store.get(&path_clone).await?.bytes().await?;
+                trace!(path = %meta.location, "loading checkpoint");
+                // Checkpoints merge a month of snapshots and are the most likely
+                // to be multi-GiB; get_adaptive chunks large reads. The size is
+                // known from the prior list(), so pass it to skip size discovery.
+                let bytes = object_store
+                    .get_adaptive(&meta.location, Some(meta.size))
+                    .await?;
                 let checkpoint: PersistedSnapshotCheckpointVersion =
                     serde_json::from_slice(&bytes)?;
                 Result::<_, PersisterError>::Ok(checkpoint)

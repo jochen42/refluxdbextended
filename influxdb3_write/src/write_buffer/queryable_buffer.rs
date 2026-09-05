@@ -206,7 +206,17 @@ impl QueryableBuffer {
                     let snapshot_chunks =
                         table_buffer.snapshot(table_def, snapshot_details.end_time_marker);
 
+                    // A chunk_time can yield multiple buffer chunks when a string/tag
+                    // column crossed the Arrow varchar limit and the chunk split
+                    // (table_buffer::buffer_chunk). Each chunk needs a distinct path:
+                    // with a shared path the persist jobs race, the last PUT wins the
+                    // object, and every job's size is recorded — stale records that
+                    // fail reads with "Corrupt footer".
+                    let mut chunk_ordinals: HashMap<i64, u32> = HashMap::new();
                     for chunk in snapshot_chunks {
+                        let ordinal_ref = chunk_ordinals.entry(chunk.chunk_time).or_insert(0);
+                        let chunk_ordinal = *ordinal_ref;
+                        *ordinal_ref += 1;
                         let table_name =
                             db_schema.table_id_to_name(table_id).expect("table exists");
                         let persist_job = PersistJob {
@@ -214,12 +224,13 @@ impl QueryableBuffer {
                             table_id: *table_id,
                             table_name: Arc::clone(&table_name),
                             chunk_time: chunk.chunk_time,
-                            path: ParquetFilePath::new(
+                            path: ParquetFilePath::new_with_chunk_ordinal(
                                 self.persister.node_identifier_prefix(),
                                 database_id.get(),
                                 table_id.get(),
                                 chunk.chunk_time,
                                 snapshot_details.last_wal_sequence_number,
+                                chunk_ordinal,
                             ),
                             batch: chunk.record_batch,
                             schema: chunk.schema,
@@ -304,7 +315,6 @@ impl QueryableBuffer {
             // persist the individual files, building the snapshot as we go
             let persisted_snapshot = Arc::new(Mutex::new(snapshot));
 
-            let persist_jobs_empty = persist_jobs.is_empty();
             let semaphore = Arc::new(Semaphore::new(parquet_snapshot_concurrency_limit.get()));
             let mut set = JoinSet::new();
             for persist_job in persist_jobs {
@@ -388,74 +398,63 @@ impl QueryableBuffer {
 
             set.join_all().await;
 
-            // persist the snapshot file - only if persist jobs are present or
-            // files have been removed due to retention policies.
-            // If persist_jobs is empty, then the parquet file wouldn't have been
-            // written out, so it's desirable to not write empty snapshot files.
+            // Always persist the snapshot manifest, even when it is empty.
             //
-            // How can persist jobs be empty even though a snapshot is triggered?
+            // The snapshot sequence number is minted eagerly at plan time in the
+            // WAL crate (`SnapshotTracker::increment_snapshot_sequence_number`) and
+            // embedded durably in the WAL file, so by the time we get here the
+            // number has already been spent. Consumers walk the sequence by exact
+            // key: the compactor point-GETs `marker + 1` and treats `NotFound` as
+            // "caught up", and enterprise read replicas block until each manifest
+            // appears. Skipping the write for an empty snapshot would leave a
+            // permanent hole that halts the compactor for this node and wedges
+            // those replicas (influxdb_pro#4827). An empty manifest is cheap and
+            // loads harmlessly, and it shares the same lifecycle as every other
+            // snapshot manifest (there is no separate cleanup path for it in OSS),
+            // so we always write it rather than leave a gap the consumers cannot
+            // distinguish from a failed persist.
             //
-            // When force snapshot is set, wal_periods (tracked by
-            // snapshot_tracker) will never be empty as a no-op is added. This
-            // means even though there is a wal period the query buffer might
-            // still be empty. The reason is, when snapshots are happening very
-            // close to each other (when force snapshot is set), they could get
-            // queued to run immediately one after the other as illustrated in
-            // example series of flushes and force snapshots below,
-            //
-            //   1 (only wal flush) // triggered by flush interval 1s
-            //   2 (snapshot)       // triggered by flush interval 1s
-            //   3 (force_snapshot) // triggered by mem check interval 10s
-            //   4 (force_snapshot) // triggered by mem check interval 10s
-            //
-            // Although the flush interval an mem check intervals aren't same
-            // there's a good chance under high memory pressure there will be
-            // a lot of overlapping.
-            //
-            // In this setup - after 2 (snapshot), we emptied wal buffer and as
-            // soon as snapshot is done, 3 will try to run the snapshot but wal
-            // buffer can be empty at this point, which means it adds a no-op.
-            // no-op has the current time which will be used as the
-            // end_time_marker. That would evict everything from query buffer, so
-            // when 4 (force snapshot) runs there's no data in the query
-            // buffer though it has a wal_period. When normal (i.e without
-            // force_snapshot) snapshot runs, snapshot_tracker will check if
-            // wal_periods are empty so it won't trigger a snapshot in the first
-            // place.
-            let removed_files_empty = persisted_snapshot.lock().removed_files.is_empty();
+            // A forced snapshot can legitimately find nothing to persist:
+            // `force_flush_buffer` adds a `WalOp::Noop` so a wal_period always
+            // exists, but back-to-back forced snapshots under memory pressure can
+            // drain the query buffer before the next one runs, leaving no persist
+            // jobs and no removed files while the sequence number has still been
+            // consumed.
             let persisted_snapshot = PersistedSnapshotVersion::V1(
                 Arc::into_inner(persisted_snapshot)
                     .expect("Should only have one strong reference")
                     .into_inner(),
             );
-            if !persist_jobs_empty || !removed_files_empty {
-                loop {
-                    match persister.persist_snapshot(&persisted_snapshot).await {
-                        Ok(_) => {
-                            // Dual-publish to shared inventory so peer queriers
-                            // and the dedicated compactor see this snapshot.
-                            // Best-effort: a failure here doesn't roll back the
-                            // primary persist — peers will pick it up on the
-                            // next checkpoint refresh.
-                            if let Some(inv) = &shared_inventory {
-                                let PersistedSnapshotVersion::V1(ps) = &persisted_snapshot;
-                                if let Err(e) = inv
-                                    .publish_wal_snapshot(persister.node_identifier_prefix(), ps)
-                                    .await
-                                {
-                                    warn!(%e, "failed to publish snapshot to shared inventory");
-                                }
+            loop {
+                match persister.persist_snapshot(&persisted_snapshot).await {
+                    Ok(_) => {
+                        // Dual-publish to shared inventory so peer queriers
+                        // and the dedicated compactor see this snapshot.
+                        // Best-effort: a failure here doesn't roll back the
+                        // primary persist — peers will pick it up on the
+                        // next checkpoint refresh. Empty manifests are
+                        // published too: the inventory poller advances the
+                        // writer's WAL watermark from them, which is what
+                        // lets the WAL-tail buffer evict files whose data
+                        // never produced a parquet file.
+                        if let Some(inv) = &shared_inventory {
+                            let PersistedSnapshotVersion::V1(ps) = &persisted_snapshot;
+                            if let Err(e) = inv
+                                .publish_wal_snapshot(persister.node_identifier_prefix(), ps)
+                                .await
+                            {
+                                warn!(%e, "failed to publish snapshot to shared inventory");
                             }
-                            let persisted_snapshot = Some(persisted_snapshot.clone());
-                            notify_snapshot_tx
-                                .send(persisted_snapshot)
-                                .expect("persisted snapshot notify tx should not be closed");
-                            break;
                         }
-                        Err(e) => {
-                            error!(%e, "Error persisting snapshot, sleeping and retrying...");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
+                        let persisted_snapshot = Some(persisted_snapshot.clone());
+                        notify_snapshot_tx
+                            .send(persisted_snapshot)
+                            .expect("persisted snapshot notify tx should not be closed");
+                        break;
+                    }
+                    Err(e) => {
+                        error!(%e, "Error persisting snapshot, sleeping and retrying...");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
             }

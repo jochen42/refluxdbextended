@@ -1432,10 +1432,7 @@ async fn setup_server(start_time: i64) -> (String, CancellationToken, Arc<dyn Wr
         &[&tokio_rustls::rustls::version::TLS13];
 
     // Start processing engine triggers
-    Arc::clone(&processing_engine)
-        .start_triggers()
-        .await
-        .expect("failed to start processing engine triggers");
+    Arc::clone(&processing_engine).start_triggers().await;
 
     write_buffer
         .wal()
@@ -1460,6 +1457,7 @@ async fn setup_server(start_time: i64) -> (String, CancellationToken, Arc<dyn Wr
         cert_file: None,
         key_file: None,
         tls_minimum_version: TLS_MIN_VERSION,
+        shutdown_timeout: std::time::Duration::from_secs(30),
     });
     let shutdown = frontend_shutdown.clone();
     let paths = EMPTY_PATHS.get_or_init(std::vec::Vec::new);

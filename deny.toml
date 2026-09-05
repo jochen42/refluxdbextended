@@ -17,6 +17,14 @@ ignore = [
     # there are multiple replacements at this time but there isn't
     # yet a clear choice
     "RUSTSEC-2025-0141",
+    # quick-xml < 0.41.0 two DoS advisories: unbounded namespace-declaration
+    # allocation in NsReader (0195) and quadratic-time attribute duplicate check
+    # (0194). Pulled in transitively at two versions with no upgrade path yet:
+    # object_store (latest 0.14.0) pins quick-xml ^0.40.1 and inferno (latest
+    # 0.12.6, via pprof) pins ^0.39 — neither reaches the patched 0.41.0. Remove
+    # once object_store and pprof/inferno move to quick-xml >= 0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
     # rustls-webpki 0.102.8 CRL distribution point matching bug; low impact
     # (requires CA compromise). Stuck on 0.102.x via wasmtime's rustls 0.22.x
     # dep in datafusion-udf-wasm. Upstream also ignores this advisory.
@@ -66,7 +74,37 @@ ignore = [
     # WASI filesystem access required (we don't grant any preopened dirs to UDFs):
     "RUSTSEC-2026-0149", # GHSA-2r75-cxrj-cmph: WASI path_open(TRUNCATE) bypasses FilePerms::WRITE host restriction
     #
+    # Another wasmtime advisory:
+    "RUSTSEC-2026-0182",
+    #
     # TODO: update wasmtime via datafusion-udf-wasm to a patched version (>=42.0.2)
+    #
+    # wasmtime-wasi 41.0.4 WASI hard links and renames bypass FilePerms for the
+    # destination (https://rustsec.org/advisories/RUSTSEC-2026-0188). Same transitive
+    # path via datafusion-udf-wasm; only reachable if a Wasm UDF is loaded with WASI
+    # filesystem preopens granted, and UDFs are disabled by default
+    # (udfs_enabled = false). Fix requires wasmtime-wasi >=45.0.3, which needs an
+    # upstream datafusion-udf-wasm bump.
+    "RUSTSEC-2026-0188",
+    #
+    # wasmtime 41.0.4 stores can mix up type indices between engines
+    # (https://rustsec.org/advisories/RUSTSEC-2026-0222). Same transitive path via
+    # datafusion-udf-wasm; only reachable if a Wasm UDF is loaded, and UDFs are
+    # disabled by default (udfs_enabled = false). The 41.x line has no patched
+    # release. The fix requires wasmtime >=46.0.2, which needs an upstream
+    # datafusion-udf-wasm bump to a DataFusion 52 rev.
+    "RUSTSEC-2026-0222",
+    #
+    # wasmtime 41.0.4 filesystem sandbox escape when paths or symlinks contain
+    # trailing slashes (https://rustsec.org/advisories/RUSTSEC-2026-0269). Same
+    # transitive path via datafusion-udf-wasm; only reachable if a Wasm UDF is
+    # loaded with WASI filesystem preopens granted, and UDFs are disabled by
+    # default (udfs_enabled = false). The 41.x line has no patched release. The
+    # fix requires wasmtime >=46.0.3, which needs an upstream datafusion-udf-wasm
+    # bump.
+    "RUSTSEC-2026-0269",
+    #
+    # TODO: update wasmtime-wasi via datafusion-udf-wasm to a patched version (>=45.0.3; >=46.0.1 is also fixed)
 
     # rand unsoundness: only reachable with rand's `log` feature plus a custom logger
     # that calls rand::rng() and triggers a reseed. We don't enable rand's `log`
@@ -74,6 +112,18 @@ ignore = [
     # unreachable. Patched in rand >=0.9.3 / >=0.8.6; the 0.8.x copy is pinned
     # transitively via cap-rand/wasmtime. Tracked for a version bump on main.
     "RUSTSEC-2026-0097", # rand unsound with custom logger calling thread_rng (log feature not enabled here)
+    #
+    # pyo3 0.24-0.28 out-of-bounds read in Iterator::nth/nth_back on
+    # PyList/PyTuple iterators; fix is only in pyo3 0.29 (API-breaking bump,
+    # tracked in influxdb_pro#4072). Not reachable here: no nth/nth_back calls
+    # in our pyo3-consuming crates, and the overflow needs a Rust-side n near
+    # usize::MAX, which our embedding never produces.
+    "RUSTSEC-2026-0176",
+    #
+    # pyo3 0.15-0.29 unsoundness bug. Possible data race in functions supplied
+    # to PyCFunction::new_closure, or PyCFunction::new_closure_bound.
+    # Neither of these methods are used in this code.
+    "RUSTSEC-2026-0177",
 ]
 git-fetch-with-cli = true
 
