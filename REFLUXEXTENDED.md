@@ -118,11 +118,18 @@ data dirs.
 │
 ├── <writer_node_id>/               writer-owned data (upstream layout)
 │   ├── wal/…                       WAL segment files (tailed by queriers)
-│   └── dbs/<db>/<table>/<date>/<HH-MM>/<walseq>.parquet      gen1 files
+│   └── dbs/<db>/<table>/<date>/<HH-MM>/<walseq>[-<n>].parquet gen1 files
 │
 └── <compactor_node_id>/
     └── dbs/<db_uuid>-<id>/<table_uuid>-<id>/genN/<date>/<HH-MM>/<ulid>.parquet
 ```
+
+A gen1 file is named by the WAL sequence that persisted it. Since upstream
+3.9.11 a gen1 chunk that splits into several buffer chunks (a string column at
+the Arrow varchar limit) persists one file per split, `<walseq>-<n>.parquet`
+for n ≥ 1; the common single-chunk case keeps the bare name. Fork code that
+parses gen1 paths (`parse_gen1_path`, tombstone GC) keys on the WAL sequence
+and accepts the suffix.
 
 Manifest filenames are chosen so a plain lexicographic `LIST` returns them in a
 useful order: WAL snapshots are keyed by `u64::MAX - sequence` (newest first);
@@ -215,11 +222,22 @@ sequenceDiagram
     loop every --wal-snapshot-size periods
         WB->>P: snapshot oldest chunks
         P->>P: sort by table sort key (ReorgPlanner)
-        P->>WAL: write gen1 parquet (.../<date>/<HH-MM>/<walseq>.parquet)
+        P->>WAL: write gen1 parquet (.../<date>/<HH-MM>/<walseq>[-<n>].parquet)
         P->>INV: publish PersistedSnapshot manifest (databases = new gen1 file)
         WB->>WB: drop persisted rows from memory
     end
 ```
+
+Every snapshot publishes a manifest, **including an empty one** (upstream
+3.9.13: a forced snapshot that finds nothing to persist still consumes a
+sequence number, and a missing manifest would look like a hole to sequential
+consumers). The fork dual-publishes those too, so the inventory poller's
+per-writer WAL watermark advances even when no parquet was written — which is
+what lets the WAL-tail buffer (§11) evict the corresponding WAL files.
+Manifests and inventory checkpoints are written with multipart uploads and
+read with size-gated ranged GETs (`put_adaptive` / `get_adaptive`), so a very
+large checkpoint — it lists every live file — cannot exceed a single-request
+limit.
 
 Key point for the rest of this document: between a write landing in memory and
 its gen1 Parquet manifest appearing in `_inventory/wal/`, the data is visible
@@ -535,7 +553,8 @@ Files are evicted two ways:
 - **Routine (correctness-safe):** the inventory poller calls
   `evict_up_to(writer, wal_seq)` after folding that writer's snapshot
   (`inventory_poller.rs:318`) — once a WAL file's data is in committed Parquet
-  (Layer A), the tail copy is redundant and dropped.
+  (Layer A), the tail copy is redundant and dropped. Empty manifests count:
+  they advance the watermark for WAL files that produced no parquet at all.
 - **Backstop (OOM cap):** `--wal-tail-max-files` per writer (default `2000`).
 
 > [!IMPORTANT]
