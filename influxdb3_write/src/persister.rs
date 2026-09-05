@@ -348,7 +348,9 @@ impl Persister {
     ) -> Result<()> {
         let path = CompactionInfoFilePath::new(self.node_identifier_prefix.as_str(), compaction_id);
         let json = serde_json::to_vec_pretty(persisted_snapshot)?;
-        self.object_store.put(path.as_ref(), json.into()).await?;
+        self.object_store
+            .put_adaptive(path.as_ref(), json.into())
+            .await?;
         Ok(())
     }
 
@@ -359,17 +361,20 @@ impl Persister {
     pub async fn load_compaction_snapshots(&self) -> Result<Vec<PersistedSnapshot>> {
         let dir = CompactionInfoFilePath::dir(&self.node_identifier_prefix);
         let mut listing = self.object_store.list(Some(&dir));
-        let mut paths = Vec::new();
+        let mut metas = Vec::new();
         while let Some(item) = listing.next().await {
-            paths.push(item?.location);
+            metas.push(item?);
         }
         // Stable order so removals consistently apply after their corresponding
         // additions when older manifests are replayed.
-        paths.sort_unstable();
+        metas.sort_unstable_by(|a, b| a.location.cmp(&b.location));
 
-        let mut snapshots = Vec::with_capacity(paths.len());
-        for location in paths {
-            let bytes = self.object_store.get(&location).await?.bytes().await?;
+        let mut snapshots = Vec::with_capacity(metas.len());
+        for meta in metas {
+            let bytes = self
+                .object_store
+                .get_adaptive(&meta.location, Some(meta.size))
+                .await?;
             let snapshot: PersistedSnapshot = serde_json::from_slice(&bytes)?;
             snapshots.push(snapshot);
         }

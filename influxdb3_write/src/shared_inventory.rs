@@ -23,6 +23,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjPath;
+use object_store_utils::{AdaptiveGetExt, AdaptivePutExt};
 use observability_deps::tracing::{debug, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -153,7 +154,7 @@ impl SharedInventory {
         let path = wal_entry(node_id, snapshot.snapshot_sequence_number.as_u64());
         let result: Result<()> = async {
             let body = serde_json::to_vec_pretty(snapshot)?;
-            self.object_store.put(&path, Bytes::from(body).into()).await?;
+            self.object_store.put_adaptive(&path, Bytes::from(body)).await?;
             Ok(())
         }
         .await;
@@ -171,7 +172,7 @@ impl SharedInventory {
         let path = compaction_entry(compaction_id);
         let result: Result<()> = async {
             let body = serde_json::to_vec_pretty(snapshot)?;
-            self.object_store.put(&path, Bytes::from(body).into()).await?;
+            self.object_store.put_adaptive(&path, Bytes::from(body)).await?;
             Ok(())
         }
         .await;
@@ -191,7 +192,7 @@ impl SharedInventory {
         let path = checkpoint_entry(&checkpoint_id);
         let result: Result<String> = async {
             let body = serde_json::to_vec_pretty(snapshot)?;
-            self.object_store.put(&path, Bytes::from(body).into()).await?;
+            self.object_store.put_adaptive(&path, Bytes::from(body)).await?;
             Ok(checkpoint_id)
         }
         .await;
@@ -260,10 +261,11 @@ impl SharedInventory {
         since_sequence_per_node: &HashMap<String, u64>,
     ) -> Result<Vec<PersistedSnapshot>> {
         let dir = ObjPath::from(format!("{SHARED_INVENTORY_PREFIX}/wal"));
-        let mut filtered: Vec<(u64, ObjPath)> = Vec::new();
+        let mut filtered: Vec<(u64, ObjPath, u64)> = Vec::new();
         let mut listing = self.object_store.list(Some(&dir));
         while let Some(item) = listing.next().await {
-            let location = item?.location;
+            let meta = item?;
+            let location = meta.location;
             // parts: ["_inventory", "wal", "<node_id>", "<stem>.info.json"]
             let parts: Vec<_> = location.parts().collect();
             if parts.len() < 4 {
@@ -281,16 +283,16 @@ impl SharedInventory {
                 .copied()
                 .unwrap_or(0);
             if seq > since {
-                filtered.push((seq, location));
+                filtered.push((seq, location, meta.size));
             }
         }
         // Ascending by sequence: replay order, so `removed_files` references
         // resolve against earlier manifests.
-        filtered.sort_unstable_by_key(|(s, _)| *s);
+        filtered.sort_unstable_by_key(|(s, _, _)| *s);
 
         let mut out = Vec::with_capacity(filtered.len());
-        for (_, path) in filtered {
-            match self.fetch_snapshot(&path).await {
+        for (_, path, size) in filtered {
+            match self.fetch_snapshot(&path, Some(size)).await {
                 Ok(s) => out.push(s),
                 Err(e) => warn!("skipping inventory entry {}: {}", path, e),
             }
@@ -308,10 +310,11 @@ impl SharedInventory {
         since_compaction_id: Option<&str>,
     ) -> Result<Vec<(String, PersistedSnapshot)>> {
         let dir = compaction_dir();
-        let mut filtered: Vec<(String, ObjPath)> = Vec::new();
+        let mut filtered: Vec<(String, ObjPath, u64)> = Vec::new();
         let mut listing = self.object_store.list(Some(&dir));
         while let Some(item) = listing.next().await {
-            let location = item?.location;
+            let meta = item?;
+            let location = meta.location;
             let parts: Vec<_> = location.parts().collect();
             let Some(filename) = parts.last().map(|p| p.as_ref().to_string()) else {
                 continue;
@@ -322,13 +325,13 @@ impl SharedInventory {
                     continue;
                 }
             }
-            filtered.push((id, location));
+            filtered.push((id, location, meta.size));
         }
         filtered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         let mut out = Vec::with_capacity(filtered.len());
-        for (id, path) in filtered {
-            match self.fetch_snapshot(&path).await {
+        for (id, path, size) in filtered {
+            match self.fetch_snapshot(&path, Some(size)).await {
                 Ok(s) => out.push((id, s)),
                 Err(e) => warn!("skipping inventory entry {}: {}", path, e),
             }
@@ -340,18 +343,21 @@ impl SharedInventory {
     /// have been written.
     pub async fn load_latest_checkpoint(&self) -> Result<Option<Checkpoint>> {
         let dir = checkpoint_dir();
-        let mut paths = Vec::new();
+        let mut metas = Vec::new();
         let mut listing = self.object_store.list(Some(&dir));
         while let Some(item) = listing.next().await {
-            paths.push(item?.location);
+            metas.push(item?);
         }
-        if paths.is_empty() {
+        if metas.is_empty() {
             return Ok(None);
         }
         // ULID v7 is time-sortable lexicographically, so newest = max.
-        paths.sort_unstable();
-        let newest = paths.last().expect("non-empty");
-        let bytes = self.object_store.get(newest).await?.bytes().await?;
+        metas.sort_unstable_by(|a, b| a.location.cmp(&b.location));
+        let newest = metas.last().expect("non-empty");
+        let bytes = self
+            .object_store
+            .get_adaptive(&newest.location, Some(newest.size))
+            .await?;
         let cp: Checkpoint = serde_json::from_slice(&bytes)?;
         Ok(Some(cp))
     }
@@ -425,8 +431,10 @@ impl SharedInventory {
         })
     }
 
-    async fn fetch_snapshot(&self, path: &ObjPath) -> Result<PersistedSnapshot> {
-        let bytes = self.object_store.get(path).await?.bytes().await?;
+    /// `size` is the listed object size when known; it lets `get_adaptive`
+    /// switch to ranged reads for oversized manifests without an extra HEAD.
+    async fn fetch_snapshot(&self, path: &ObjPath, size: Option<u64>) -> Result<PersistedSnapshot> {
+        let bytes = self.object_store.get_adaptive(path, size).await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 }
