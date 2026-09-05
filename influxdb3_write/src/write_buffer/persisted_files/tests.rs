@@ -365,17 +365,17 @@ fn test_tombstone_gc_by_high_water() {
     assert_eq!(persisted.tombstone_count(), 1);
 
     // High-water still below the source seq (1800): retained.
-    persisted.gc_tombstones(&std::collections::HashMap::from([(
-        "main-writer-0".to_string(),
-        1799u64,
-    )]), None);
+    persisted.gc_tombstones(
+        &std::collections::HashMap::from([("main-writer-0".to_string(), 1799u64)]),
+        None,
+    );
     assert_eq!(persisted.tombstone_count(), 1);
 
     // High-water reaches the source seq: collected.
-    persisted.gc_tombstones(&std::collections::HashMap::from([(
-        "main-writer-0".to_string(),
-        1800u64,
-    )]), None);
+    persisted.gc_tombstones(
+        &std::collections::HashMap::from([("main-writer-0".to_string(), 1800u64)]),
+        None,
+    );
     assert!(persisted.tombstone_count() == 0);
 }
 

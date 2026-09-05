@@ -191,15 +191,12 @@ impl NotFoundTolerantSource {
     /// silently turns every one of those passes into a no-op for parquet-backed
     /// queries. Passes must use this helper instead.
     pub fn as_parquet_source(source: &dyn FileSource) -> Option<&ParquetSource> {
-        source
-            .as_any()
-            .downcast_ref::<ParquetSource>()
-            .or_else(|| {
-                source
-                    .as_any()
-                    .downcast_ref::<Self>()
-                    .and_then(|wrapped| wrapped.inner.as_any().downcast_ref::<ParquetSource>())
-            })
+        source.as_any().downcast_ref::<ParquetSource>().or_else(|| {
+            source
+                .as_any()
+                .downcast_ref::<Self>()
+                .and_then(|wrapped| wrapped.inner.as_any().downcast_ref::<ParquetSource>())
+        })
     }
 
     /// Re-apply NotFound tolerance to `rebuilt` when `original` carried it, so
@@ -387,7 +384,11 @@ mod tests {
     use std::sync::Arc;
 
     fn one_row() -> RecordBatch {
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Int64,
+            false,
+        )]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap()
     }
 

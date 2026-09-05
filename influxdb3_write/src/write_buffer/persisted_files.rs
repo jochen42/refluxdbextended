@@ -183,8 +183,7 @@ impl PersistedFiles {
             return;
         };
 
-        let paths_to_remove: HashSet<&String> =
-            files_to_remove.iter().map(|f| &f.path).collect();
+        let paths_to_remove: HashSet<&String> = files_to_remove.iter().map(|f| &f.path).collect();
 
         let (actually_removed_count, actually_removed_size, actually_removed_rows) = files
             .iter()
@@ -254,11 +253,7 @@ impl PersistedFiles {
 
     /// Seed removed-file tombstones from a shared-inventory checkpoint before
     /// folding the newer WAL/compaction manifests on top of it.
-    pub fn seed_tombstones(
-        &self,
-        gen1: Vec<(String, u64)>,
-        compaction: Vec<(String, String)>,
-    ) {
+    pub fn seed_tombstones(&self, gen1: Vec<(String, u64)>, compaction: Vec<(String, String)>) {
         self.inner.write().seed_tombstones(gen1, compaction);
     }
 
@@ -628,9 +623,7 @@ impl Inner {
             source_compaction_id,
         );
         self.parquet_files_count += delta.added_count;
-        self.parquet_files_count = self
-            .parquet_files_count
-            .saturating_sub(delta.removed_count);
+        self.parquet_files_count = self.parquet_files_count.saturating_sub(delta.removed_count);
         self.parquet_files_row_count += delta.added_row_count;
         self.parquet_files_row_count = self
             .parquet_files_row_count
@@ -878,8 +871,9 @@ fn update_persisted_files_with_snapshot(
                         })
                         .unwrap_or_default();
 
-                    if let Some(table_files) =
-                        db_to_tables.get_mut(db_id).and_then(|t| t.get_mut(table_id))
+                    if let Some(table_files) = db_to_tables
+                        .get_mut(db_id)
+                        .and_then(|t| t.get_mut(table_id))
                     {
                         table_files.retain(|f| {
                             if remove_paths.contains(f.path.as_str()) {

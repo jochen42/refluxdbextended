@@ -16,8 +16,8 @@ use schema::sort::SortKey;
 use tracing::debug;
 
 use crate::{
-    provider::not_found_tolerant::NotFoundTolerantSource,
     QueryChunk,
+    provider::not_found_tolerant::NotFoundTolerantSource,
     provider::{PartitionedFileExt, RecordBatchesExec},
 };
 

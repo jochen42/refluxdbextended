@@ -75,7 +75,9 @@ fn consumer_dir() -> ObjPath {
 }
 
 fn consumer_entry(node_id: &str) -> ObjPath {
-    ObjPath::from(format!("{SHARED_INVENTORY_PREFIX}/consumers/{node_id}.json"))
+    ObjPath::from(format!(
+        "{SHARED_INVENTORY_PREFIX}/consumers/{node_id}.json"
+    ))
 }
 
 /// A consumer's (querier's) self-reported convergence position: the highest
@@ -154,7 +156,9 @@ impl SharedInventory {
         let path = wal_entry(node_id, snapshot.snapshot_sequence_number.as_u64());
         let result: Result<()> = async {
             let body = serde_json::to_vec_pretty(snapshot)?;
-            self.object_store.put_adaptive(&path, Bytes::from(body)).await?;
+            self.object_store
+                .put_adaptive(&path, Bytes::from(body))
+                .await?;
             Ok(())
         }
         .await;
@@ -172,7 +176,9 @@ impl SharedInventory {
         let path = compaction_entry(compaction_id);
         let result: Result<()> = async {
             let body = serde_json::to_vec_pretty(snapshot)?;
-            self.object_store.put_adaptive(&path, Bytes::from(body)).await?;
+            self.object_store
+                .put_adaptive(&path, Bytes::from(body))
+                .await?;
             Ok(())
         }
         .await;
@@ -184,15 +190,14 @@ impl SharedInventory {
     /// including the entries with ids lexicographically `<= up_to_id`. Future
     /// loaders that find this checkpoint can skip listing entries with id
     /// `<= up_to_id`. Returns the checkpoint id used.
-    pub async fn write_checkpoint(
-        &self,
-        snapshot: &Checkpoint,
-    ) -> Result<String> {
+    pub async fn write_checkpoint(&self, snapshot: &Checkpoint) -> Result<String> {
         let checkpoint_id = Uuid::now_v7().to_string();
         let path = checkpoint_entry(&checkpoint_id);
         let result: Result<String> = async {
             let body = serde_json::to_vec_pretty(snapshot)?;
-            self.object_store.put_adaptive(&path, Bytes::from(body)).await?;
+            self.object_store
+                .put_adaptive(&path, Bytes::from(body))
+                .await?;
             Ok(checkpoint_id)
         }
         .await;
@@ -278,10 +283,7 @@ impl SharedInventory {
                 continue;
             };
             let seq = u64::MAX - reversed;
-            let since = since_sequence_per_node
-                .get(&node_id)
-                .copied()
-                .unwrap_or(0);
+            let since = since_sequence_per_node.get(&node_id).copied().unwrap_or(0);
             if seq > since {
                 filtered.push((seq, location, meta.size));
             }
@@ -388,9 +390,7 @@ impl SharedInventory {
         // re-fetching anything we already saw.
         let mut wal_watermarks = since_per_node;
         for s in &wal_snapshots {
-            let entry = wal_watermarks
-                .entry(s.node_id.clone())
-                .or_insert(0);
+            let entry = wal_watermarks.entry(s.node_id.clone()).or_insert(0);
             let seq = s.snapshot_sequence_number.as_u64();
             if seq > *entry {
                 *entry = seq;
@@ -518,33 +518,67 @@ mod tests {
         let cid = "019ec300-0000-7000-8000-000000000000"; // the compaction being deleted
 
         // No consumers → nothing to wait for.
-        assert!(inv.all_live_consumers_folded(cid, 1000, 60_000).await.unwrap());
+        assert!(
+            inv.all_live_consumers_folded(cid, 1000, 60_000)
+                .await
+                .unwrap()
+        );
 
         // A consumer that has NOT folded cid (older cursor) blocks.
-        inv.write_consumer_heartbeat("q1", Some("019ec200-0000-7000-8000-000000000000".into()), 1000)
-            .await
-            .unwrap();
-        assert!(!inv.all_live_consumers_folded(cid, 1000, 60_000).await.unwrap());
+        inv.write_consumer_heartbeat(
+            "q1",
+            Some("019ec200-0000-7000-8000-000000000000".into()),
+            1000,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !inv.all_live_consumers_folded(cid, 1000, 60_000)
+                .await
+                .unwrap()
+        );
 
         // A consumer with no cursor at all blocks.
-        inv.write_consumer_heartbeat("q2", None, 1000).await.unwrap();
-        assert!(!inv.all_live_consumers_folded(cid, 1000, 60_000).await.unwrap());
-
-        // Both advance past cid → unblocked.
-        inv.write_consumer_heartbeat("q1", Some("019ec300-0000-7000-8000-000000000001".into()), 2000)
+        inv.write_consumer_heartbeat("q2", None, 1000)
             .await
             .unwrap();
+        assert!(
+            !inv.all_live_consumers_folded(cid, 1000, 60_000)
+                .await
+                .unwrap()
+        );
+
+        // Both advance past cid → unblocked.
+        inv.write_consumer_heartbeat(
+            "q1",
+            Some("019ec300-0000-7000-8000-000000000001".into()),
+            2000,
+        )
+        .await
+        .unwrap();
         inv.write_consumer_heartbeat("q2", Some(cid.to_string()), 2000)
             .await
             .unwrap();
-        assert!(inv.all_live_consumers_folded(cid, 2000, 60_000).await.unwrap());
+        assert!(
+            inv.all_live_consumers_folded(cid, 2000, 60_000)
+                .await
+                .unwrap()
+        );
 
         // A stale lagging consumer is ignored (heartbeat older than ttl).
-        inv.write_consumer_heartbeat("q3", Some("019ec100-0000-7000-8000-000000000000".into()), 2000)
-            .await
-            .unwrap();
+        inv.write_consumer_heartbeat(
+            "q3",
+            Some("019ec100-0000-7000-8000-000000000000".into()),
+            2000,
+        )
+        .await
+        .unwrap();
         // now=100_000, ttl=60_000 → q3 (last seen 2000) is stale; q1/q2 (2000) also stale → all ignored → true.
-        assert!(inv.all_live_consumers_folded(cid, 100_000, 60_000).await.unwrap());
+        assert!(
+            inv.all_live_consumers_folded(cid, 100_000, 60_000)
+                .await
+                .unwrap()
+        );
     }
 
     /// Boot-race guard: a querier that publishes a heartbeat at the checkpoint
@@ -565,13 +599,21 @@ mod tests {
             .unwrap();
         // The gate must NOT permit deleting `newer`'s inputs: this querier will
         // load and reference them but has not folded `newer`'s removal yet.
-        assert!(!inv.all_live_consumers_folded(newer, 1000, 60_000).await.unwrap());
+        assert!(
+            !inv.all_live_consumers_folded(newer, 1000, 60_000)
+                .await
+                .unwrap()
+        );
 
         // After the querier's poller has folded past `newer`, the gate unblocks.
         inv.write_consumer_heartbeat("q-boot", Some(newer.to_string()), 2000)
             .await
             .unwrap();
-        assert!(inv.all_live_consumers_folded(newer, 2000, 60_000).await.unwrap());
+        assert!(
+            inv.all_live_consumers_folded(newer, 2000, 60_000)
+                .await
+                .unwrap()
+        );
     }
 
     fn snap_with(node: &str, seq: u64, file_path: &str) -> PersistedSnapshot {
@@ -637,10 +679,7 @@ mod tests {
         inv.publish_wal_snapshot("node-a", &snap_with("node-a", 2, "a/2.parquet"))
             .await
             .unwrap();
-        let loaded = inv
-            .load_all_wal_snapshots(&HashMap::new())
-            .await
-            .unwrap();
+        let loaded = inv.load_all_wal_snapshots(&HashMap::new()).await.unwrap();
         assert_eq!(loaded.len(), 3);
         let paths: std::collections::HashSet<String> = loaded
             .iter()
@@ -683,8 +722,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let since: HashMap<String, u64> =
-            [("node-a".to_string(), 3u64)].into_iter().collect();
+        let since: HashMap<String, u64> = [("node-a".to_string(), 3u64)].into_iter().collect();
         let loaded = inv.load_all_wal_snapshots(&since).await.unwrap();
         let seqs: Vec<u64> = loaded
             .iter()
@@ -726,7 +764,10 @@ mod tests {
             wal_high_water: [("node-a".to_string(), 5u64)].into_iter().collect(),
             compactions_high_water: None,
             merged_snapshot: snap_with("checkpoint", 0, "merged.parquet"),
-            tombstones: vec![("main-writer-0/dbs/1/2/d/h/0000001800.parquet".to_string(), 1800)],
+            tombstones: vec![(
+                "main-writer-0/dbs/1/2/d/h/0000001800.parquet".to_string(),
+                1800,
+            )],
             compaction_tombstones: vec![(
                 "main-compactor-0/dbs/u-1/u-2/gen2/d/h/019ec5ca.parquet".to_string(),
                 "019ec5ff".to_string(),
