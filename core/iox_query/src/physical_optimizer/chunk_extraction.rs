@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use datafusion::{
     datasource::{
-        physical_plan::{FileScanConfig, FileSource, ParquetSource},
+        physical_plan::{FileScanConfig, FileSource},
         source::DataSourceExec,
     },
     error::DataFusionError,
@@ -16,6 +16,7 @@ use schema::sort::SortKey;
 use tracing::debug;
 
 use crate::{
+    provider::not_found_tolerant::NotFoundTolerantSource,
     QueryChunk,
     provider::{PartitionedFileExt, RecordBatchesExec},
 };
@@ -128,10 +129,8 @@ impl ExecutionPlanVisitor for ExtractChunksVisitor {
                     String::from("not a file-based data source").into(),
                 ));
             };
-            let Some(parquet_source) = file_scan_config
-                .file_source()
-                .as_any()
-                .downcast_ref::<ParquetSource>()
+            let Some(parquet_source) =
+                NotFoundTolerantSource::as_parquet_source(file_scan_config.file_source().as_ref())
             else {
                 return Err(DataFusionError::External(
                     String::from("not parquet files").into(),
@@ -351,16 +350,17 @@ mod tests {
                         .as_any()
                         .downcast_ref::<FileScanConfig>()
                         .unwrap();
-                    let parquet_source = file_scan_config
-                        .file_source()
-                        .as_any()
-                        .downcast_ref::<ParquetSource>()
-                        .unwrap();
+                    // Production plans carry the NotFound-tolerant wrapper; keep it
+                    // on the rebuilt source so the check exercises that shape.
+                    let file_source = file_scan_config.file_source();
+                    let parquet_source =
+                        NotFoundTolerantSource::as_parquet_source(file_source.as_ref()).unwrap();
                     return Ok(Transformed::yes(DataSourceExec::from_data_source(
                         FileScanConfigBuilder::from(file_scan_config.clone())
-                            .with_source(Arc::new(
-                                parquet_source.clone().with_predicate(Arc::new(Literal::new(
-                                    ScalarValue::from(false),
+                            .with_source(NotFoundTolerantSource::rewrap_like(
+                                file_source.as_ref(),
+                                Arc::new(parquet_source.clone().with_predicate(Arc::new(
+                                    Literal::new(ScalarValue::from(false)),
                                 ))),
                             ))
                             .build(),

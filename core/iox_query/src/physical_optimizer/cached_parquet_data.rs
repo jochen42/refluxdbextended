@@ -1,7 +1,9 @@
 use std::{ops::Range, sync::Arc};
 
+use crate::provider::not_found_tolerant::NotFoundTolerantSource;
+
 use bytes::Bytes;
-use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::parquet::arrow::arrow_reader::ArrowReaderOptions;
 use datafusion::parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
@@ -55,10 +57,8 @@ impl PhysicalOptimizerRule for CachedParquetData {
             else {
                 return Ok(Transformed::no(plan));
             };
-            let Some(parquet_source) = file_scan_config
-                .file_source()
-                .as_any()
-                .downcast_ref::<ParquetSource>()
+            let Some(parquet_source) =
+                NotFoundTolerantSource::as_parquet_source(file_scan_config.file_source().as_ref())
             else {
                 return Ok(Transformed::no(plan));
             };
@@ -90,7 +90,10 @@ impl PhysicalOptimizerRule for CachedParquetData {
                 )));
             Ok(Transformed::yes(DataSourceExec::from_data_source(
                 FileScanConfigBuilder::from(file_scan_config.clone())
-                    .with_source(Arc::new(parquet_source))
+                    .with_source(NotFoundTolerantSource::rewrap_like(
+                        file_scan_config.file_source().as_ref(),
+                        Arc::new(parquet_source),
+                    ))
                     .build(),
             )))
         })

@@ -4,7 +4,7 @@ use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     datasource::{
-        physical_plan::{FileScanConfig, FileScanConfigBuilder, FileSource, ParquetSource},
+        physical_plan::{FileScanConfig, FileScanConfigBuilder, FileSource},
         source::DataSourceExec,
     },
     error::Result,
@@ -18,6 +18,7 @@ use datafusion::{
 };
 
 use crate::provider::DeduplicateExec;
+use crate::provider::not_found_tolerant::NotFoundTolerantSource;
 
 /// Push down predicates.
 #[derive(Debug, Default)]
@@ -62,11 +63,9 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                     else {
                         return Ok(Transformed::no(plan));
                     };
-                    let Some(parquet_source) = file_scan_config
-                        .file_source()
-                        .as_any()
-                        .downcast_ref::<ParquetSource>()
-                    else {
+                    let Some(parquet_source) = NotFoundTolerantSource::as_parquet_source(
+                        file_scan_config.file_source().as_ref(),
+                    ) else {
                         return Ok(Transformed::no(plan));
                     };
                     let mut builder = parquet_source.clone();
@@ -87,7 +86,10 @@ impl PhysicalOptimizerRule for PredicatePushdown {
 
                     let mut new_node: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
                         FileScanConfigBuilder::from(file_scan_config.clone())
-                            .with_source(Arc::new(builder))
+                            .with_source(NotFoundTolerantSource::rewrap_like(
+                                file_scan_config.file_source().as_ref(),
+                                Arc::new(builder),
+                            ))
                             .build(),
                     );
                     if !parquet_source
@@ -162,7 +164,7 @@ fn conjunction(
 mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::{
-        datasource::object_store::ObjectStoreUrl,
+        datasource::{object_store::ObjectStoreUrl, physical_plan::ParquetSource},
         logical_expr::Operator,
         physical_expr::LexOrdering,
         physical_plan::{

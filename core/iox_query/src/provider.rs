@@ -29,7 +29,7 @@ use snafu::{ResultExt, Snafu};
 
 mod adapter;
 mod deduplicate;
-mod not_found_tolerant;
+pub(crate) mod not_found_tolerant;
 pub mod overlap;
 mod physical;
 pub(crate) mod progressive_eval;

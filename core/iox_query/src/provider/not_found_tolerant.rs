@@ -24,7 +24,7 @@ use datafusion::common::{Result, Statistics};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{
-    FileOpenFuture, FileOpener, FileScanConfig, FileSource,
+    FileOpenFuture, FileOpener, FileScanConfig, FileSource, ParquetSource,
 };
 use datafusion::datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion::datasource::table_schema::TableSchema;
@@ -180,6 +180,41 @@ impl NotFoundTolerantSource {
     fn rewrap(inner: Arc<dyn FileSource>) -> Arc<dyn FileSource> {
         Arc::new(Self { inner })
     }
+
+    /// Downcast `source` to a [`ParquetSource`], looking through this wrapper
+    /// when present.
+    ///
+    /// IOx's optimizer passes (chunk extraction and everything built on it,
+    /// predicate pushdown, the cached parquet loader) identify parquet scans
+    /// by downcasting the `FileScanConfig`'s file source. A plain
+    /// `as_any().downcast_ref::<ParquetSource>()` fails on the wrapper, which
+    /// silently turns every one of those passes into a no-op for parquet-backed
+    /// queries. Passes must use this helper instead.
+    pub fn as_parquet_source(source: &dyn FileSource) -> Option<&ParquetSource> {
+        source
+            .as_any()
+            .downcast_ref::<ParquetSource>()
+            .or_else(|| {
+                source
+                    .as_any()
+                    .downcast_ref::<Self>()
+                    .and_then(|wrapped| wrapped.inner.as_any().downcast_ref::<ParquetSource>())
+            })
+    }
+
+    /// Re-apply NotFound tolerance to `rebuilt` when `original` carried it, so
+    /// a pass that reconstructs the `ParquetSource` (predicate pushdown, cached
+    /// loader) does not drop the wrapper on the way out.
+    pub fn rewrap_like(
+        original: &dyn FileSource,
+        rebuilt: Arc<dyn FileSource>,
+    ) -> Arc<dyn FileSource> {
+        if original.as_any().is::<Self>() {
+            Self::rewrap(rebuilt)
+        } else {
+            rebuilt
+        }
+    }
 }
 
 impl Debug for NotFoundTolerantSource {
@@ -290,7 +325,24 @@ impl FileSource for NotFoundTolerantSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::config::TableParquetOptions;
     use object_store::path::Path as ObjPath;
+
+    #[test]
+    fn optimizer_helpers_see_through_wrapper() {
+        let parquet: Arc<dyn FileSource> =
+            Arc::new(ParquetSource::new(TableParquetOptions::default()));
+        let wrapped: Arc<dyn FileSource> =
+            Arc::new(NotFoundTolerantSource::new(Arc::clone(&parquet)));
+
+        assert!(NotFoundTolerantSource::as_parquet_source(parquet.as_ref()).is_some());
+        assert!(NotFoundTolerantSource::as_parquet_source(wrapped.as_ref()).is_some());
+
+        let rebuilt = NotFoundTolerantSource::rewrap_like(wrapped.as_ref(), Arc::clone(&parquet));
+        assert!(rebuilt.as_any().is::<NotFoundTolerantSource>());
+        let bare = NotFoundTolerantSource::rewrap_like(parquet.as_ref(), Arc::clone(&parquet));
+        assert!(bare.as_any().is::<ParquetSource>());
+    }
 
     #[test]
     fn detects_direct_not_found() {
