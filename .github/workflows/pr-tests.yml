@@ -38,8 +38,14 @@ jobs:
           # the CLI plugin/processing-engine tests shell out to a python env
           pip3 install --user pip setuptools || true
 
+      - name: Read pinned toolchain
+        id: toolchain
+        run: echo "channel=$(grep -oE 'channel = "[^"]+"' rust-toolchain.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
 
       - name: Rust build cache
         uses: Swatinem/rust-cache@v2

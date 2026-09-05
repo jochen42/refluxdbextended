@@ -38,6 +38,9 @@ const NON_SENSITIVE_PARAMS: &[&str] = &[
     "bucket",
     // Memory and performance parameters
     "exec-mem-pool-bytes",
+    "exec-spill-enabled",
+    "exec-spill-dir",
+    "exec-spill-max-mb",
     "num-datafusion-threads",
     "query-file-limit",
     "force-snapshot-mem-threshold",
@@ -76,6 +79,10 @@ const NON_SENSITIVE_PARAMS: &[&str] = &[
     "max-compaction-files",
     "min-files-for-compaction",
     "compaction-delete-grace",
+    "max-concurrent-compactions",
+    "keep-generations-trailing-window",
+    "cold-gc-enabled",
+    "cold-gc-max-deletes-per-run",
     // Multi-node deployment parameters
     "mode",
     "shared-catalog",

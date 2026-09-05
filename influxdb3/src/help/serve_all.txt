@@ -190,7 +190,7 @@ Examples:
                                                  [env: INFLUXDB3_WRITER_NODE_IDS=]
   --wal-tail-poll-interval <INTERVAL>          WAL-tail listing cadence (Layer C) [default: 1s]
                                                  [env: INFLUXDB3_WAL_TAIL_POLL_INTERVAL=]
-  --wal-tail-max-files <N>                     Max retained WAL files per writer [default: 64]
+  --wal-tail-max-files <N>                     Max retained WAL files per writer [default: 2000]
                                                  [env: INFLUXDB3_WAL_TAIL_MAX_FILES=]
   --gen1-lookback-duration <DURATION>          The amount of time that the server looks back on startup when
                                                populating the in-memory index of gen1 files.

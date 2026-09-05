@@ -2,6 +2,9 @@
 results/
 # datafusion-cli history:
 **.history
+# CI staging dir for the release binary (release.yml writes ./binary/influxdb3)
+/binary/
+
 # rust compiled binary target directory:
 **/target
 # other:
