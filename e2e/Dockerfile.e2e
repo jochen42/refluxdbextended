@@ -4,8 +4,12 @@
 # - Uses the distro's python3-dev instead of python-build-standalone. The
 #   processing engine still links cleanly because pyo3 only needs Python's
 #   headers/libs at build/link time.
-# - Disables the gcp/azure/jemalloc features; only `aws` is required for the
-#   MinIO-backed benchmark.
+# - Disables the gcp/azure features; only `aws` is required for the
+#   MinIO-backed benchmark. jemalloc stays on: the production image runs
+#   jemalloc, and glibc malloc's per-thread arenas retain memory across
+#   queries over many tiny gen1 files (querier RSS climbed to the VM limit
+#   under the uncompacted benchmark on glibc, stayed flat at ~4 GiB on
+#   jemalloc), which would make local memory numbers meaningless.
 # - Single-arch — built for whatever the host docker daemon is (arm64 on
 #   Apple Silicon, amd64 elsewhere).
 #
@@ -56,7 +60,7 @@ RUN --mount=type=cache,id=influxdb3_e2e_registry,target=/usr/local/cargo/registr
     --mount=type=cache,id=influxdb3_e2e_target,target=/src/target \
     cargo build --release \
         --package influxdb3 \
-        --no-default-features --features aws \
+        --no-default-features --features aws,jemalloc_replacing_malloc \
     && cp /src/target/release/influxdb3 /usr/local/bin/influxdb3
 
 FROM debian:bookworm-slim

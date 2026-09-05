@@ -1,0 +1,165 @@
+[14:55:57] phase 0: starting minio + writer + querier
+ Image minio/mc:RELEASE.2024-11-21T17-21-54Z Pulling 
+ Image minio/minio:RELEASE.2024-12-13T22-19-12Z Pulling 
+ 103f276c9c15 Pulling fs layer 0B
+ 9b5f9b249239 Pulling fs layer 0B
+ 958c4c5ed135 Pulling fs layer 0B
+ 2cfc9de0f9d7 Pulling fs layer 0B
+ 515aab219ab5 Pulling fs layer 0B
+ 7daaf8e8088b Pulling fs layer 0B
+ 2c958a6bf5a2 Pulling fs layer 0B
+ 2f3d9364302f Pulling fs layer 0B
+ 515aab219ab5 Pulling fs layer 0B
+ 1bad7d3deee7 Pulling fs layer 0B
+ 11284307bea9 Pulling fs layer 0B
+ 62afbcb95067 Pulling fs layer 0B
+ 777bf830bb7e Pulling fs layer 0B
+ dbe9240ba46c Pulling fs layer 0B
+ ba4594e8a9f2 Pulling fs layer 0B
+ 103f276c9c15 Downloading 2.097MB
+ 103f276c9c15 Downloading 5.243MB
+ 9b5f9b249239 Download complete 0B
+ 2c958a6bf5a2 Download complete 0B
+ 103f276c9c15 Downloading 8.389MB
+ 7daaf8e8088b Download complete 0B
+ 2cfc9de0f9d7 Download complete 0B
+ 958c4c5ed135 Downloading 2.097MB
+ 103f276c9c15 Download complete 0B
+ 515aab219ab5 Downloading 1.049MB
+ 11284307bea9 Downloading 1.049MB
+ 515aab219ab5 Downloading 2.097MB
+ 958c4c5ed135 Downloading 4.194MB
+ 515aab219ab5 Downloading 2.097MB
+ 11284307bea9 Download complete 0B
+ 2f3d9364302f Download complete 0B
+ dbe9240ba46c Download complete 0B
+ 958c4c5ed135 Downloading 6.291MB
+ 515aab219ab5 Downloading 2.097MB
+ 515aab219ab5 Downloading 3.146MB
+ 777bf830bb7e Download complete 0B
+ 515aab219ab5 Downloading 3.146MB
+ 958c4c5ed135 Downloading 7.34MB
+ 1bad7d3deee7 Downloading 1.049MB
+ 62afbcb95067 Downloading 1.049MB
+ 515aab219ab5 Downloading 4.194MB
+ 958c4c5ed135 Download complete 0B
+ 515aab219ab5 Downloading 4.194MB
+ 1bad7d3deee7 Download complete 0B
+ 62afbcb95067 Downloading 4.194MB
+ 515aab219ab5 Downloading 5.243MB
+ 515aab219ab5 Downloading 5.243MB
+ 62afbcb95067 Downloading 5.243MB
+ 515aab219ab5 Downloading 5.243MB
+ 515aab219ab5 Downloading 5.243MB
+ 62afbcb95067 Downloading 9.437MB
+ 515aab219ab5 Download complete 0B
+ ba4594e8a9f2 Downloading 1.049MB
+ 515aab219ab5 Download complete 0B
+ 515aab219ab5 Extracting 1B
+ 515aab219ab5 Extracting 1B
+ ba4594e8a9f2 Downloading 2.097MB
+ 62afbcb95067 Download complete 0B
+ 515aab219ab5 Extracting 1B
+ 515aab219ab5 Extracting 1B
+ ba4594e8a9f2 Downloading 3.146MB
+ 00d7087424c2 Download complete 0B
+ 9b5f9b249239 Pull complete 0B
+ 7daaf8e8088b Pull complete 0B
+ 2cfc9de0f9d7 Pull complete 0B
+ 515aab219ab5 Extracting 1B
+ 958c4c5ed135 Extracting 1B
+ 515aab219ab5 Pull complete 0B
+ ba4594e8a9f2 Downloading 5.243MB
+ 1bad7d3deee7 Extracting 1B
+ 958c4c5ed135 Pull complete 0B
+ 103f276c9c15 Pull complete 0B
+ Image minio/mc:RELEASE.2024-11-21T17-21-54Z Pulled 
+ ba4594e8a9f2 Downloading 7.34MB
+ 51f7461b3374 Download complete 0B
+ 2f3d9364302f Pull complete 0B
+ 1bad7d3deee7 Pull complete 0B
+ ba4594e8a9f2 Downloading 11.53MB
+ ba4594e8a9f2 Downloading 14.68MB
+ ba4594e8a9f2 Downloading 18.87MB
+ ba4594e8a9f2 Downloading 23.07MB
+ ba4594e8a9f2 Downloading 27.26MB
+ ba4594e8a9f2 Downloading 30.41MB
+ ba4594e8a9f2 Downloading 34.6MB
+ ba4594e8a9f2 Download complete 0B
+ ba4594e8a9f2 Extracting 1B
+ ba4594e8a9f2 Extracting 1B
+ ba4594e8a9f2 Extracting 1B
+ 62afbcb95067 Extracting 1B
+ ba4594e8a9f2 Pull complete 0B
+ 2c958a6bf5a2 Pull complete 0B
+ 11284307bea9 Pull complete 0B
+ dbe9240ba46c Pull complete 0B
+ 777bf830bb7e Pull complete 0B
+ 62afbcb95067 Pull complete 0B
+ Image minio/minio:RELEASE.2024-12-13T22-19-12Z Pulled 
+ Network e2e_default Creating 
+ Network e2e_default Created 
+ Volume e2e_minio-data Creating 
+ Volume e2e_minio-data Created 
+ Container e2e-minio-1 Creating 
+ Container e2e-minio-1 Created 
+ Container e2e-minio-setup-1 Creating 
+ Container e2e-minio-setup-1 Created 
+ Container e2e-writer-1 Creating 
+ Container e2e-writer-1 Created 
+ Container e2e-querier-1 Creating 
+ Container e2e-querier-1 Created 
+ Container e2e-minio-1 Starting 
+ Container e2e-minio-1 Started 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-1 Healthy 
+ Container e2e-minio-setup-1 Starting 
+ Container e2e-minio-setup-1 Started 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Starting 
+ Container e2e-writer-1 Started 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-writer-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Healthy 
+ Container e2e-querier-1 Starting 
+ Container e2e-querier-1 Started 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-writer-1 Waiting 
+ Container e2e-querier-1 Waiting 
+ Container e2e-writer-1 Healthy 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-minio-1 Healthy 
+ Container e2e-querier-1 Healthy 
+[14:56:10] phase 1: writing one LP row
+[14:56:11] phase 2: polling querier (deadline=3s)
+[14:56:12] row visible after 0.640s
+[14:56:12] phase 3: killing writer; querier should still see the row from cached state
+ Container e2e-writer-1 Stopping 
+ Container e2e-writer-1 Stopped 
+[14:56:13] post-writer-kill query still returns 1 (resilience OK)
+[14:56:13] done — freshness OK in 0.640s (deadline 3s)
+[14:56:13] capturing container logs
+[14:56:13] tearing down stack
+ Container e2e-querier-1 Stopping 
+ Container e2e-querier-1 Stopped 
+ Container e2e-querier-1 Removing 
+ Container e2e-querier-1 Removed 
+ Container e2e-writer-1 Stopping 
+ Container e2e-writer-1 Stopped 
+ Container e2e-writer-1 Removing 
+ Container e2e-writer-1 Removed 
+ Container e2e-minio-setup-1 Stopping 
+ Container e2e-minio-setup-1 Stopped 
+ Container e2e-minio-setup-1 Removing 
+ Container e2e-minio-setup-1 Removed 
+ Container e2e-minio-1 Stopping 
+ Container e2e-minio-1 Stopped 
+ Container e2e-minio-1 Removing 
+ Container e2e-minio-1 Removed 
+ Network e2e_default Removing 
+ Volume e2e_minio-data Removing 
+ Volume e2e_minio-data Removed 
+ Network e2e_default Removed 

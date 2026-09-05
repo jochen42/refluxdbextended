@@ -1,0 +1,211 @@
+[15:35:40] phase 0: starting writer + querier (no compactor)
+ Network e2e_default Creating 
+ Network e2e_default Created 
+ Volume e2e_minio-data Creating 
+ Volume e2e_minio-data Created 
+ Container e2e-minio-1 Creating 
+ Container e2e-minio-1 Created 
+ Container e2e-minio-setup-1 Creating 
+ Container e2e-minio-setup-1 Created 
+ Container e2e-writer-1 Creating 
+ Container e2e-writer-1 Created 
+ Container e2e-querier-1 Creating 
+ Container e2e-querier-1 Created 
+ Container e2e-minio-1 Starting 
+ Container e2e-minio-1 Started 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-1 Healthy 
+ Container e2e-minio-setup-1 Starting 
+ Container e2e-minio-setup-1 Started 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Starting 
+ Container e2e-writer-1 Started 
+ Container e2e-writer-1 Waiting 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Healthy 
+ Container e2e-querier-1 Starting 
+ Container e2e-querier-1 Started 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-writer-1 Waiting 
+ Container e2e-querier-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Healthy 
+ Container e2e-minio-1 Healthy 
+ Container e2e-querier-1 Healthy 
+[15:35:49] phase 1: generating data (hours=24 hosts=200 points-per-host=5000 batch-size=1000)
+ Container e2e-minio-1 Running 
+ Container e2e-writer-1 Running 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-1 Healthy 
+ Container e2e-minio-setup-1 Starting 
+ Container e2e-minio-setup-1 Started 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Waiting 
+ Container e2e-writer-1 Healthy 
+ Container e2e-gen-run-6e73f737bd13 Creating 
+ Container e2e-gen-run-6e73f737bd13 Created 
+plan: 200 hosts × 5000 points = 1000000 total points over 24h (start=1788536151267635750 end=1788622551267635750) parallel=4
+done: wrote 1000000 points in 249.9s (4001 points/s)
+[15:40:01] phase 1b: waiting for writer to flush WAL + publish inventory
+[15:42:01] phase 2: benchmarking uncompacted dataset
+ Container e2e-minio-1 Running 
+ Container e2e-writer-1 Running 
+ Container e2e-querier-1 Running 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-1 Healthy 
+ Container e2e-minio-setup-1 Starting 
+ Container e2e-minio-setup-1 Started 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Waiting 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-writer-1 Healthy 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-querier-1 Waiting 
+ Container e2e-querier-1 Healthy 
+ Container e2e-bench-run-eefe87e4b8f5 Creating 
+ Container e2e-bench-run-eefe87e4b8f5 Created 
+benchmarking 4 queries × 5 runs (tag=uncompacted)
+  full_scan: warming...
+    run 1/5: 18.679s (184 bytes)
+    run 2/5: 18.658s (184 bytes)
+    run 3/5: 18.583s (184 bytes)
+    run 4/5: 18.471s (185 bytes)
+    run 5/5: 18.439s (184 bytes)
+  high_card_filter: warming...
+    run 1/5: 19.480s (1360 bytes)
+    run 2/5: 19.169s (1360 bytes)
+    run 3/5: 19.491s (1360 bytes)
+    run 4/5: 19.210s (1360 bytes)
+    run 5/5: 19.247s (1360 bytes)
+  hour_buckets: warming...
+    run 1/5: 19.440s (1336 bytes)
+    run 2/5: 19.302s (1340 bytes)
+    run 3/5: 19.497s (1340 bytes)
+    run 4/5: 19.343s (1342 bytes)
+    run 5/5: 19.276s (1341 bytes)
+  narrow_window: warming...
+    run 1/5: 19.095s (170 bytes)
+    run 2/5: 19.213s (170 bytes)
+    run 3/5: 19.241s (170 bytes)
+    run 4/5: 19.089s (170 bytes)
+    run 5/5: 19.098s (170 bytes)
+wrote results/uncompacted.json
+[15:49:43] uncompacted parquet object count (best effort):        0
+unknown
+[15:49:43] phase 3: starting compactor; will poll for settle
+ Container e2e-minio-1 Running 
+ Container e2e-compactor-1 Creating 
+ Container e2e-compactor-1 Created 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-1 Healthy 
+ Container e2e-minio-setup-1 Starting 
+ Container e2e-minio-setup-1 Started 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-compactor-1 Starting 
+ Container e2e-compactor-1 Started 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-compactor-1 Waiting 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-compactor-1 Healthy 
+ Container e2e-minio-1 Healthy 
+[15:49:45] compactor cycles observed so far: 0
+[15:49:55] compactor cycles observed so far: 0
+[15:50:05] compactor cycles observed so far: 0
+[15:50:15] compactor cycles observed so far: 4
+[15:50:25] compactor cycles observed so far: 247
+[15:50:35] compactor cycles observed so far: 289
+[15:50:45] compactor cycles observed so far: 289
+[15:50:55] compactor cycles observed so far: 290
+[15:51:06] compactor cycles observed so far: 290
+[15:51:16] compactor cycles observed so far: 290
+[15:51:26] compactor cycles observed so far: 290
+[15:51:26] compactor appears settled (30s without new cycles)
+[15:51:31] phase 4: benchmarking compacted dataset
+ Container e2e-minio-1 Running 
+ Container e2e-writer-1 Running 
+ Container e2e-querier-1 Running 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-1 Healthy 
+ Container e2e-minio-setup-1 Starting 
+ Container e2e-minio-setup-1 Started 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-writer-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Healthy 
+ Container e2e-querier-1 Waiting 
+ Container e2e-querier-1 Healthy 
+ Container e2e-bench-run-68bd362c1063 Creating 
+ Container e2e-bench-run-68bd362c1063 Created 
+benchmarking 4 queries × 5 runs (tag=compacted)
+  full_scan: warming...
+    run 1/5: 0.035s (185 bytes)
+    run 2/5: 0.031s (186 bytes)
+    run 3/5: 0.024s (187 bytes)
+    run 4/5: 0.012s (184 bytes)
+    run 5/5: 0.013s (188 bytes)
+  high_card_filter: warming...
+    run 1/5: 0.023s (1360 bytes)
+    run 2/5: 0.023s (1360 bytes)
+    run 3/5: 0.023s (1360 bytes)
+    run 4/5: 0.024s (1360 bytes)
+    run 5/5: 0.023s (1360 bytes)
+  hour_buckets: warming...
+    run 1/5: 0.023s (1338 bytes)
+    run 2/5: 0.021s (1333 bytes)
+    run 3/5: 0.021s (1334 bytes)
+    run 4/5: 0.021s (1334 bytes)
+    run 5/5: 0.023s (1333 bytes)
+  narrow_window: warming...
+    run 1/5: 0.023s (172 bytes)
+    run 2/5: 0.022s (171 bytes)
+    run 3/5: 0.022s (172 bytes)
+    run 4/5: 0.022s (173 bytes)
+    run 5/5: 0.022s (173 bytes)
+wrote results/compacted.json
+[15:51:34] phase 5: rendering comparison
+
+query                     uncompacted (s)    compacted (s)    speedup
+----------------------------------------------------------------------
+full_scan                          18.583            0.024    786.73x
+high_card_filter                   19.247            0.023    833.05x
+hour_buckets                       19.343            0.021    911.11x
+narrow_window                      19.098            0.022    872.25x
+
+runs per query: 5
+[15:51:34] done — full results in e2e/results/{uncompacted,compacted}.json
+[15:51:34] capturing container logs
+[15:51:35] tearing down stack
+ Container e2e-compactor-1 Stopping 
+ Container e2e-querier-1 Stopping 
+ Container e2e-querier-1 Stopped 
+ Container e2e-querier-1 Removing 
+ Container e2e-querier-1 Removed 
+ Container e2e-writer-1 Stopping 
+ Container e2e-compactor-1 Stopped 
+ Container e2e-compactor-1 Removing 
+ Container e2e-compactor-1 Removed 
+ Container e2e-writer-1 Stopped 
+ Container e2e-writer-1 Removing 
+ Container e2e-writer-1 Removed 
+ Container e2e-minio-setup-1 Stopping 
+ Container e2e-minio-setup-1 Stopped 
+ Container e2e-minio-setup-1 Removing 
+ Container e2e-minio-setup-1 Removed 
+ Container e2e-minio-1 Stopping 
+ Container e2e-minio-1 Stopped 
+ Container e2e-minio-1 Removing 
+ Container e2e-minio-1 Removed 
+ Volume e2e_minio-data Removing 
+ Network e2e_default Removing 
+ Network e2e_default Removed 
+ Volume e2e_minio-data Removed 
+bench exit=0

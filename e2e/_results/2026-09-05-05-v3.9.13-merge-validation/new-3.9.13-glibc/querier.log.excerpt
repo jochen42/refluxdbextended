@@ -1,0 +1,280 @@
+querier-1  | 2026-09-05T14:58:03.225554716Z 2026-09-05T14:58:03.225331Z  WARN influxdb3::env_compat: environment variable LOG_FILTER is deprecated, use INFLUXDB3_LOG_FILTER instead
+querier-1  | 2026-09-05T14:58:03.226714008Z 2026-09-05T14:58:03.226634Z  INFO influxdb3_server::startup_probe: answering health probes while startup completes address=0.0.0.0:8181
+querier-1  | 2026-09-05T14:58:03.226719466Z 2026-09-05T14:58:03.226670Z  INFO influxdb3_lib::commands::serve: server starting node_id=querier-1 git_hash=cad54163389403011ff36044d1f786fb38ad78d2 version=3.9.13 uuid=62983057-d993-4812-8156-fdd73137688d num_cpus=8 product_name="InfluxDB 3 Core"
+querier-1  | 2026-09-05T14:58:03.226824508Z 2026-09-05T14:58:03.226742Z  INFO influxdb3_clap_blocks::object_store: Object Store bucket=Some("influxdb3-bench") endpoint=Some(Endpoint("http://minio:9000")) object_store_type="S3"
+querier-1  | 2026-09-05T14:58:03.230182924Z 2026-09-05T14:58:03.230137Z  INFO influxdb3_lib::commands::serve: initialising parquet cache
+querier-1  | 2026-09-05T14:58:03.230222674Z 2026-09-05T14:58:03.230169Z  INFO influxdb3_lib::commands::serve: Creating shared query executor num_threads=8
+querier-1  | 2026-09-05T14:58:03.231350674Z 2026-09-05T14:58:03.231292Z  INFO influxdb3_lib::commands::serve: opening shared catalog at _catalog/
+querier-1  | 2026-09-05T14:58:03.234915383Z 2026-09-05T14:58:03.234823Z  INFO influxdb3_catalog::catalog::versions::v2::update: create database name="_internal"
+querier-1  | 2026-09-05T14:58:03.234921633Z 2026-09-05T14:58:03.234859Z  INFO influxdb3_lib::commands::serve: catalog initialized catalog_uuid=6b619a40-8e53-4e4b-981e-e183b110d9e5
+querier-1  | 2026-09-05T14:58:03.234922758Z 2026-09-05T14:58:03.234868Z  INFO influxdb3_lib::commands::serve: Initializing table index cache node_id="querier-1" max_entries=Some(100) concurrency_limit=20
+querier-1  | 2026-09-05T14:58:03.234923674Z 2026-09-05T14:58:03.234872Z  INFO influxdb3_write::table_index_cache: creating table indices from split snapshots
+querier-1  | 2026-09-05T14:58:03.235802299Z 2026-09-05T14:58:03.235183Z  INFO influxdb3_write::table_index_cache: loading all snapshot object metas
+querier-1  | 2026-09-05T14:58:03.237315216Z 2026-09-05T14:58:03.237270Z  INFO influxdb3_write::table_index_cache: Starting table index cache synchronization from object store node_prefix=querier-1
+querier-1  | 2026-09-05T14:58:03.237982383Z 2026-09-05T14:58:03.237943Z  INFO influxdb3_write::table_index_cache: No table new table indices to be created. duration_ms=0 total_cached=0 indices_updated=0 cache_capacity=Some(100)
+querier-1  | 2026-09-05T14:58:03.238006258Z 2026-09-05T14:58:03.237968Z  INFO influxdb3_write::retention_period_handler: Starting retention period handler background task check_interval_seconds=1800
+querier-1  | 2026-09-05T14:58:03.238008174Z 2026-09-05T14:58:03.237971Z  INFO influxdb3_catalog::catalog::versions::v2::update: register node node_id="querier-1" core_count=8 mode=[Core] cli_params=Some("{\"http-bind\":\"0.0.0.0:8181\",\"object-store\":\"s3\",\"mode\":\"querier\",\"aws-allow-http\":\"*******\",\"writer-node-ids\":\"writer-1\",\"aws-secret-access-key\":\"*******\",\"aws-endpoint\":
+querier-1  | 2026-09-05T14:58:03.238014674Z 2026-09-05T14:58:03.237990Z  INFO influxdb3_catalog::catalog::versions::v2::update: registering new node to the catalog node_id="querier-1" instance_id="9ade7dcf-e7ae-462f-9529-f85e289247c7"
+querier-1  | 2026-09-05T14:58:03.238989383Z 2026-09-05T14:58:03.238945Z  INFO influxdb3_catalog::object_store::versions::v2: persisted next catalog sequence put_result=PutResult { e_tag: Some("\"e59ae6f77babf24f46934b8355350404\""), version: None } object_path=CatalogFilePath(Path { raw: "_catalog/catalog/v2/logs/00000000000000000004.catalog" })
+querier-1  | 2026-09-05T14:58:03.239049716Z 2026-09-05T14:58:03.239023Z  INFO influxdb3_lib::commands::serve: catalog initialized instance_id="9ade7dcf-e7ae-462f-9529-f85e289247c7"
+querier-1  | 2026-09-05T14:58:03.239064508Z 2026-09-05T14:58:03.239044Z  INFO influxdb3_catalog::catalog::versions::v2::update: set generation duration level=1 duration_ns=600000000000
+querier-1  | 2026-09-05T14:58:03.239065799Z 2026-09-05T14:58:03.239051Z  WARN influxdb3_lib::commands::serve: cannot change the existing gen1 duration after it has been set existing_secs=60 provided_secs=600
+querier-1  | 2026-09-05T14:58:03.242505508Z 2026-09-05T14:58:03.242389Z  INFO influxdb3_wal::object_store: replaying WAL files
+querier-1  | 2026-09-05T14:58:03.242512299Z 2026-09-05T14:58:03.242402Z  INFO influxdb3_wal::object_store: completed replaying wal files time_taken=16.5µs
+querier-1  | 2026-09-05T14:58:03.242513466Z 2026-09-05T14:58:03.242421Z  INFO influxdb3_lib::commands::serve: spawning parquet ref validator interval=3600s
+querier-1  | 2026-09-05T14:58:03.242554341Z 2026-09-05T14:58:03.242527Z  WARN influxdb3_lib::commands::serve: UNSAFE WAL-tail sizing: --wal-tail-max-files (4) is below 3x --wal-snapshot-size (600 -> need >= 1800). The querier may evict un-persisted tail files and return EMPTY results for recent time windows. Raise --wal-tail-max-files to >= 1800 (3x snapshot-size + margin), or lower --wal-snapshot
+querier-1  | 2026-09-05T14:58:03.242557091Z 2026-09-05T14:58:03.242534Z  INFO influxdb3_lib::commands::serve: enabling layer C (wal tail) writer_node_ids=["writer-1"] interval=1s
+querier-1  | 2026-09-05T14:58:03.242557841Z 2026-09-05T14:58:03.242541Z  INFO influxdb3_lib::commands::serve: spawning shared-inventory poller interval=1s
+querier-1  | 2026-09-05T14:58:03.242614924Z 2026-09-05T14:58:03.242573Z  INFO influxdb3_lib::commands::serve: setting up background mem check for query buffer
+querier-1  | 2026-09-05T14:58:03.242668883Z 2026-09-05T14:58:03.242623Z  INFO influxdb3_write::deleter: Started catalog hard deleter task. delete_grace_period=86400s
+querier-1  | 2026-09-05T14:58:03.242675341Z 2026-09-05T14:58:03.242593Z  INFO influxdb3_lib::commands::serve: compaction service disabled (mode=Querier does not run compaction)
+querier-1  | 2026-09-05T14:58:03.242676341Z 2026-09-05T14:58:03.242641Z  INFO influxdb3_lib::commands::serve: setting up telemetry store
+querier-1  | 2026-09-05T14:58:03.242688549Z 2026-09-05T14:58:03.242646Z  WARN influxdb3_lib::commands::serve: server started without auth (`--without-auth` switch), all token creation and regeneration of admin token endpoints are disabled
+querier-1  | 2026-09-05T14:58:03.243090341Z 2026-09-05T14:58:03.243066Z  INFO influxdb3_lib::commands::serve: setting up server with authz disabled for paths paths_without_authz=[]
+querier-1  | 2026-09-05T14:58:03.243127799Z 2026-09-05T14:58:03.243094Z  INFO influxdb3_server: startup time: 16ms address=0.0.0.0:8181
+querier-1  | 2026-09-05T14:58:12.275173720Z 2026-09-05T14:58:12.275084Z  INFO influxdb3_write::inventory_poller: inventory poller advanced catalog before_seq=4 after_seq=5
+querier-1  | 2026-09-05T15:04:23.912326712Z 2026-09-05T15:04:23.912253Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- Full-range aggregation across every host and every point. Forces a scan of
+querier-1  | 2026-09-05T15:04:23.912345003Z 2026-09-05T15:04:23.912294Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- Full-range aggregation across every host and every point. Forces a scan of
+querier-1  | 2026-09-05T15:04:24.410111962Z 2026-09-05T15:04:24.408666Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:04:24.931775296Z 2026-09-05T15:04:24.931662Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:04:26.019296379Z 2026-09-05T15:04:26.018523Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:04:47.633979084Z 2026-09-05T15:04:47.633901Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- Full-range aggregation across every host and every point. Forces a scan of
+querier-1  | 2026-09-05T15:04:47.634019042Z 2026-09-05T15:04:47.633929Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- Full-range aggregation across every host and every point. Forces a scan of
+querier-1  | 2026-09-05T15:04:47.983182042Z 2026-09-05T15:04:47.983062Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:04:48.370121501Z 2026-09-05T15:04:48.369968Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:04:49.379634460Z 2026-09-05T15:04:49.378509Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:05:10.911202053Z 2026-09-05T15:05:10.911133Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- Full-range aggregation across every host and every point. Forces a scan of
+querier-1  | 2026-09-05T15:05:10.911223386Z 2026-09-05T15:05:10.911174Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- Full-range aggregation across every host and every point. Forces a scan of
+querier-1  | 2026-09-05T15:05:11.266089053Z 2026-09-05T15:05:11.265963Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:05:11.673670679Z 2026-09-05T15:05:11.673537Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:05:12.667674637Z 2026-09-05T15:05:12.666802Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:05:35.349836717Z 2026-09-05T15:05:35.349665Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- Full-range aggregation across every host and every point. Forces a scan of
+querier-1  | 2026-09-05T15:05:35.349858675Z 2026-09-05T15:05:35.349716Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- Full-range aggregation across every host and every point. Forces a scan of
+querier-1  | 2026-09-05T15:05:35.727092092Z 2026-09-05T15:05:35.726984Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:05:36.157866759Z 2026-09-05T15:05:36.157695Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:05:37.307253051Z 2026-09-05T15:05:37.305553Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:06:00.595155590Z 2026-09-05T15:06:00.595075Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- Full-range aggregation across every host and every point. Forces a scan of
+querier-1  | 2026-09-05T15:06:00.595182757Z 2026-09-05T15:06:00.595110Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- Full-range aggregation across every host and every point. Forces a scan of
+querier-1  | 2026-09-05T15:06:00.956489590Z 2026-09-05T15:06:00.956382Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:06:01.361620174Z 2026-09-05T15:06:01.361511Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:06:02.390505966Z 2026-09-05T15:06:02.389173Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:06:31.422124632Z 2026-09-05T15:06:31.421769Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- Full-range aggregation across every host and every point. Forces a scan of
+querier-1  | 2026-09-05T15:06:31.423224799Z 2026-09-05T15:06:31.422071Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- Full-range aggregation across every host and every point. Forces a scan of
+querier-1  | 2026-09-05T15:06:31.938256924Z 2026-09-05T15:06:31.938118Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:06:32.639716799Z 2026-09-05T15:06:32.639524Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:06:34.593090342Z 2026-09-05T15:06:34.590479Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:07:16.334675750Z 2026-09-05T15:07:16.334517Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- High-cardinality predicate: per-host extremes across a 4-week window.
+querier-1  | 2026-09-05T15:07:16.335092958Z 2026-09-05T15:07:16.334862Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- High-cardinality predicate: per-host extremes across a 4-week window.
+querier-1  | 2026-09-05T15:07:16.782994250Z 2026-09-05T15:07:16.782872Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:07:17.284717792Z 2026-09-05T15:07:17.284616Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:07:18.644494209Z 2026-09-05T15:07:18.644369Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:07:46.000413000Z 2026-09-05T15:07:46.000314Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- High-cardinality predicate: per-host extremes across a 4-week window.
+querier-1  | 2026-09-05T15:07:46.001292000Z 2026-09-05T15:07:46.001239Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- High-cardinality predicate: per-host extremes across a 4-week window.
+querier-1  | 2026-09-05T15:07:46.374122500Z 2026-09-05T15:07:46.374003Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:07:46.793539000Z 2026-09-05T15:07:46.793419Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:07:47.984746334Z 2026-09-05T15:07:47.984630Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:08:14.135344055Z 2026-09-05T15:08:14.135261Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- High-cardinality predicate: per-host extremes across a 4-week window.
+querier-1  | 2026-09-05T15:08:14.135763805Z 2026-09-05T15:08:14.135650Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- High-cardinality predicate: per-host extremes across a 4-week window.
+querier-1  | 2026-09-05T15:08:14.531193930Z 2026-09-05T15:08:14.531068Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:08:14.975264305Z 2026-09-05T15:08:14.975129Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:08:16.155245750Z 2026-09-05T15:08:16.155112Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:08:41.246830970Z 2026-09-05T15:08:41.246758Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- High-cardinality predicate: per-host extremes across a 4-week window.
+querier-1  | 2026-09-05T15:08:41.246849220Z 2026-09-05T15:08:41.246778Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- High-cardinality predicate: per-host extremes across a 4-week window.
+querier-1  | 2026-09-05T15:08:41.606980970Z 2026-09-05T15:08:41.606874Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:08:42.020143970Z 2026-09-05T15:08:42.020045Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:08:43.146337763Z 2026-09-05T15:08:43.146195Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:09:08.337566344Z 2026-09-05T15:09:08.337490Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- High-cardinality predicate: per-host extremes across a 4-week window.
+querier-1  | 2026-09-05T15:09:08.337582427Z 2026-09-05T15:09:08.337519Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- High-cardinality predicate: per-host extremes across a 4-week window.
+querier-1  | 2026-09-05T15:09:08.736560469Z 2026-09-05T15:09:08.736380Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:09:09.150286219Z 2026-09-05T15:09:09.150153Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:09:10.340347345Z 2026-09-05T15:09:10.340183Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:09:35.668925176Z 2026-09-05T15:09:35.668864Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- High-cardinality predicate: per-host extremes across a 4-week window.
+querier-1  | 2026-09-05T15:09:35.668977467Z 2026-09-05T15:09:35.668890Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- High-cardinality predicate: per-host extremes across a 4-week window.
+querier-1  | 2026-09-05T15:09:36.086817092Z 2026-09-05T15:09:36.086718Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:09:36.447532218Z 2026-09-05T15:09:36.447417Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:09:37.373677218Z 2026-09-05T15:09:37.373578Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:10:03.238370133Z 2026-09-05T15:10:03.238299Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- 6-hour downsampling over an 8-week window. Touches most parquet files
+querier-1  | 2026-09-05T15:10:03.238393258Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:03.238394008Z     region,
+querier-1  | 2026-09-05T15:10:03.238394633Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:03.238395341Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:03.238398716Z 2026-09-05T15:10:03.238319Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- 6-hour downsampling over an 8-week window. Touches most parquet files
+querier-1  | 2026-09-05T15:10:03.238401758Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:03.238402299Z     region,
+querier-1  | 2026-09-05T15:10:03.238402799Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:03.238403341Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:03.238425674Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:03.238426258Z     region,
+querier-1  | 2026-09-05T15:10:03.238426758Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:03.238427299Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:03.596688175Z 2026-09-05T15:10:03.596574Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:10:04.243208883Z 2026-09-05T15:10:04.243068Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:10:06.990184135Z 2026-09-05T15:10:06.990043Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:10:07.656666135Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:07.656666718Z     region,
+querier-1  | 2026-09-05T15:10:07.656667260Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:07.656667843Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:07.656674177Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:07.656674718Z     region,
+querier-1  | 2026-09-05T15:10:07.656675218Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:07.656675718Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:07.672685718Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:07.672686302Z     region,
+querier-1  | 2026-09-05T15:10:07.672686885Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:07.672687427Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:32.944046466Z 2026-09-05T15:10:32.943969Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- 6-hour downsampling over an 8-week window. Touches most parquet files
+querier-1  | 2026-09-05T15:10:32.944068299Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:32.944069008Z     region,
+querier-1  | 2026-09-05T15:10:32.944069716Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:32.944070383Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:32.944077299Z 2026-09-05T15:10:32.943993Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- 6-hour downsampling over an 8-week window. Touches most parquet files
+querier-1  | 2026-09-05T15:10:32.944080258Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:32.944080799Z     region,
+querier-1  | 2026-09-05T15:10:32.944081299Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:32.944081799Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:32.944092091Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:32.944092633Z     region,
+querier-1  | 2026-09-05T15:10:32.944093091Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:32.944093633Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:33.289362633Z 2026-09-05T15:10:33.289252Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:10:33.632220050Z 2026-09-05T15:10:33.632121Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:10:34.547810550Z 2026-09-05T15:10:34.547714Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:10:35.198460759Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:35.198461425Z     region,
+querier-1  | 2026-09-05T15:10:35.198461967Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:35.198462550Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:35.198468717Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:35.198469259Z     region,
+querier-1  | 2026-09-05T15:10:35.198469800Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:35.198470342Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:35.216135509Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:35.216136259Z     region,
+querier-1  | 2026-09-05T15:10:35.216136842Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:35.216137425Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:59.341732006Z 2026-09-05T15:10:59.341677Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- 6-hour downsampling over an 8-week window. Touches most parquet files
+querier-1  | 2026-09-05T15:10:59.341745173Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:59.341745881Z     region,
+querier-1  | 2026-09-05T15:10:59.341746548Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:59.341747256Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:59.341750881Z 2026-09-05T15:10:59.341694Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- 6-hour downsampling over an 8-week window. Touches most parquet files
+querier-1  | 2026-09-05T15:10:59.341758256Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:59.341758839Z     region,
+querier-1  | 2026-09-05T15:10:59.341759339Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:59.341759881Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:59.341769131Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:10:59.341769673Z     region,
+querier-1  | 2026-09-05T15:10:59.341770214Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:10:59.341770756Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:10:59.694273214Z 2026-09-05T15:10:59.694162Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:11:00.105399715Z 2026-09-05T15:11:00.105187Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:11:01.232061215Z 2026-09-05T15:11:01.231910Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:11:02.064233591Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:02.064234216Z     region,
+querier-1  | 2026-09-05T15:11:02.064234757Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:02.064235341Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:02.064241882Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:02.064242466Z     region,
+querier-1  | 2026-09-05T15:11:02.064242966Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:02.064243507Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:02.096534382Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:02.096534966Z     region,
+querier-1  | 2026-09-05T15:11:02.096535507Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:02.096536091Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:26.488566463Z 2026-09-05T15:11:26.488504Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- 6-hour downsampling over an 8-week window. Touches most parquet files
+querier-1  | 2026-09-05T15:11:26.488580088Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:26.488580796Z     region,
+querier-1  | 2026-09-05T15:11:26.488581463Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:26.488582171Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:26.488586671Z 2026-09-05T15:11:26.488522Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- 6-hour downsampling over an 8-week window. Touches most parquet files
+querier-1  | 2026-09-05T15:11:26.488590296Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:26.488594838Z     region,
+querier-1  | 2026-09-05T15:11:26.488595463Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:26.488596005Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:26.488619380Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:26.488620005Z     region,
+querier-1  | 2026-09-05T15:11:26.488620546Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:26.488621171Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:26.852470338Z 2026-09-05T15:11:26.852371Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:11:27.358553463Z 2026-09-05T15:11:27.358436Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:11:28.865997631Z 2026-09-05T15:11:28.865882Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:11:29.542090298Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:29.542091006Z     region,
+querier-1  | 2026-09-05T15:11:29.542091548Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:29.542092131Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:29.542099089Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:29.542099631Z     region,
+querier-1  | 2026-09-05T15:11:29.542100173Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:29.542100673Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:29.558956381Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:29.558957006Z     region,
+querier-1  | 2026-09-05T15:11:29.558957589Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:29.558963048Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:54.496352087Z 2026-09-05T15:11:54.496284Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- 6-hour downsampling over an 8-week window. Touches most parquet files
+querier-1  | 2026-09-05T15:11:54.496366879Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:54.496367587Z     region,
+querier-1  | 2026-09-05T15:11:54.496368212Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:54.496368879Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:54.496372462Z 2026-09-05T15:11:54.496304Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- 6-hour downsampling over an 8-week window. Touches most parquet files
+querier-1  | 2026-09-05T15:11:54.496376004Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:54.496376795Z     region,
+querier-1  | 2026-09-05T15:11:54.496377379Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:54.496378045Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:54.497258795Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:54.497259462Z     region,
+querier-1  | 2026-09-05T15:11:54.497260004Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:54.497260587Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:54.852976462Z 2026-09-05T15:11:54.852809Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:11:55.248746629Z 2026-09-05T15:11:55.248602Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:11:56.188001004Z 2026-09-05T15:11:56.187862Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:11:56.855516380Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:56.855517005Z     region,
+querier-1  | 2026-09-05T15:11:56.855517546Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:56.855518088Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:56.855562088Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:56.855562671Z     region,
+querier-1  | 2026-09-05T15:11:56.855563171Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:56.855563713Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:11:56.873154630Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:11:56.873155171Z     region,
+querier-1  | 2026-09-05T15:11:56.873155713Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:11:56.873156255Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:12:21.639465419Z 2026-09-05T15:12:21.639401Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- 6-hour downsampling over an 8-week window. Touches most parquet files
+querier-1  | 2026-09-05T15:12:21.639478544Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:12:21.639480252Z     region,
+querier-1  | 2026-09-05T15:12:21.639480961Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:12:21.639481627Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:12:21.639485211Z 2026-09-05T15:12:21.639419Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- 6-hour downsampling over an 8-week window. Touches most parquet files
+querier-1  | 2026-09-05T15:12:21.639488794Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:12:21.639489502Z     region,
+querier-1  | 2026-09-05T15:12:21.639490127Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:12:21.639490794Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:12:21.639508294Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:12:21.639508836Z     region,
+querier-1  | 2026-09-05T15:12:21.639509336Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:12:21.639509877Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:12:21.997767252Z 2026-09-05T15:12:21.997673Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:12:22.428770961Z 2026-09-05T15:12:22.428679Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:12:23.774157920Z 2026-09-05T15:12:23.771194Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:12:24.453888920Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:12:24.453889462Z     region,
+querier-1  | 2026-09-05T15:12:24.453889962Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:12:24.453890504Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:12:24.453904379Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:12:24.453904879Z     region,
+querier-1  | 2026-09-05T15:12:24.453905379Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:12:24.453905879Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:12:24.488208087Z     DATE_BIN(INTERVAL '6 hours', time) AS bucket,
+querier-1  | 2026-09-05T15:12:24.488208670Z     region,
+querier-1  | 2026-09-05T15:12:24.488209212Z     AVG(temp) AS avg_temp,
+querier-1  | 2026-09-05T15:12:24.488209754Z     APPROX_PERCENTILE_CONT(humidity, 0.95) AS p95_humidity
+querier-1  | 2026-09-05T15:12:49.405216001Z 2026-09-05T15:12:49.405060Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- 1-week recent window — exercises the gen1-heavy tail. Most recent data
+querier-1  | 2026-09-05T15:12:49.405776960Z 2026-09-05T15:12:49.405168Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- 1-week recent window — exercises the gen1-heavy tail. Most recent data
+querier-1  | 2026-09-05T15:12:49.800257501Z 2026-09-05T15:12:49.800151Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:12:50.167151002Z 2026-09-05T15:12:50.167043Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:12:51.089697877Z 2026-09-05T15:12:51.089565Z  WARN iox_query::physical_optimizer::sort::parquet_sortness: cannot use pre-sorted parquet files, fan-out too wide n_files=144075 max_parquet_fanout=10000
+querier-1  | 2026-09-05T15:13:16.598179750Z 2026-09-05T15:13:16.597738Z  INFO influxdb3_server::http: handling query_sql database=bench query_str=-- 1-week recent window — exercises the gen1-heavy tail. Most recent data
+querier-1  | 2026-09-05T15:13:16.598284583Z 2026-09-05T15:13:16.598184Z  INFO influxdb3_query_executor: executing sql query database=bench query=-- 1-week recent window — exercises the gen1-heavy tail. Most recent data
+querier-1  | 2026-09-05T15:13:16.977204250Z 2026-09-05T15:13:16.977101Z  INFO influxdb3_write::composite_write_buffer: composite get_table_chunks db_schema.id=DbId(2) table_def.table_id=TableId(0) local=144075 tail=0 total=144075
+querier-1  | 2026-09-05T15:13:17.397004375Z 2026-09-05T15:13:17.396083Z  WARN iox_query::physical_optimizer::dedup::split: cannot split dedup operation, fanout too wide n_split=1441 max_dedup_split=100
+querier-1  | 2026-09-05T15:13:34.580214508Z 2026-09-05T15:13:34.555935Z  INFO object_store::client::retry: Encountered transport error of kind Request, backing off for 0.1 seconds, retry 1 of 10: HTTP error: error sending request
+querier-1  | 2026-09-05T15:13:50.042128932Z 2026-09-05T15:13:49.540064Z  INFO object_store::client::retry: Encountered transport error of kind Timeout, backing off for 0.1 seconds, retry 1 of 10: HTTP error: error sending request

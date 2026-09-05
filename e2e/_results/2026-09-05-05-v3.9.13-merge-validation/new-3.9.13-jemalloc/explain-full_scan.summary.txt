@@ -1,0 +1,23 @@
+plan lines=11 bytes=2780
+DataSourceExec=1 file_groups headers=['8']
+  DeduplicateExec: 1
+  SortPreservingMergeExec: 1
+  SortExec: 1
+  RepartitionExec: 2
+  UnionExec: 0
+  FilterExec: 0
+  ProgressiveEvalExec: 0
+  CoalesceBatchesExec: 1
+  AggregateExec: 2
+  | ProjectionExec: expr=[region@0 as region, avg(sensors.temp)@1 as avg_temp, max(sensors.humidity)@2 as max_humid, count(Int64(1))@3 as n]
+  |   AggregateExec: mode=FinalPartitioned, gby=[region@0 as region], aggr=[avg(sensors.temp), max(sensors.humidity), count(Int64(1))]
+  |     CoalesceBatchesExec: target_batch_size=8192
+  |       RepartitionExec: partitioning=Hash([region@0], 8), input_partitions=8
+  |         AggregateExec: mode=Partial, gby=[region@1 as region], aggr=[avg(sensors.temp), max(sensors.humidity), count(Int64(1))]
+  |           RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+  |             ProjectionExec: expr=[humidity@0 as humidity, region@1 as region, temp@2 as temp]
+  |               DeduplicateExec: [host@3 ASC,region@1 ASC,sensor@4 ASC,time@5 ASC]
+  |                 SortPreservingMergeExec: [host@3 ASC, region@1 ASC, sensor@4 ASC, time@5 ASC, __chunk_order@6 ASC]
+  |                   SortExec: expr=[host@3 ASC, region@1 ASC, sensor@4 ASC, time@5 ASC, __chunk_order@6 ASC], preserve_partitioning=[true]
+  |                     DataSourceExec: file_groups={…}, projection=[humidity, region, temp, host, sensor, time, __chunk_order], file_type=parquet
+explain wall time: 2.16s

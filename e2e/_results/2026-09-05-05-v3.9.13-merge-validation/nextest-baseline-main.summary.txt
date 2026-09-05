@@ -1,0 +1,153 @@
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.155s] (1342/3193) influxdb3_server::lib test_deduplicate_rows_in_write_buffer_both_memory_and_parquet
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.237s] (1405/3193) influxdb3_server::lib test_deduplicate_rows_in_write_buffer_parquet
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.025s] (1861/3193) iox_query physical_optimizer::chunk_extraction::tests::test_preserve_data_source_exec_parquet_schema
+  TRY 3 FAIL [   0.028s] (1862/3193) iox_query physical_optimizer::chunk_extraction::tests::test_parquet_with_predicate_fails
+  TRY 3 FAIL [   0.026s] (1863/3193) iox_query physical_optimizer::chunk_extraction::tests::test_roundtrip_many_chunks
+  TRY 3 FAIL [   0.028s] (1866/3193) iox_query physical_optimizer::chunk_extraction::tests::test_roundtrip_single_parquet
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.103s] (1870/3193) iox_query physical_optimizer::dedup::dedup_null_columns::tests::test_tie_breaking
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.108s] (1871/3193) iox_query physical_optimizer::dedup::dedup_null_columns::tests::test_two_chunks
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.107s] (1872/3193) iox_query physical_optimizer::dedup::dedup_null_columns::tests::test_single_chunk_misses_pk_cols
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.109s] (1874/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_three_chunks_single_chunk_has_extra_col2
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.112s] (1875/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_single_chunk_misses_pk_cols
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.110s] (1876/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_three_chunks_different_subsets
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.110s] (1877/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_three_chunks_single_chunk_has_extra_col1
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.114s] (1878/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_single_chunk_with_chunk_order_col
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.113s] (1879/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_single_chunk_order
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.115s] (1880/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_single_chunk_time_always_included
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.104s] (1881/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_tie_breaker
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.130s] (1912/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_two_chunks_one_without_sort_key
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.130s] (1918/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_two_chunks_sorted_ranks_higher_than_not_sorted
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.132s] (1928/3193) iox_query physical_optimizer::dedup::split::tests::partition_split::test_different_partitions
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.146s] (1929/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_unusual_time_order
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.144s] (1930/3193) iox_query physical_optimizer::dedup::split::tests::combine::test_only_combine_contiguous_arms
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.128s] (1939/3193) iox_query physical_optimizer::dedup::split::tests::time_split::test_different_groups
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.134s] (2051/3193) iox_query physical_optimizer::sort::order_union_sorted_inputs::test::test_many_partition_files_all_non_overlapped_files_no_ingester_data
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.141s] (2056/3193) iox_query physical_optimizer::sort::order_union_sorted_inputs::test::test_many_partition_files
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.128s] (2119/3193) iox_query physical_optimizer::sort::regroup_files::tests::test_after_regrouping_have_nonoverlapping_file_groups
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.141s] (2126/3193) iox_query physical_optimizer::sort::regroup_files::tests::test_repartitioned_files_are_overlapping_without_regrouping
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.136s] (2130/3193) iox_query physical_optimizer::tests::test_parquet_must_resorted
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     Summary [  57.893s] 3193 tests run: 3165 passed, 28 failed, 17 skipped
+  TRY 3 FAIL [   0.155s] (1342/3193) influxdb3_server::lib test_deduplicate_rows_in_write_buffer_both_memory_and_parquet
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.237s] (1405/3193) influxdb3_server::lib test_deduplicate_rows_in_write_buffer_parquet
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.025s] (1861/3193) iox_query physical_optimizer::chunk_extraction::tests::test_preserve_data_source_exec_parquet_schema
+  TRY 3 FAIL [   0.028s] (1862/3193) iox_query physical_optimizer::chunk_extraction::tests::test_parquet_with_predicate_fails
+  TRY 3 FAIL [   0.026s] (1863/3193) iox_query physical_optimizer::chunk_extraction::tests::test_roundtrip_many_chunks
+  TRY 3 FAIL [   0.028s] (1866/3193) iox_query physical_optimizer::chunk_extraction::tests::test_roundtrip_single_parquet
+  TRY 3 FAIL [   0.103s] (1870/3193) iox_query physical_optimizer::dedup::dedup_null_columns::tests::test_tie_breaking
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.108s] (1871/3193) iox_query physical_optimizer::dedup::dedup_null_columns::tests::test_two_chunks
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.107s] (1872/3193) iox_query physical_optimizer::dedup::dedup_null_columns::tests::test_single_chunk_misses_pk_cols
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.109s] (1874/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_three_chunks_single_chunk_has_extra_col2
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.112s] (1875/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_single_chunk_misses_pk_cols
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.110s] (1876/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_three_chunks_different_subsets
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.110s] (1877/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_three_chunks_single_chunk_has_extra_col1
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.114s] (1878/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_single_chunk_with_chunk_order_col
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.113s] (1879/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_single_chunk_order
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.115s] (1880/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_single_chunk_time_always_included
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.104s] (1881/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_tie_breaker
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.130s] (1912/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_two_chunks_one_without_sort_key
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.130s] (1918/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_two_chunks_sorted_ranks_higher_than_not_sorted
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.132s] (1928/3193) iox_query physical_optimizer::dedup::split::tests::partition_split::test_different_partitions
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.146s] (1929/3193) iox_query physical_optimizer::dedup::dedup_sort_order::tests::test_unusual_time_order
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.144s] (1930/3193) iox_query physical_optimizer::dedup::split::tests::combine::test_only_combine_contiguous_arms
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.128s] (1939/3193) iox_query physical_optimizer::dedup::split::tests::time_split::test_different_groups
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.134s] (2051/3193) iox_query physical_optimizer::sort::order_union_sorted_inputs::test::test_many_partition_files_all_non_overlapped_files_no_ingester_data
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.141s] (2056/3193) iox_query physical_optimizer::sort::order_union_sorted_inputs::test::test_many_partition_files
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.128s] (2119/3193) iox_query physical_optimizer::sort::regroup_files::tests::test_after_regrouping_have_nonoverlapping_file_groups
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.141s] (2126/3193) iox_query physical_optimizer::sort::regroup_files::tests::test_repartitioned_files_are_overlapping_without_regrouping
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRY 3 FAIL [   0.136s] (2130/3193) iox_query physical_optimizer::tests::test_parquet_must_resorted
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

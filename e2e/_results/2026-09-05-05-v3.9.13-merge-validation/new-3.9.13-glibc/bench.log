@@ -1,0 +1,181 @@
+[14:57:56] phase 0: starting writer + querier (no compactor)
+ Network e2e_default Creating 
+ Network e2e_default Created 
+ Volume e2e_minio-data Creating 
+ Volume e2e_minio-data Created 
+ Container e2e-minio-1 Creating 
+ Container e2e-minio-1 Created 
+ Container e2e-minio-setup-1 Creating 
+ Container e2e-minio-setup-1 Created 
+ Container e2e-writer-1 Creating 
+ Container e2e-writer-1 Created 
+ Container e2e-querier-1 Creating 
+ Container e2e-querier-1 Created 
+ Container e2e-minio-1 Starting 
+ Container e2e-minio-1 Started 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-1 Healthy 
+ Container e2e-minio-setup-1 Starting 
+ Container e2e-minio-setup-1 Started 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Starting 
+ Container e2e-writer-1 Started 
+ Container e2e-writer-1 Waiting 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Healthy 
+ Container e2e-querier-1 Starting 
+ Container e2e-querier-1 Started 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-writer-1 Waiting 
+ Container e2e-querier-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Healthy 
+ Container e2e-minio-1 Healthy 
+ Container e2e-querier-1 Healthy 
+[14:58:05] phase 1: generating data (hours=24 hosts=200 points-per-host=5000 batch-size=1000)
+ Container e2e-minio-1 Running 
+ Container e2e-writer-1 Running 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-1 Healthy 
+ Container e2e-minio-setup-1 Starting 
+ Container e2e-minio-setup-1 Started 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Image python:3.12-alpine Pulling 
+ 5de55e5ef9c0 Pulling fs layer 0B
+ bc05c92714f2 Pulling fs layer 0B
+ 8a485d5dac59 Pulling fs layer 0B
+ 679686af9d41 Pulling fs layer 0B
+ 5de55e5ef9c0 Downloading 1.049MB
+ 5de55e5ef9c0 Download complete 0B
+ bc05c92714f2 Download complete 0B
+ 5de55e5ef9c0 Extracting 1B
+ 679686af9d41 Downloading 3.146MB
+ 5de55e5ef9c0 Extracting 1B
+ 8a485d5dac59 Download complete 0B
+ 679686af9d41 Downloading 7.34MB
+ 5de55e5ef9c0 Extracting 1B
+ 679686af9d41 Downloading 11.53MB
+ 5de55e5ef9c0 Extracting 1B
+ 679686af9d41 Downloading 14.68MB
+ 5de55e5ef9c0 Extracting 1B
+ 679686af9d41 Download complete 0B
+ 5de55e5ef9c0 Extracting 1B
+ 5de55e5ef9c0 Extracting 1B
+ 5de55e5ef9c0 Extracting 1B
+ 5de55e5ef9c0 Pull complete 0B
+ 8a485d5dac59 Pull complete 0B
+ 679686af9d41 Extracting 1B
+ 3df23bd404c9 Download complete 0B
+ 6f3805b5fad9 Download complete 0B
+ 679686af9d41 Extracting 1B
+ bc05c92714f2 Pull complete 0B
+ 679686af9d41 Pull complete 0B
+ Image python:3.12-alpine Pulled 
+ Container e2e-writer-1 Waiting 
+ Container e2e-writer-1 Healthy 
+ Container e2e-gen-run-2aa6fa75b079 Creating 
+ Container e2e-gen-run-2aa6fa75b079 Created 
+plan: 200 hosts × 5000 points = 1000000 total points over 24h (start=1788533891536208303 end=1788620291536208303) parallel=4
+done: wrote 1000000 points in 249.2s (4013 points/s)
+[15:02:21] phase 1b: waiting for writer to flush WAL + publish inventory
+[15:04:21] phase 2: benchmarking uncompacted dataset
+ Container e2e-minio-1 Running 
+ Container e2e-writer-1 Running 
+ Container e2e-querier-1 Running 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-1 Healthy 
+ Container e2e-minio-setup-1 Starting 
+ Container e2e-minio-setup-1 Started 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Waiting 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-writer-1 Healthy 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-querier-1 Waiting 
+ Container e2e-querier-1 Healthy 
+ Container e2e-bench-run-fb9742043e97 Creating 
+ Container e2e-bench-run-fb9742043e97 Created 
+benchmarking 4 queries × 5 runs (tag=uncompacted)
+  full_scan: warming...
+    run 1/5: 23.277s (185 bytes)
+    run 2/5: 24.438s (184 bytes)
+    run 3/5: 25.246s (183 bytes)
+    run 4/5: 30.820s (184 bytes)
+    run 5/5: 44.906s (183 bytes)
+  high_card_filter: warming...
+    run 1/5: 28.135s (1360 bytes)
+    run 2/5: 27.112s (1360 bytes)
+    run 3/5: 27.092s (1360 bytes)
+    run 4/5: 27.331s (1360 bytes)
+    run 5/5: 27.567s (1360 bytes)
+  hour_buckets: warming...
+    run 1/5: 26.394s (1331 bytes)
+    run 2/5: 27.147s (1325 bytes)
+    run 3/5: 28.008s (1337 bytes)
+    run 4/5: 27.143s (1325 bytes)
+    run 5/5: 27.762s (1332 bytes)
+  narrow_window: warming...
+Traceback (most recent call last):
+  File "/work/benchmark.py", line 107, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/work/benchmark.py", line 81, in main
+    elapsed, size = run_query(sql)
+                    ^^^^^^^^^^^^^^
+  File "/work/benchmark.py", line 33, in run_query
+    with urllib.request.urlopen(req, timeout=600) as resp:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/urllib/request.py", line 215, in urlopen
+    return opener.open(url, data, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/urllib/request.py", line 515, in open
+    response = self._open(req, data)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/urllib/request.py", line 532, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/urllib/request.py", line 492, in _call_chain
+    result = func(*args)
+             ^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/urllib/request.py", line 1373, in http_open
+    return self.do_open(http.client.HTTPConnection, req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/urllib/request.py", line 1348, in do_open
+    r = h.getresponse()
+        ^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/http/client.py", line 1478, in getresponse
+    response.begin()
+  File "/usr/local/lib/python3.12/http/client.py", line 343, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/http/client.py", line 312, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+
+[15:13:50] capturing container logs
+[15:13:51] tearing down stack
+ Container e2e-querier-1 Stopping 
+ Container e2e-querier-1 Stopped 
+ Container e2e-querier-1 Removing 
+ Container e2e-querier-1 Removed 
+ Container e2e-writer-1 Stopping 
+ Container e2e-writer-1 Stopped 
+ Container e2e-writer-1 Removing 
+ Container e2e-writer-1 Removed 
+ Container e2e-minio-setup-1 Stopping 
+ Container e2e-minio-setup-1 Stopped 
+ Container e2e-minio-setup-1 Removing 
+ Container e2e-minio-setup-1 Removed 
+ Container e2e-minio-1 Stopping 
+ Container e2e-minio-1 Stopped 
+ Container e2e-minio-1 Removing 
+ Container e2e-minio-1 Removed 
+ Network e2e_default Removing 
+ Volume e2e_minio-data Removing 
+ Network e2e_default Removed 
+ Volume e2e_minio-data Removed 

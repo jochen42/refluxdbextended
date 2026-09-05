@@ -1,0 +1,67 @@
+[14:57:09] phase 0: starting minio + writer + querier
+ Network e2e_default Creating 
+ Network e2e_default Created 
+ Volume e2e_minio-data Creating 
+ Volume e2e_minio-data Created 
+ Container e2e-minio-1 Creating 
+ Container e2e-minio-1 Created 
+ Container e2e-minio-setup-1 Creating 
+ Container e2e-minio-setup-1 Created 
+ Container e2e-writer-1 Creating 
+ Container e2e-writer-1 Created 
+ Container e2e-querier-1 Creating 
+ Container e2e-querier-1 Created 
+ Container e2e-minio-1 Starting 
+ Container e2e-minio-1 Started 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-1 Healthy 
+ Container e2e-minio-setup-1 Starting 
+ Container e2e-minio-setup-1 Started 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Starting 
+ Container e2e-writer-1 Started 
+ Container e2e-writer-1 Waiting 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Healthy 
+ Container e2e-querier-1 Starting 
+ Container e2e-querier-1 Started 
+ Container e2e-querier-1 Waiting 
+ Container e2e-minio-1 Waiting 
+ Container e2e-minio-setup-1 Waiting 
+ Container e2e-writer-1 Waiting 
+ Container e2e-minio-setup-1 Exited 
+ Container e2e-writer-1 Healthy 
+ Container e2e-minio-1 Healthy 
+ Container e2e-querier-1 Healthy 
+[14:57:17] phase 1: writing one LP row
+[14:57:18] phase 2: polling querier (deadline=3s)
+[14:57:19] row visible after 0.613s
+[14:57:19] phase 3: killing writer; querier should still see the row from cached state
+ Container e2e-writer-1 Stopping 
+ Container e2e-writer-1 Stopped 
+[14:57:20] post-writer-kill query still returns 1 (resilience OK)
+[14:57:21] done — freshness OK in 0.613s (deadline 3s)
+[14:57:21] capturing container logs
+[14:57:21] tearing down stack
+ Container e2e-querier-1 Stopping 
+ Container e2e-querier-1 Stopped 
+ Container e2e-querier-1 Removing 
+ Container e2e-querier-1 Removed 
+ Container e2e-writer-1 Stopping 
+ Container e2e-writer-1 Stopped 
+ Container e2e-writer-1 Removing 
+ Container e2e-writer-1 Removed 
+ Container e2e-minio-setup-1 Stopping 
+ Container e2e-minio-setup-1 Stopped 
+ Container e2e-minio-setup-1 Removing 
+ Container e2e-minio-setup-1 Removed 
+ Container e2e-minio-1 Stopping 
+ Container e2e-minio-1 Stopped 
+ Container e2e-minio-1 Removing 
+ Container e2e-minio-1 Removed 
+ Network e2e_default Removing 
+ Volume e2e_minio-data Removing 
+ Volume e2e_minio-data Removed 
+ Network e2e_default Removed 
