@@ -1,0 +1,17 @@
+# Mixed-version overlay: pin individual roles to a different image than
+# INFLUXDB3_IMAGE. Used to validate a rolling upgrade, where writer, compactor
+# and queriers briefly run different builds against the same bucket.
+#
+# Usage (from e2e/), e.g. new writer + old querier:
+#
+#   export COMPOSE_FILE=docker-compose.yml:docker-compose.mixed.yml
+#   QUERIER_IMAGE=docker.io/jochen42/refluxdbextended:3.9.3 ./run-freshness-test.sh
+#
+# Unset roles fall back to the e2e image.
+services:
+  writer:
+    image: ${WRITER_IMAGE:-influxdb3-unlocked:e2e}
+  querier:
+    image: ${QUERIER_IMAGE:-influxdb3-unlocked:e2e}
+  compactor:
+    image: ${COMPACTOR_IMAGE:-influxdb3-unlocked:e2e}

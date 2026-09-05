@@ -31,6 +31,18 @@ the comparison is apples-to-apples.
     docker build -t influxdb3-unlocked:e2e .
     ```
 
+## Mixed versions (rolling-upgrade check)
+
+`docker-compose.mixed.yml` overlays a per-role image so writer, compactor and
+querier can run different builds against one bucket, which is what a rolling
+update looks like from the object store's point of view:
+
+```bash
+export COMPOSE_FILE=docker-compose.yml:docker-compose.mixed.yml
+QUERIER_IMAGE=docker.io/jochen42/refluxdbextended:3.9.3 ./run-freshness-test.sh   # new writer, old querier
+WRITER_IMAGE=docker.io/jochen42/refluxdbextended:3.9.3  ./run-freshness-test.sh   # old writer, new querier
+```
+
 ## One command
 
 ```bash
