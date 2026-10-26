@@ -41,7 +41,8 @@ freshness layer for sub-second visibility of recent writes.
 - Unlimited databases, tables, columns, tags
 - 1 GB HTTP request body, larger last-cache, higher cardinality budget
 - Telemetry disabled by default
-- Scoped tokens (`db:<name>:<action>`, wildcards, expiry)
+- Scoped tokens (`db:<name>:<action>`, wildcards, expiry), enforced on every
+  API: read-only tokens can query but not write or administer (see below)
 
 ### Multi-level compaction
 - Generation durations: 1m, 5m, 10m, 30m, 1h, 6h, 12h, 1d, 7d, 30d, 90d, 365d
@@ -151,6 +152,30 @@ export INFLUXDB3_AUTH_TOKEN="apiv3_..."
 ```
 
 To disable auth for development: `--without-auth`.
+
+Scoped tokens. Upstream Core stores token permissions but never checks them, so
+every token acts as admin. This fork enforces them:
+
+```bash
+# read-only on one database
+./influxdb3 create token --name grafana --permissions db:metrics:read
+# read-only on all databases
+./influxdb3 create token --name reader --permissions 'db:*:read'
+# several grants: repeat the flag
+./influxdb3 create token --name ingest \
+    --permissions db:metrics:read,write --permissions db:logs:read
+```
+
+| Endpoint | Required grant |
+|---|---|
+| v3 `write_lp`, v1 `/write`, v2 `/api/v2/write` | `write` on the database |
+| v3 `query_sql` / `query_influxql`, v1 `/query`, Flight / FlightSQL | `read` on the database |
+| Writes to a database that does not exist yet (auto-create) | `write` on `db:*` |
+| SHOW DATABASES, `GET /api/v3/configure/database` | v1 filters the list; v3 needs `read` on `db:*` |
+| All other `/api/v3/configure/*`, plugins, `/api/v3/engine/*` | admin token |
+| `/health`, `/ping`, `/metrics` | any valid token |
+
+Denied requests return 403. The v2 write API returns 401, matching InfluxDB v2.
 
 Health check:
 
