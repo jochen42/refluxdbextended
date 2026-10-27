@@ -27,7 +27,7 @@ use hyper::{Method, StatusCode};
 use influxdb_influxql_parser::select::GroupByClause;
 use influxdb_influxql_parser::statement::Statement;
 use influxdb3_authz::{
-    AccessRequest, AuthProvider, AuthenticatorError, NoAuthAuthenticator,
+    AccessRequest, AuthProvider, AuthenticatorError, DatabaseActions, NoAuthAuthenticator,
     ResourceAuthorizationError,
 };
 use influxdb3_cache::distinct_cache;
@@ -1125,6 +1125,8 @@ impl HttpApi {
 
     async fn write_lp_inner(&self, params: WriteParams, req: Request) -> Result<Response> {
         validate_db_name(&params.db)?;
+        self.authorize_database(request_token_id(&req), &params.db, DatabaseActions::WRITE)
+            .await?;
         // NamespaceName contains additional validation; do it early
         let database = NamespaceName::new(params.db)?;
         let body = self.read_body(req).await?;
@@ -1199,14 +1201,18 @@ impl HttpApi {
     pub(crate) async fn create_scoped_token(&self, req: Request) -> Result<Response, Error> {
         let request: CreateScopedTokenRequest = self.read_body_json(req).await?;
         let catalog = self.write_buffer.catalog();
-        
+
         // Convert the request permissions to the internal permission format
         let mut permissions = Vec::new();
         for perm_req in request.permissions {
             let resource_type = match perm_req.resource_type.as_str() {
                 "db" => influxdb3_authz::ResourceType::Database,
                 "token" => influxdb3_authz::ResourceType::Token,
-                _ => return Err(Error::InvalidContentType { expected: mime::APPLICATION_JSON }),
+                _ => {
+                    return Err(Error::InvalidContentType {
+                        expected: mime::APPLICATION_JSON,
+                    });
+                }
             };
 
             let resource_identifier = if perm_req.resource_names.contains(&"*".to_string()) {
@@ -1241,23 +1247,33 @@ impl HttpApi {
                         let mut db_actions = 0u16;
                         for action in perm_req.actions {
                             match action.as_str() {
-                                "read" => db_actions |= 1,
-                                "write" => db_actions |= 2,
-                                "create" => db_actions |= 4,
-                                _ => return Err(Error::InvalidContentType { expected: mime::APPLICATION_JSON }),
+                                "read" => db_actions |= DatabaseActions::READ.0,
+                                "write" => db_actions |= DatabaseActions::WRITE.0,
+                                "create" => db_actions |= DatabaseActions::CREATE.0,
+                                _ => {
+                                    return Err(Error::InvalidContentType {
+                                        expected: mime::APPLICATION_JSON,
+                                    });
+                                }
                             }
                         }
-                        influxdb3_authz::Actions::Database(influxdb3_authz::DatabaseActions(db_actions))
+                        influxdb3_authz::Actions::Database(influxdb3_authz::DatabaseActions(
+                            db_actions,
+                        ))
                     }
                     influxdb3_authz::ResourceType::Token => {
                         let mut token_actions = 0u16;
                         for action in perm_req.actions {
                             match action.as_str() {
-                                "read" => token_actions |= 1,
-                                "write" => token_actions |= 2,
-                                "create" => token_actions |= 4,
-                                "delete" => token_actions |= 8,
-                                _ => return Err(Error::InvalidContentType { expected: mime::APPLICATION_JSON }),
+                                "read" => token_actions |= influxdb3_authz::CrudActions::READ.0,
+                                "write" => token_actions |= influxdb3_authz::CrudActions::WRITE.0,
+                                "create" => token_actions |= influxdb3_authz::CrudActions::CREATE.0,
+                                "delete" => token_actions |= influxdb3_authz::CrudActions::DELETE.0,
+                                _ => {
+                                    return Err(Error::InvalidContentType {
+                                        expected: mime::APPLICATION_JSON,
+                                    });
+                                }
                             }
                         }
                         influxdb3_authz::Actions::Token(influxdb3_authz::CrudActions(token_actions))
@@ -1274,11 +1290,7 @@ impl HttpApi {
         }
 
         let (token_info, token) = catalog
-            .create_scoped_token(
-                request.token_name,
-                permissions,
-                request.expiry_secs,
-            )
+            .create_scoped_token(request.token_name, permissions, request.expiry_secs)
             .await?;
 
         let response = CreateTokenWithPermissionsResponse::from_token_info(token_info, token);
@@ -1308,12 +1320,15 @@ impl HttpApi {
     }
 
     async fn query_sql(&self, req: Request) -> Result<Response> {
+        let token_id = request_token_id(&req);
         let QueryRequest {
             database,
             query_str,
             format,
             params,
         } = self.extract_query_request::<String>(req).await?;
+        self.authorize_database(token_id, &database, DatabaseActions::READ)
+            .await?;
 
         info!(%database, %query_str, ?format, "handling query_sql");
 
@@ -1334,6 +1349,7 @@ impl HttpApi {
     }
 
     async fn query_influxql(&self, req: Request) -> Result<Response> {
+        let token_id = request_token_id(&req);
         let QueryRequest {
             database,
             query_str,
@@ -1343,7 +1359,7 @@ impl HttpApi {
 
         info!(?database, %query_str, ?format, "handling query_influxql");
         let (stream, _) = self
-            .query_influxql_inner(database, &query_str, params)
+            .query_influxql_inner(token_id, database, &query_str, params)
             .await?;
 
         ResponseBuilder::new()
@@ -1564,6 +1580,7 @@ impl HttpApi {
     /// APIs.
     async fn query_influxql_inner(
         &self,
+        token_id: Option<TokenId>,
         database: Option<String>,
         query_str: &str,
         params: Option<StatementParams>,
@@ -1589,6 +1606,23 @@ impl HttpApi {
                 }
             }
         };
+
+        // Authorize against the resolved database. Statements without one (SHOW DATABASES,
+        // SHOW RETENTION POLICIES without ON) span every database, so they need a wildcard
+        // read grant.
+        match database.as_deref() {
+            Some(db) => {
+                self.authorize_database(token_id, db, DatabaseActions::READ)
+                    .await?
+            }
+            None => {
+                self.authorize_access(
+                    token_id,
+                    AccessRequest::UnknownDatabase(DatabaseActions::READ),
+                )
+                .await?
+            }
+        }
 
         let statement = statement.to_statement();
         let group_by = match &statement {
@@ -1876,6 +1910,12 @@ impl HttpApi {
     }
 
     async fn show_databases(&self, req: Request) -> Result<Response> {
+        // Lists every database, so it needs a wildcard read grant.
+        self.authorize_access(
+            request_token_id(&req),
+            AccessRequest::UnknownDatabase(DatabaseActions::READ),
+        )
+        .await?;
         let query = req.uri().query().unwrap_or("");
         let ShowDatabasesRequest {
             format,
@@ -2177,6 +2217,33 @@ impl HttpApi {
             .body(empty_response_body());
 
         Ok(body?)
+    }
+
+    /// Authorize `actions` on the database named `db`. A database that is not in the catalog
+    /// (e.g. auto-created by this write) only matches a wildcard database grant.
+    async fn authorize_database(
+        &self,
+        token_id: Option<TokenId>,
+        db: &str,
+        actions: DatabaseActions,
+    ) -> Result<()> {
+        let request = match self.write_buffer.catalog().db_name_to_id(db) {
+            Some(db_id) => AccessRequest::Database(db_id, actions),
+            None => AccessRequest::UnknownDatabase(actions),
+        };
+        self.authorize_access(token_id, request).await
+    }
+
+    async fn authorize_access(
+        &self,
+        token_id: Option<TokenId>,
+        request: AccessRequest,
+    ) -> Result<()> {
+        let token_id = token_id.ok_or(Error::Unauthenticated)?;
+        self.authorizer
+            .authorize_action(&token_id, request)
+            .await
+            .map_err(|_| Error::ResourceAuthorization(ResourceAuthorizationError::Unauthorized))
     }
 
     async fn authorize_admin(&self, req: &Request) -> Result<TokenId> {
@@ -2762,6 +2829,29 @@ pub(crate) async fn route_request(
     Ok(response)
 }
 
+fn request_token_id(req: &Request) -> Option<TokenId> {
+    req.extensions().get::<TokenId>().copied()
+}
+
+/// Whether a route is operator-level. Data-plane routes return false; their handlers check
+/// per-database grants. Unknown routes return true so new endpoints default to admin-only.
+fn route_requires_admin(method: &Method, path: &str) -> bool {
+    let data_plane = matches!(
+        path,
+        all_paths::API_LEGACY_WRITE
+            | all_paths::API_V2_WRITE
+            | all_paths::API_V3_WRITE
+            | all_paths::API_V3_QUERY_SQL
+            | all_paths::API_V3_QUERY_INFLUXQL
+            | all_paths::API_V1_QUERY
+            | all_paths::API_V3_HEALTH
+            | all_paths::API_V1_HEALTH
+            | all_paths::API_PING
+            | all_paths::API_METRICS
+    ) || (method == Method::GET && path == all_paths::API_V3_CONFIGURE_DATABASE);
+    !data_plane
+}
+
 async fn perform_routing(
     http_server: Arc<HttpApi>,
     mut req: Request,
@@ -2800,7 +2890,9 @@ async fn perform_routing(
 
     // admin token creation should be allowed without authentication
     // and any endpoints that are disabled.
-    if path == all_paths::API_V3_CONFIGURE_ADMIN_TOKEN || paths_without_authz.contains(&path) {
+    let skip_authentication =
+        path == all_paths::API_V3_CONFIGURE_ADMIN_TOKEN || paths_without_authz.contains(&path);
+    if skip_authentication {
         trace!(?uri, "not authenticating request");
     } else {
         trace!(?uri, "authenticating request");
@@ -2819,9 +2911,7 @@ async fn perform_routing(
     );
     let is_query_path = matches!(
         path,
-        all_paths::API_V3_QUERY_SQL
-            | all_paths::API_V3_QUERY_INFLUXQL
-            | all_paths::API_V1_QUERY,
+        all_paths::API_V3_QUERY_SQL | all_paths::API_V3_QUERY_INFLUXQL | all_paths::API_V1_QUERY,
     );
     if is_write_path && !http_server.endpoint_policy.allow_write {
         return Ok(ResponseBuilder::new()
@@ -2838,6 +2928,14 @@ async fn perform_routing(
                 "this node is not configured to serve queries",
             ))
             .unwrap());
+    }
+
+    // Everything except data-plane routes (writes, queries, health, ping, metrics) is
+    // operator-level and needs an admin token. Data-plane handlers check per-database grants
+    // themselves, because the database is only known after parsing the request. The first
+    // admin token is created without a token, so that bootstrap path is exempt.
+    if !skip_authentication && route_requires_admin(&method, path) {
+        http_server.authorize_admin(&req).await?;
     }
 
     match (method.clone(), path) {

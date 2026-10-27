@@ -302,11 +302,14 @@ pub struct CreateScopedTokenConfig {
     #[clap(long)]
     pub name: Option<String>,
 
-    /// Permissions in format "resource_type:resource_name:action"
-    ///   e.g. db:test_db:read,write
-    ///        db:*:read
-    ///        token:*:read,write
-    #[clap(long, value_delimiter = ',')]
+    /// Permissions in format "resource_type:resource_name:action[,action]".
+    /// Repeat the flag for several permissions.
+    ///   e.g. --permissions db:test_db:read             (read-only)
+    ///        --permissions db:*:read                   (read-only, all databases)
+    ///        --permissions db:test_db:read,write
+    ///        --permissions db:a:read --permissions db:b:read,write
+    // No value delimiter: the action list itself is comma-separated.
+    #[clap(long)]
     pub permissions: Vec<String>,
 
     /// Expires in `duration`,

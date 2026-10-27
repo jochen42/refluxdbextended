@@ -565,3 +565,298 @@ async fn disabled_auth_test_exhaustive() {
         "finished running the tests for"
     );
 }
+
+/// Create a scoped token through the HTTP API and return its secret.
+async fn create_scoped_token(
+    server: &TestServer,
+    admin_token: &str,
+    name: &str,
+    permissions: serde_json::Value,
+) -> String {
+    let resp = server
+        .http_client()
+        .post(format!("{}/api/v3/configure/token", server.client_addr()))
+        .bearer_auth(admin_token)
+        .json(&serde_json::json!({
+            "token_name": name,
+            "permissions": permissions,
+            "expiry_secs": null,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "create token {name}");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    body["token"]
+        .as_str()
+        .expect("token in response")
+        .to_string()
+}
+
+#[tokio::test]
+async fn read_only_token_is_enforced() {
+    let server = TestServer::configure().with_auth().spawn().await;
+    let admin = server.auth_token.clone().expect("admin token");
+    let client = server.http_client();
+    let base = server.client_addr();
+
+    for db in ["foo", "bar"] {
+        server
+            .write_lp_to_db(db, "cpu,host=a usage=0.5 2998574937", Precision::Second)
+            .await
+            .unwrap();
+    }
+
+    let ro_foo = create_scoped_token(
+        &server,
+        &admin,
+        "ro-foo",
+        serde_json::json!([{ "resource_type": "db", "resource_names": ["foo"], "actions": ["read"] }]),
+    )
+    .await;
+    let ro_all = create_scoped_token(
+        &server,
+        &admin,
+        "ro-all",
+        serde_json::json!([{ "resource_type": "db", "resource_names": ["*"], "actions": ["read"] }]),
+    )
+    .await;
+    let rw_foo = create_scoped_token(
+        &server,
+        &admin,
+        "rw-foo",
+        serde_json::json!([{ "resource_type": "db", "resource_names": ["foo"], "actions": ["read", "write"] }]),
+    )
+    .await;
+
+    let write = |token: String, db: &'static str| {
+        client
+            .post(format!("{base}/api/v3/write_lp"))
+            .query(&[("db", db)])
+            .body("cpu,host=b usage=0.7 2998574938")
+            .bearer_auth(token)
+            .send()
+    };
+    let query = |token: String, db: &'static str| {
+        client
+            .get(format!("{base}/api/v3/query_sql"))
+            .query(&[("db", db), ("q", "select host from cpu")])
+            .bearer_auth(token)
+            .send()
+    };
+    let status = |r: reqwest::Result<reqwest::Response>| r.unwrap().status();
+
+    // Read-only on foo: can read foo, nothing else.
+    assert_eq!(status(query(ro_foo.clone(), "foo").await), StatusCode::OK);
+    assert_eq!(
+        status(query(ro_foo.clone(), "bar").await),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status(write(ro_foo.clone(), "foo").await),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status(write(ro_foo.clone(), "newdb").await),
+        StatusCode::FORBIDDEN
+    );
+
+    // Wildcard read: reads every database, still cannot write.
+    assert_eq!(status(query(ro_all.clone(), "foo").await), StatusCode::OK);
+    assert_eq!(status(query(ro_all.clone(), "bar").await), StatusCode::OK);
+    assert_eq!(
+        status(write(ro_all.clone(), "foo").await),
+        StatusCode::FORBIDDEN
+    );
+
+    // Read-write on foo: writes foo, not bar, and cannot auto-create databases.
+    assert_eq!(
+        status(write(rw_foo.clone(), "foo").await),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        status(write(rw_foo.clone(), "bar").await),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status(write(rw_foo.clone(), "newdb").await),
+        StatusCode::FORBIDDEN
+    );
+
+    // Legacy write endpoints are covered too.
+    let v2 = client
+        .post(format!("{base}/api/v2/write"))
+        .query(&[("bucket", "foo")])
+        .body("cpu,host=c usage=0.1 2998574939000000000")
+        .bearer_auth(&ro_foo)
+        .send()
+        .await
+        .unwrap();
+    // The v2 API reports authorization failures as 401, matching InfluxDB v2.
+    assert_eq!(v2.status(), StatusCode::UNAUTHORIZED);
+    let v1 = client
+        .post(format!("{base}/write"))
+        .query(&[("db", "foo")])
+        .body("cpu,host=c usage=0.1 2998574939000000000")
+        .bearer_auth(&ro_foo)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            v1.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "v1 write: {}",
+        v1.status()
+    );
+
+    // InfluxQL on v3 resolves the database before authorizing.
+    let influxql = |token: &str, db: &'static str| {
+        client
+            .get(format!("{base}/api/v3/query_influxql"))
+            .query(&[("db", db), ("q", "SELECT host FROM cpu")])
+            .bearer_auth(token.to_string())
+            .send()
+    };
+    assert_eq!(status(influxql(&ro_foo, "foo").await), StatusCode::OK);
+    assert_eq!(
+        status(influxql(&ro_foo, "bar").await),
+        StatusCode::FORBIDDEN
+    );
+
+    // Listing databases needs a wildcard read grant.
+    let list_dbs = |token: &str| {
+        client
+            .get(format!("{base}/api/v3/configure/database"))
+            .query(&[("format", "json")])
+            .bearer_auth(token.to_string())
+            .send()
+    };
+    assert_eq!(status(list_dbs(&ro_foo).await), StatusCode::FORBIDDEN);
+    assert_eq!(status(list_dbs(&ro_all).await), StatusCode::OK);
+
+    // Operator endpoints are admin-only.
+    let create_db = client
+        .post(format!("{base}/api/v3/configure/database"))
+        .json(&serde_json::json!({ "db": "sneaky" }))
+        .bearer_auth(&ro_all)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_db.status(), StatusCode::FORBIDDEN);
+    let delete_db = client
+        .delete(format!("{base}/api/v3/configure/database"))
+        .query(&[("db", "foo")])
+        .bearer_auth(&rw_foo)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete_db.status(), StatusCode::FORBIDDEN);
+    let mint = client
+        .post(format!("{base}/api/v3/configure/token"))
+        .bearer_auth(&ro_all)
+        .json(&serde_json::json!({
+            "token_name": "escalate",
+            "permissions": [{ "resource_type": "db", "resource_names": ["*"], "actions": ["write"] }],
+            "expiry_secs": null,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mint.status(), StatusCode::FORBIDDEN);
+    let delete_token = client
+        .delete(format!("{base}/api/v3/configure/token"))
+        .query(&[("token_name", "rw-foo")])
+        .bearer_auth(&ro_all)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete_token.status(), StatusCode::FORBIDDEN);
+
+    // Health and ping stay open to any valid token.
+    for path in ["/health", "/ping"] {
+        let r = client
+            .get(format!("{base}{path}"))
+            .bearer_auth(&ro_foo)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "{path}");
+    }
+
+    // Admin is unaffected.
+    assert_eq!(
+        status(write(admin.clone(), "bar").await),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(status(query(admin.clone(), "bar").await), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn read_only_token_v1_query_and_flight() {
+    let server = TestServer::configure().with_auth().spawn().await;
+    let admin = server.auth_token.clone().expect("admin token");
+    let client = server.http_client();
+    let base = server.client_addr();
+
+    for db in ["foo", "bar"] {
+        server
+            .write_lp_to_db(db, "cpu,host=a usage=0.5 2998574937", Precision::Second)
+            .await
+            .unwrap();
+    }
+    let ro_foo = create_scoped_token(
+        &server,
+        &admin,
+        "ro-foo",
+        serde_json::json!([{ "resource_type": "db", "resource_names": ["foo"], "actions": ["read"] }]),
+    )
+    .await;
+
+    // v1 /query: readable db works, other db is refused.
+    let v1 = |db: &'static str, q: &'static str| {
+        client
+            .get(format!("{base}/query"))
+            .query(&[("db", db), ("q", q)])
+            .bearer_auth(&ro_foo)
+            .send()
+    };
+    let ok = v1("foo", "SELECT host FROM cpu").await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    let denied = v1("bar", "SELECT host FROM cpu").await.unwrap();
+    assert_ne!(
+        denied.status(),
+        StatusCode::OK,
+        "v1 query on bar must be refused"
+    );
+
+    // SHOW DATABASES over v1 lists only what the token can read.
+    let show = v1("foo", "SHOW DATABASES").await.unwrap();
+    assert_eq!(show.status(), StatusCode::OK);
+    let body = show.text().await.unwrap();
+    assert!(body.contains("foo"), "{body}");
+    assert!(!body.contains("bar"), "{body}");
+
+    // Flight: query on foo works, bar is refused.
+    let mut foo_client = server.flight_sql_client("foo").await;
+    foo_client
+        .add_header("authorization", &format!("Bearer {ro_foo}"))
+        .unwrap();
+    let response = foo_client.query("SELECT host FROM cpu").await.unwrap();
+    let batches = collect_stream(response).await;
+    assert!(!batches.is_empty());
+
+    let mut bar_client = server.flight_sql_client("bar").await;
+    bar_client
+        .add_header("authorization", &format!("Bearer {ro_foo}"))
+        .unwrap();
+    let err = bar_client
+        .query("SELECT host FROM cpu")
+        .await
+        .expect_err("flight query on bar must be refused");
+    assert!(
+        format!("{err:?}").contains("PermissionDenied"),
+        "unexpected error: {err:?}"
+    );
+}

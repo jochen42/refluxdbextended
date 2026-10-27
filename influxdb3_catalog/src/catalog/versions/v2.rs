@@ -723,15 +723,17 @@ impl Catalog {
 
             Ok(CatalogBatch::Token(TokenBatch {
                 time_ns: created_at,
-                ops: vec![TokenCatalogOp::CreateScopedToken(CreateScopedTokenDetails {
-                    token_id,
-                    name: Arc::from(token_name.as_str()),
-                    hash: hash.clone(),
-                    created_at,
-                    updated_at: None,
-                    expiry,
-                    permissions: permissions.clone(),
-                })],
+                ops: vec![TokenCatalogOp::CreateScopedToken(
+                    CreateScopedTokenDetails {
+                        token_id,
+                        name: Arc::from(token_name.as_str()),
+                        hash: hash.clone(),
+                        created_at,
+                        updated_at: None,
+                        expiry,
+                        permissions: permissions.clone(),
+                    },
+                )],
             }))
         })
         .await?;
@@ -982,6 +984,14 @@ impl Catalog {
 impl TokenProvider for Catalog {
     fn get_token(&self, token_hash: Vec<u8>) -> Option<Arc<TokenInfo>> {
         self.inner.read().tokens.hash_to_info(token_hash)
+    }
+
+    fn get_token_by_id(&self, token_id: &TokenId) -> Option<Arc<TokenInfo>> {
+        self.inner.read().tokens.repo().get_by_id(token_id)
+    }
+
+    fn db_name_to_id(&self, db_name: &str) -> Option<DbId> {
+        Catalog::db_name_to_id(self, db_name)
     }
 }
 
