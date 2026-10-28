@@ -5,11 +5,17 @@ use influxdb3_catalog::catalog::Catalog;
 use influxdb3_id::{DbId, TableId};
 use influxdb3_shutdown::ShutdownToken;
 use iox_time::TimeProvider;
-use observability_deps::tracing::{debug, error, info};
+use observability_deps::tracing::{debug, error, info, warn};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// A periodic table index sync slower than this is logged at `warn`.
+const SLOW_TABLE_INDEX_SYNC: Duration = Duration::from_secs(300);
 
 /// Handles periodic enforcement of retention policies by deleting expired parquet files.
+///
+/// Each check also syncs the table indices from newly persisted snapshots, whether or not any
+/// retention policy exists, so the snapshot backlog converted at startup stays small.
 #[derive(Debug)]
 pub struct RetentionPeriodHandler {
     table_index_cache: TableIndexCache,
@@ -61,6 +67,8 @@ impl RetentionPeriodHandler {
 
     /// Check all tables for retention policies and enforce them.
     async fn check_and_enforce_retention(&self) {
+        self.sync_table_indices().await;
+
         debug!("Checking retention policies");
 
         // Get the retention period cutoff map from the catalog
@@ -80,6 +88,33 @@ impl RetentionPeriodHandler {
         for ((db_id, table_id), cutoff_time_ns) in cutoff_map {
             self.enforce_retention_for_table(db_id, table_id, cutoff_time_ns)
                 .await;
+        }
+    }
+
+    /// Fold newly persisted snapshots into the table indices.
+    ///
+    /// Without this, the conversion marker only advances at startup (or when a purge runs), so
+    /// the next startup has to convert every snapshot since the last one before WAL replay.
+    async fn sync_table_indices(&self) {
+        let start = Instant::now();
+        match self.table_index_cache.sync_from_persisted_snapshots().await {
+            Ok(()) => {
+                let elapsed = start.elapsed();
+                if elapsed > SLOW_TABLE_INDEX_SYNC {
+                    warn!(
+                        duration_ms = elapsed.as_millis(),
+                        "Slow table index sync from persisted snapshots"
+                    );
+                } else {
+                    info!(
+                        duration_ms = elapsed.as_millis(),
+                        "Synced table indices from persisted snapshots"
+                    );
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to sync table indices from persisted snapshots");
+            }
         }
     }
 

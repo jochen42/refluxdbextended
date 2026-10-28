@@ -2300,6 +2300,11 @@ async fn initialize_table_index_cache(
     // This needs to happen before WAL snapshotting, retention handling, or hard deletion could
     // begin executing so we have a quiescent time during which we can transform
     // `PersistedSnapshot` to `TableIndexSnapshot` to `TableIndex` to completion.
+    //
+    // Logged at warn so the step stays visible under a warn log filter: its duration grows with
+    // the snapshot backlog and the server answers 503 until it is done.
+    warn!("Syncing table indices from persisted snapshots before WAL replay");
+    let sync_start = std::time::Instant::now();
     table_index_cache.initialize().await.map_err(|e| {
         warn!("Failed to initialize table index cache: {}", e);
         Error::WriteBufferInit(anyhow::anyhow!(
@@ -2307,6 +2312,10 @@ async fn initialize_table_index_cache(
             e
         ))
     })?;
+    warn!(
+        duration_ms = sync_start.elapsed().as_millis(),
+        "Synced table indices from persisted snapshots"
+    );
 
     // Create and start the retention period handler
     let retention_handler = Arc::new(RetentionPeriodHandler::new(

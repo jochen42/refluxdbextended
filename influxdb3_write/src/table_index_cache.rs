@@ -119,6 +119,10 @@ pub enum TableIndexCacheError {
 
 pub type Result<T> = std::result::Result<T, TableIndexCacheError>;
 
+/// A snapshot backlog at least this large is logged at `warn` (start, progress, completion) so a
+/// long catch-up stays visible under a `warn` log filter. At startup it blocks WAL replay.
+const LARGE_SNAPSHOT_BACKLOG: usize = 500;
+
 /// Configuration for the TableIndexCache
 #[derive(Debug, Clone, Copy)]
 pub struct TableIndexCacheConfig {
@@ -443,11 +447,20 @@ impl TableIndexCache {
         let sem = Arc::new(Semaphore::new(self.inner.config.concurrency_limit));
         let mut js = tokio::task::JoinSet::new();
         let mut processed_count = 0;
+        let snapshots_to_process = snapshot_metas.len();
+        let large_backlog = snapshots_to_process >= LARGE_SNAPSHOT_BACKLOG;
 
-        info!(
-            snapshots_to_process = snapshot_metas.len(),
-            "Splitting snapshots into table index snapshots"
-        );
+        if large_backlog {
+            warn!(
+                snapshots_to_process,
+                "Large snapshot backlog: splitting snapshots into table index snapshots, this can take a while"
+            );
+        } else {
+            info!(
+                snapshots_to_process,
+                "Splitting snapshots into table index snapshots"
+            );
+        }
         for meta in snapshot_metas {
             let object_store = Arc::clone(&self.inner.object_store);
             let sem = Arc::clone(&sem);
@@ -471,11 +484,19 @@ impl TableIndexCache {
         while let Some(res) = js.join_next().await {
             match res.map_err(TableIndexCacheError::TableSnapshotPersistenceTaskFailed)? {
                 Ok(object_meta) => {
-                    info!(
+                    debug!(
                         snapshot_path = %object_meta.location,
                         "Finished splitting snapshot into table index snapshots",
                     );
                     processed_count += 1;
+                    if large_backlog && processed_count % LARGE_SNAPSHOT_BACKLOG == 0 {
+                        warn!(
+                            snapshots_processed = processed_count,
+                            snapshots_to_process,
+                            elapsed_s = start_time.elapsed().as_secs(),
+                            "Splitting snapshots into table index snapshots: progress"
+                        );
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -501,12 +522,21 @@ impl TableIndexCache {
             .map_err(TableIndexCacheError::PutConversionMarkerError)?;
 
         let elapsed = start_time.elapsed();
-        info!(
-            duration_ms = elapsed.as_millis(),
-            snapshots_processed = processed_count,
-            last_sequence = %last_seq_number,
-            "Completed splitting persisted snapshots"
-        );
+        if large_backlog {
+            warn!(
+                duration_ms = elapsed.as_millis(),
+                snapshots_processed = processed_count,
+                last_sequence = %last_seq_number,
+                "Completed splitting persisted snapshots"
+            );
+        } else {
+            info!(
+                duration_ms = elapsed.as_millis(),
+                snapshots_processed = processed_count,
+                last_sequence = %last_seq_number,
+                "Completed splitting persisted snapshots"
+            );
+        }
 
         Ok(())
     }
@@ -514,6 +544,16 @@ impl TableIndexCache {
     /// This method is intended to run at startup to make sure that `TableIndex`s exist for each
     /// table and that each one is update to date with the latest `PersistedSnapshot`.
     pub async fn initialize(&self) -> Result<()> {
+        self.sync_from_persisted_snapshots().await
+    }
+
+    /// Fold snapshots persisted since the last conversion into the table indices.
+    ///
+    /// The conversion marker otherwise only advances at startup or when a purge runs, so a
+    /// long-running node with no retention policies leaves every snapshot since its last start
+    /// for the next startup to convert, and that blocks WAL replay. Calling this periodically
+    /// keeps the startup backlog bounded by the call interval.
+    pub async fn sync_from_persisted_snapshots(&self) -> Result<()> {
         // Load any unhandled persisted snapshots and convert them to TableIndexSnapshot
         self.split_persisted_snapshots_to_table_index_snapshots()
             .await?;
