@@ -35,6 +35,7 @@ use futures_util::stream::{FuturesOrdered, StreamExt};
 use influxdb3_cache::parquet_cache::ParquetFileDataToCache;
 use influxdb3_wal::SnapshotSequenceNumber;
 use iox_time::TimeProvider;
+use metric::{Registry, U64Gauge};
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectMeta, ObjectStore};
 use object_store_utils::{AdaptiveGetExt, AdaptivePutExt};
@@ -107,6 +108,10 @@ const CHECKPOINTS_TO_RETAIN_PER_MONTH: usize = 2;
 /// limit is capped by the object-store connection limit at startup.
 pub const DEFAULT_MAX_CONCURRENT_SNAPSHOT_LOADS: usize = 64;
 
+/// Compaction manifest loads at least this large are logged at `warn` (start and completion) so a
+/// slow startup stays visible under a `warn` log filter.
+const LARGE_COMPACTION_MANIFEST_LOAD: usize = 1000;
+
 /// Cached checkpoint with its file index for efficient incremental updates.
 ///
 /// Storing the FileIndex alongside the checkpoint avoids rebuilding it on every
@@ -140,6 +145,8 @@ pub struct Persister {
     cached_checkpoint: RwLock<Option<CachedCheckpoint>>,
     /// Max snapshot manifests fetched concurrently during startup restore.
     snapshot_load_concurrency: usize,
+    /// Compaction manifests not yet loaded by the running startup load.
+    compaction_manifests_pending: Option<U64Gauge>,
 }
 
 impl Persister {
@@ -167,6 +174,26 @@ impl Persister {
             last_checkpoint_time: RwLock::new(None),
             cached_checkpoint: RwLock::new(None),
             snapshot_load_concurrency: DEFAULT_MAX_CONCURRENT_SNAPSHOT_LOADS,
+            compaction_manifests_pending: None,
+        }
+    }
+
+    /// Register the startup load progress gauges.
+    pub fn with_metrics(mut self, registry: &Registry) -> Self {
+        self.compaction_manifests_pending = Some(
+            registry
+                .register_metric::<U64Gauge>(
+                    "influxdb3_compaction_manifests_load_pending",
+                    "compaction manifests not yet loaded by the running startup load",
+                )
+                .recorder(&[]),
+        );
+        self
+    }
+
+    fn set_compaction_manifests_pending(&self, pending: usize) {
+        if let Some(gauge) = &self.compaction_manifests_pending {
+            gauge.set(pending as u64);
         }
     }
 
@@ -354,11 +381,15 @@ impl Persister {
         Ok(())
     }
 
-    /// Load every compaction manifest under `{host}/compactions/`. Unlike WAL snapshots
-    /// there is no expectation of unbounded growth — compaction emits one manifest per
-    /// cycle and prior manifests' `removed_files` cancel earlier `databases` entries when
-    /// fed back through `PersistedFiles`.
+    /// Load every compaction manifest under `{host}/compactions/`. Compaction emits one
+    /// manifest per cycle and nothing prunes them, so the count grows with the node's age (64k
+    /// on the prod compactor in Oct 2026); prior manifests' `removed_files` cancel earlier
+    /// `databases` entries when fed back through `PersistedFiles`.
+    ///
+    /// Manifests are fetched with up to `snapshot_load_concurrency` requests in flight; a
+    /// sequential load took 84 min at startup for those 64k manifests.
     pub async fn load_compaction_snapshots(&self) -> Result<Vec<PersistedSnapshot>> {
+        let start = Instant::now();
         let dir = CompactionInfoFilePath::dir(&self.node_identifier_prefix);
         let mut listing = self.object_store.list(Some(&dir));
         let mut metas = Vec::new();
@@ -369,14 +400,41 @@ impl Persister {
         // additions when older manifests are replayed.
         metas.sort_unstable_by(|a, b| a.location.cmp(&b.location));
 
-        let mut snapshots = Vec::with_capacity(metas.len());
-        for meta in metas {
-            let bytes = self
-                .object_store
-                .get_adaptive(&meta.location, Some(meta.size))
-                .await?;
-            let snapshot: PersistedSnapshot = serde_json::from_slice(&bytes)?;
-            snapshots.push(snapshot);
+        let manifests = metas.len();
+        let large_load = manifests >= LARGE_COMPACTION_MANIFEST_LOAD;
+        if large_load {
+            warn!(
+                manifests,
+                concurrency = self.snapshot_load_concurrency,
+                "Loading compaction manifests, this can take a while"
+            );
+        }
+        self.set_compaction_manifests_pending(manifests);
+
+        // buffered() keeps the listing order, which the removals above rely on
+        let mut fetches = futures_util::stream::iter(metas.into_iter().map(|meta| {
+            let object_store = Arc::clone(&self.object_store);
+            async move {
+                let bytes = object_store
+                    .get_adaptive(&meta.location, Some(meta.size))
+                    .await?;
+                let snapshot: PersistedSnapshot = serde_json::from_slice(&bytes)?;
+                Ok::<_, PersisterError>(snapshot)
+            }
+        }))
+        .buffered(self.snapshot_load_concurrency);
+
+        let mut snapshots = Vec::with_capacity(manifests);
+        while let Some(snapshot) = fetches.next().await {
+            snapshots.push(snapshot?);
+            self.set_compaction_manifests_pending(manifests - snapshots.len());
+        }
+
+        let duration_ms = start.elapsed().as_millis();
+        if large_load {
+            warn!(manifests, duration_ms, "Loaded compaction manifests");
+        } else {
+            debug!(manifests, duration_ms, "Loaded compaction manifests");
         }
         Ok(snapshots)
     }

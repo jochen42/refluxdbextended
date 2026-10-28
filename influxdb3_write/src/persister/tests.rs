@@ -1263,3 +1263,40 @@ async fn load_snapshots_bounds_fetch_concurrency() {
         tracking.max_in_flight_gets()
     );
 }
+
+/// Compaction manifests load concurrently but must come back in listing order, since later
+/// manifests' `removed_files` cancel files that earlier ones added.
+#[tokio::test]
+async fn load_compaction_snapshots_concurrently_keeps_listing_order() {
+    let registry = metric::Registry::default();
+    let (persister, _) = create_test_persister(0, None);
+    let persister = persister
+        .with_snapshot_load_concurrency(8)
+        .with_metrics(&registry);
+
+    // zero-padded ids so the listing order is the numeric order
+    let count = 200;
+    for seq in 0..count {
+        persister
+            .persist_compaction_snapshot(&format!("{seq:05}"), &create_test_snapshot(seq))
+            .await
+            .unwrap();
+    }
+
+    let loaded = persister.load_compaction_snapshots().await.unwrap();
+    let seqs: Vec<u64> = loaded
+        .iter()
+        .map(|s| s.snapshot_sequence_number.as_u64())
+        .collect();
+    assert_eq!(seqs, (0..count).collect::<Vec<_>>());
+
+    let pending = registry
+        .get_instrument::<metric::Metric<metric::U64Gauge>>(
+            "influxdb3_compaction_manifests_load_pending",
+        )
+        .unwrap()
+        .get_observer(&metric::Attributes::from(&[]))
+        .unwrap()
+        .fetch();
+    assert_eq!(pending, 0);
+}

@@ -51,7 +51,7 @@ use influxdb3_write::{
 };
 use iox_query::exec::{DedicatedExecutor, Executor, ExecutorConfig, PerQueryMemoryPoolConfig};
 use iox_time::{SystemProvider, TimeProvider};
-use metric::U64Gauge;
+use metric::{Metric, Registry, U64Gauge};
 use object_store::ObjectStore;
 use object_store_metrics::ObjectStoreMetrics;
 use object_store_utils::SelfVerifyingCreateStore;
@@ -1141,6 +1141,8 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             "1 once startup (catalog load, table index sync, WAL replay) is done and the API serves requests, 0 before",
         )
         .recorder(&[]);
+    let startup_phase = StartupPhase::new(&metrics);
+    startup_phase.set("catalog");
     let startup_probe = StartupProbe::spawn(
         TcpListener::bind(*config.http_bind_address)
             .await
@@ -1359,12 +1361,15 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         concurrency_limit: config.table_index_cache_concurrency_limit,
     };
 
-    let persister = Arc::new(Persister::new(
-        Arc::clone(&object_store),
-        node_id.as_str(),
-        Arc::clone(&time_provider) as _,
-        config.checkpoint_interval.map(|v| v.into()),
-    ));
+    let persister = Arc::new(
+        Persister::new(
+            Arc::clone(&object_store),
+            node_id.as_str(),
+            Arc::clone(&time_provider) as _,
+            config.checkpoint_interval.map(|v| v.into()),
+        )
+        .with_metrics(&metrics),
+    );
 
     let process_uuid_getter: Arc<dyn ProcessUuidGetter> = Arc::new(ProcessUuidWrapper::new());
     // Pick shared vs per-node catalog: explicit flag wins; otherwise default
@@ -1399,6 +1404,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     info!(catalog_uuid = ?catalog.catalog_uuid(), "catalog initialized");
 
     let retention_handler_token = shutdown_manager.register();
+    startup_phase.set("table_index_sync");
     let _table_index_cache = initialize_table_index_cache(
         node_id.clone(),
         config.retention_check_interval.into(),
@@ -1497,6 +1503,10 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         snapshot_size: config.wal_snapshot_size,
         wal_replay_fail_on_error: config.wal_replay_fail_on_error,
     };
+
+    // Shared inventory load, writer lease, persisted files (checkpoints, snapshots, compaction
+    // manifests) and WAL replay.
+    startup_phase.set("write_buffer_init");
 
     // Multi-node modes (writer/compactor/querier) participate in the shared
     // inventory: writers publish snapshots there, queriers load peers' files
@@ -2006,6 +2016,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     // port (including an OS-assigned `:0`) never changes across handover.
     let listener = startup_probe.into_listener().await.map_err(Error::Server)?;
     server_ready.set(1);
+    startup_phase.set("serving");
 
     // Only create recovery listener if explicitly enabled
     let admin_token_recovery_listener = if let Some(addr) = config.admin_token_recovery_bind_address
@@ -2289,6 +2300,34 @@ fn determine_package_manager() -> Arc<dyn PythonEnvironmentManager> {
 
     // If neither is available, return DisabledManager
     Arc::new(DisabledManager)
+}
+
+/// `influxdb3_startup_phase{phase=...}`: 1 for the startup phase in progress, 0 for the others.
+/// Together with the per-phase pending gauges this shows where a slow startup spends its time.
+struct StartupPhase(Metric<U64Gauge>);
+
+impl StartupPhase {
+    const PHASES: [&'static str; 4] = [
+        "catalog",
+        "table_index_sync",
+        "write_buffer_init",
+        "serving",
+    ];
+
+    fn new(registry: &Registry) -> Self {
+        Self(registry.register_metric::<U64Gauge>(
+            "influxdb3_startup_phase",
+            "1 for the startup phase in progress, 0 for the others",
+        ))
+    }
+
+    fn set(&self, current: &'static str) {
+        for phase in Self::PHASES {
+            self.0
+                .recorder(&[("phase", phase)])
+                .set(u64::from(phase == current));
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
