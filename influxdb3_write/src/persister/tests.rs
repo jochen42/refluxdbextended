@@ -1300,3 +1300,31 @@ async fn load_compaction_snapshots_concurrently_keeps_listing_order() {
         .fetch();
     assert_eq!(pending, 0);
 }
+
+/// A manifest that can't be read must fail the load instead of being skipped: dropping its
+/// `removed_files` makes the compactor re-compact inputs it already replaced.
+#[tokio::test]
+async fn load_compaction_snapshots_fails_on_corrupt_manifest() {
+    let (persister, _) = create_test_persister(0, None);
+    for seq in 0..3 {
+        persister
+            .persist_compaction_snapshot(&format!("{seq:05}"), &create_test_snapshot(seq))
+            .await
+            .unwrap();
+    }
+    let corrupt = CompactionInfoFilePath::new("test_host", "00001");
+    persister
+        .object_store
+        .put(corrupt.as_ref(), "{".into())
+        .await
+        .unwrap();
+
+    let err = persister.load_compaction_snapshots().await.unwrap_err();
+    match err {
+        PersisterError::CompactionManifestLoad { path, source } => {
+            assert_eq!(path, corrupt.to_string());
+            assert!(matches!(*source, PersisterError::SerdeJson(_)), "{source}");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}

@@ -404,15 +404,10 @@ impl WriteBufferImpl {
         // Load compaction manifests and replay them after WAL snapshots so their
         // `removed_files` correctly cancel inputs that the WAL snapshots added.
         // Compaction manifests don't drive WAL/snapshot sequence numbers.
-        match persister.load_compaction_snapshots().await {
-            Ok(compaction_snapshots) => {
-                for snapshot in compaction_snapshots {
-                    persisted_files.add_persisted_snapshot_files(snapshot);
-                }
-            }
-            Err(e) => {
-                warn!(%e, "failed to load compaction manifests at startup");
-            }
+        // Fail startup when any manifest can't be loaded: without its `removed_files`
+        // the compactor re-compacts inputs it already replaced and duplicates rows.
+        for snapshot in persister.load_compaction_snapshots().await? {
+            persisted_files.add_persisted_snapshot_files(snapshot);
         }
 
         // Multi-node: also fold every peer's published WAL snapshots plus

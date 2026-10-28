@@ -81,6 +81,13 @@ pub enum PersisterError {
 
     #[error("failed to parse snapshot sequence number from filename")]
     InvalidSnapshotSequenceNumber,
+
+    #[error("failed to load compaction manifest {path}: {source}")]
+    CompactionManifestLoad {
+        path: String,
+        #[source]
+        source: Box<PersisterError>,
+    },
 }
 
 impl From<PersisterError> for DataFusionError {
@@ -415,11 +422,18 @@ impl Persister {
         let mut fetches = futures_util::stream::iter(metas.into_iter().map(|meta| {
             let object_store = Arc::clone(&self.object_store);
             async move {
-                let bytes = object_store
-                    .get_adaptive(&meta.location, Some(meta.size))
-                    .await?;
-                let snapshot: PersistedSnapshot = serde_json::from_slice(&bytes)?;
-                Ok::<_, PersisterError>(snapshot)
+                let load = async {
+                    let bytes = object_store
+                        .get_adaptive(&meta.location, Some(meta.size))
+                        .await?;
+                    let snapshot: PersistedSnapshot = serde_json::from_slice(&bytes)?;
+                    Ok::<_, PersisterError>(snapshot)
+                };
+                load.await
+                    .map_err(|source| PersisterError::CompactionManifestLoad {
+                        path: meta.location.to_string(),
+                        source: Box::new(source),
+                    })
             }
         }))
         .buffered(self.snapshot_load_concurrency);

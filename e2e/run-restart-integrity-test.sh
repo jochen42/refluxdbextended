@@ -11,10 +11,10 @@
 #   3. Roll compactor → querier → writer onto NEW_IMAGE; after each restart
 #      write a burst, let compaction run, verify.
 #   4. Restart the compactor on NEW_IMAGE once more, burst, verify.
-#   5. Fault: corrupt one manifest, restart the compactor, burst, verify.
-#      Today the compactor then starts without ANY manifest (warn only); this
-#      phase is reported as an expected failure until that is fixed, and does
-#      not fail the run.
+#   5. Fault: corrupt one manifest and restart the compactor. It must exit
+#      and name the manifest instead of starting compaction. Images before the
+#      fail-closed fix (extended-3.9.13-4 and older) start anyway and fail here.
+#   6. Restore the manifest, restart the compactor, burst, verify.
 #
 # Verification compares the querier's per-table count, sum(v), min/max(time)
 # and per-hour counts with what churn wrote, waits for the view to match and
@@ -40,6 +40,7 @@ cd "$(dirname "$0")"
 : "${VERIFY_WAIT_SEC:=180}"
 : "${VERIFY_STABLE_SEC:=60}"
 : "${STARTUP_MAX_SEC:=1800}"
+: "${FAULT_WAIT_SEC:=120}"
 : "${LOG_FILTER:=info}"
 : "${BUCKET:=influxdb3-restart}"
 : "${WRITER_PORT:=18181}"
@@ -161,27 +162,19 @@ restart_role() {
     fi
 }
 
-# phase <name> <expect_fail:0|1>: burst, settle, verify, report row.
+# verify_phase <name>: check the querier against ground truth, add a report row.
 verify_phase() {
-    local name=$1 expect_fail=$2 manifests outcome
+    local name=$1 manifests outcome
     manifests=$(manifest_count)
     log "${name}: verifying (${manifests} manifests)"
     if python3 restart_check.py verify --expected "${EXPECTED}" \
         --querier-url "${QUERIER_URL}" \
         --wait-sec "${VERIFY_WAIT_SEC}" --stable-sec "${VERIFY_STABLE_SEC}" \
         2>&1 | tee "${OUT}/${name}.verify.log"; then
-        if [ "${expect_fail}" = 1 ]; then
-            outcome="pass (expected failure did not occur)"
-        else
-            outcome="pass"
-        fi
+        outcome="pass"
     else
-        if [ "${expect_fail}" = 1 ]; then
-            outcome="FAIL (expected, open fix)"
-        else
-            outcome="**FAIL**"
-            failures=$((failures + 1))
-        fi
+        outcome="**FAIL**"
+        failures=$((failures + 1))
     fi
     echo "| ${name} | $(short "${COMPACTOR_IMAGE}") | $(short "${QUERIER_IMAGE}") | $(short "${WRITER_IMAGE}") | ${manifests} | ${STARTUP_SECS:--} | ${LOAD_LINE:--} | ${outcome} |" >>"${REPORT}"
     log "${name}: ${outcome}"
@@ -214,47 +207,79 @@ while :; do
 done
 sleep "${POST_BURST_SEC}"
 STARTUP_SECS="-" LOAD_LINE="-"
-verify_phase "1-seed" 0
+verify_phase "1-seed"
 
 # --- Phase 2: restart on old image (baseline) ---------------------------------
 restart_role compactor "${OLD_IMAGE}"
 compactor_startup || err "compactor (old) did not start compaction in time"
 burst
-verify_phase "2-compactor-restart-old" 0
+verify_phase "2-compactor-restart-old"
 
 # --- Phase 3: roll onto new image ---------------------------------------------
 restart_role compactor "${NEW_IMAGE}"
 compactor_startup || err "compactor (new) did not start compaction in time"
 burst
-verify_phase "3a-compactor-new" 0
+verify_phase "3a-compactor-new"
 
 STARTUP_SECS="-" LOAD_LINE="-"
 restart_role querier "${NEW_IMAGE}"
 burst
-verify_phase "3b-querier-new" 0
+verify_phase "3b-querier-new"
 
 restart_role writer "${NEW_IMAGE}"
 burst
-verify_phase "3c-writer-new" 0
+verify_phase "3c-writer-new"
 
 # --- Phase 4: restart again on new image --------------------------------------
 restart_role compactor "${NEW_IMAGE}"
 compactor_startup || err "compactor (new) did not start compaction in time"
 burst
-verify_phase "4-compactor-restart-new" 0
+verify_phase "4-compactor-restart-new"
 curl -sf "http://localhost:${COMPACTOR_PORT}/metrics" \
     | grep -E '^influxdb3_(compaction_manifests_load_pending|startup_phase|server_ready)' \
     >"${OUT}/compactor-metrics.txt" || true
 
 # --- Phase 5: corrupt one manifest --------------------------------------------
+# The compactor must refuse to start: running without a manifest's
+# `removed_files` re-compacts inputs it already replaced and duplicates rows.
 victim=$(mc_sh "mc ls --recursive local/${BUCKET}/compactor-1/compactions/" \
     | awk '{print $NF}' | sort | awk '{a[NR]=$0} END {print a[int(NR/2)]}')
+manifest="local/${BUCKET}/compactor-1/compactions/${victim}"
+backup="local/${BUCKET}/restart-test-backup/${victim}"
 log "phase 5: corrupting compactor-1/compactions/${victim}"
-mc_sh "echo '{' | mc pipe local/${BUCKET}/compactor-1/compactions/${victim}" >/dev/null
+mc_sh "mc cp -q ${manifest} ${backup} && echo '{' | mc pipe ${manifest}" >/dev/null
 restart_role compactor "${NEW_IMAGE}"
-compactor_startup || err "compactor did not start compaction after corruption"
+cid=$(compose ps -a -q compactor)
+deadline=$(( $(date +%s) + FAULT_WAIT_SEC ))
+fault_outcome=""
+while [ -z "${fault_outcome}" ]; do
+    if docker logs "${cid}" 2>&1 | grep -q "Starting compaction service"; then
+        fault_outcome="**FAIL** (compactor started despite a corrupt manifest)"
+    elif [ "$(docker inspect -f '{{.State.Running}}' "${cid}")" = false ]; then
+        if docker logs "${cid}" 2>&1 | grep -q "failed to load compaction manifest compactor-1/compactions/${victim}"; then
+            fault_outcome="pass (refused to start, exit $(docker inspect -f '{{.State.ExitCode}}' "${cid}"))"
+        else
+            fault_outcome="**FAIL** (exited without naming the manifest)"
+        fi
+    elif [ "$(date +%s)" -ge "${deadline}" ]; then
+        fault_outcome="**FAIL** (neither started nor exited within ${FAULT_WAIT_SEC}s)"
+    else
+        sleep 1
+    fi
+done
+case "${fault_outcome}" in pass*) ;; *) failures=$((failures + 1)) ;; esac
+LOAD_LINE=$(docker logs "${cid}" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+    | grep -oE 'failed to load compaction manifests?[^"]*' | tail -1 | cut -c1-120 || true)
+echo "| 5-corrupt-manifest | $(short "${COMPACTOR_IMAGE}") | $(short "${QUERIER_IMAGE}") | $(short "${WRITER_IMAGE}") | $(manifest_count) | - | ${LOAD_LINE:-"(no log line)"} | ${fault_outcome} |" >>"${REPORT}"
+log "5-corrupt-manifest: ${fault_outcome}"
+
+# --- Phase 6: restore the manifest --------------------------------------------
+log "phase 6: restoring the manifest"
+mc_sh "mc cp -q ${backup} ${manifest}" >/dev/null
+restart_role compactor "${NEW_IMAGE}"
+compactor_startup || err "compactor did not start compaction after restore"
 burst
-verify_phase "5-corrupt-manifest" 1
+verify_phase "6-manifest-restored"
 
 {
     echo
