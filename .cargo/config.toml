@@ -1,6 +1,11 @@
 # Local development overrides for Linux with lld
 # These flags are commented out by target-env in CI builds
 
+[build]
+# Incremental caches grew target/ past 50 GB and filled the disk; overrides every
+# profile's `incremental` setting. CARGO_INCREMENTAL=1 re-enables it for one run.
+incremental = false
+
 [target.x86_64-unknown-linux-gnu]
 rustflags = [
     "--cfg", "tokio_unstable",
