@@ -262,6 +262,8 @@ async fn write_flush_delete_and_load() {
             Path::from("my_host/wal/00000000002.wal")
         ]
     );
+    let files_pending = metric::U64Gauge::default();
+    files_pending.set(99);
     replay_wal
         .replay(
             None,
@@ -271,6 +273,7 @@ async fn write_flush_delete_and_load() {
             ],
             1,
             false,
+            Some(&files_pending),
         )
         .await
         .unwrap();
@@ -288,6 +291,7 @@ async fn write_flush_delete_and_load() {
         assert_eq!(notified_refs, vec![&file_1_contents, &file_2_contents]);
     }
     assert!(replay_notifier.snapshot_details.lock().is_none());
+    assert_eq!(files_pending.fetch(), 0, "all WAL files replayed");
 
     // create wal file 3, which should trigger a snapshot
     let op3 = WalOp::Write(WriteBatch {
@@ -417,7 +421,13 @@ async fn write_flush_delete_and_load() {
         vec![Path::from("my_host/wal/00000000003.wal")]
     );
     replay_wal
-        .replay(None, &[Path::from("my_host/wal/00000000003.wal")], 1, true)
+        .replay(
+            None,
+            &[Path::from("my_host/wal/00000000003.wal")],
+            1,
+            true,
+            None,
+        )
         .await
         .unwrap();
     let replay_notifier = replay_notifier

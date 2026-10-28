@@ -10,6 +10,7 @@ license.workspace = true
 data_types = { path = "../core/data_types" }
 iox_time = { path = "../core/iox_time" }
 influxdb-line-protocol = { path = "../core/influxdb_line_protocol" }
+metric = { path = "../core/metric" }
 observability_deps = { path = "../core/observability_deps" }
 schema = { path = "../core/schema" }
 
@@ -41,6 +42,5 @@ large-strings = ["influxdb-line-protocol/large-strings"]
 workspace = true
 
 [dev-dependencies]
-metric = { path = "../core/metric" }
 object_store_utils = { path = "../object_store_utils", features = ["test-helpers"] }
 test-log.workspace = true

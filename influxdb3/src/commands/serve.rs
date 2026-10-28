@@ -1124,6 +1124,23 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     // the replacement starts over with an even larger WAL backlog. The
     // probe returns 200 on the health/ping paths and 503 + Retry-After
     // everywhere else until the real server takes the listener over.
+    //
+    // The main registry exists before the probe so the probe can serve
+    // `/metrics` (startup progress gauges) when the real server would serve it
+    // without authorization anyway.
+    let metrics = setup_metric_registry();
+    let metrics_without_authz = config.without_auth
+        || config
+            .disable_authz
+            .unwrap_or_default()
+            .get_mapped_endpoints()
+            .contains(&influxdb3_server::all_paths::API_METRICS);
+    let server_ready = metrics
+        .register_metric::<U64Gauge>(
+            "influxdb3_server_ready",
+            "1 once startup (catalog load, table index sync, WAL replay) is done and the API serves requests, 0 before",
+        )
+        .recorder(&[]);
     let startup_probe = StartupProbe::spawn(
         TcpListener::bind(*config.http_bind_address)
             .await
@@ -1131,6 +1148,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         config.cert_file.as_ref(),
         config.key_file.as_ref(),
         (&config.tls_minimum_version).into(),
+        metrics_without_authz.then(|| Arc::clone(&metrics)),
     )
     .map_err(Error::Server)?;
 
@@ -1150,8 +1168,6 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
 
     // check if any env vars that are deprecated is still being passed around and warn
     warn_use_of_deprecated_env_vars(DEPRECATED_ENV_VARS);
-
-    let metrics = setup_metric_registry();
 
     // Wire the NotFound-tolerant read path's swallow counter to the main
     // registry (the one CommonServerState / query executor expose at /metrics).
@@ -1387,6 +1403,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         node_id.clone(),
         config.retention_check_interval.into(),
         table_index_cache_config,
+        &metrics,
         Arc::clone(&object_store),
         Arc::clone(&catalog),
         Arc::clone(&time_provider) as _,
@@ -1988,6 +2005,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     // Take the listener back from the startup probe — same socket, so the
     // port (including an OS-assigned `:0`) never changes across handover.
     let listener = startup_probe.into_listener().await.map_err(Error::Server)?;
+    server_ready.set(1);
 
     // Only create recovery listener if explicitly enabled
     let admin_token_recovery_listener = if let Some(addr) = config.admin_token_recovery_bind_address
@@ -2273,10 +2291,12 @@ fn determine_package_manager() -> Arc<dyn PythonEnvironmentManager> {
     Arc::new(DisabledManager)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn initialize_table_index_cache(
     node_id: String,
     retention_check_interval: Duration,
     table_index_cache_config: TableIndexCacheConfig,
+    metrics: &metric::Registry,
     object_store: Arc<dyn ObjectStore>,
     catalog: Arc<Catalog>,
     time_provider: Arc<dyn TimeProvider>,
@@ -2287,6 +2307,7 @@ async fn initialize_table_index_cache(
         table_index_cache_config,
         Arc::clone(&object_store),
     );
+    table_index_cache.register_metrics(metrics);
 
     info!(
         node_id = node_id.clone(),

@@ -10,6 +10,7 @@ use futures_util::stream::StreamExt;
 use hashbrown::HashMap;
 use influxdb3_shutdown::{CancellationToken, ShutdownToken};
 use iox_time::TimeProvider;
+use metric::{Registry, U64Gauge};
 use object_store::path::{Path, PathPart};
 use object_store::{ObjectStore, PutPayload};
 use object_store_utils::{PutNonce, SelfVerifyingCreate};
@@ -31,6 +32,7 @@ pub struct CreateWalObjectStoreArgs<'a> {
     pub snapshotted_wal_files_to_keep: u64,
     pub shutdown: ShutdownToken,
     pub wal_replay_concurrency_limit: usize,
+    pub metric_registry: Arc<Registry>,
 }
 
 #[derive(Debug)]
@@ -62,6 +64,7 @@ impl WalObjectStore {
             snapshotted_wal_files_to_keep,
             shutdown,
             wal_replay_concurrency_limit,
+            metric_registry,
         }: CreateWalObjectStoreArgs<'a>,
     ) -> Result<Arc<Self>, crate::Error> {
         let node_identifier = node_identifier_prefix.to_string();
@@ -81,11 +84,18 @@ impl WalObjectStore {
             shutdown.clone_cancellation_token(),
         );
 
+        let files_pending = metric_registry
+            .register_metric::<U64Gauge>(
+                "influxdb3_wal_replay_files_pending",
+                "WAL files not yet replayed by the running startup replay",
+            )
+            .recorder(&[]);
         wal.replay(
             last_wal_sequence_number,
             &all_wal_file_paths,
             wal_replay_concurrency_limit,
             config.wal_replay_fail_on_error,
+            Some(&files_pending),
         )
         .await?;
         let wal = Arc::new(wal);
@@ -145,17 +155,26 @@ impl WalObjectStore {
     }
 
     /// Loads the WAL files in order from object store, calling the file notifier on each one and
-    /// populating the snapshot tracker with the WAL periods.
+    /// populating the snapshot tracker with the WAL periods. `files_pending`, if given, tracks how
+    /// many WAL files are left to replay.
     pub async fn replay(
         &self,
         last_wal_sequence_number: Option<WalFileSequenceNumber>,
         all_wal_file_paths: &[Path],
         concurrency_limit: usize,
         fail_on_error: bool,
+        files_pending: Option<&U64Gauge>,
     ) -> crate::Result<()> {
         let replay_start = Instant::now();
         info!("replaying WAL files");
         let paths = self.load_existing_wal_file_paths(last_wal_sequence_number, all_wal_file_paths);
+        let mut remaining = paths.len();
+        let set_files_pending = |pending: usize| {
+            if let Some(gauge) = files_pending {
+                gauge.set(pending as u64);
+            }
+        };
+        set_files_pending(remaining);
 
         let last_snapshot_sequence_number = {
             self.flush_buffer
@@ -192,6 +211,10 @@ impl WalObjectStore {
             for result in results {
                 use crate::Error;
                 use crate::serialize::Error as SerializeError;
+
+                // counts the file being replayed until the next one starts
+                set_files_pending(remaining);
+                remaining -= 1;
 
                 let wal_contents = match result.await? {
                     (_, Ok(wal_contents)) => wal_contents,
@@ -273,6 +296,7 @@ impl WalObjectStore {
             debug!(time_taken = ?batched_end, batch_len = ?batched.len(), "replaying batch completed");
         }
 
+        set_files_pending(0);
         // this is useful to know at the info level
         info!(time_taken = ?replay_start.elapsed(), "completed replaying wal files");
         Ok(())

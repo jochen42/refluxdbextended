@@ -9,11 +9,16 @@
 //! with 200 keeps the supervisor away; every other request gets a 503
 //! with `Retry-After` so clients know the node exists but is not ready.
 //!
+//! When `/metrics` is served without authorization, the probe serves it too,
+//! so startup progress gauges (table index sync, WAL replay) can be scraped
+//! while the rest of the API is still unavailable.
+//!
 //! Only HTTP/1.1 is spoken here, which is what health probes use. When
 //! TLS is configured the probe terminates it with the same certificate as
 //! the real server and advertises `http/1.1` via ALPN.
 
 use crate::all_paths;
+use metric::Registry;
 use observability_deps::tracing::{debug, info, warn};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -39,6 +44,26 @@ static UNAVAILABLE_RESPONSE: LazyLock<String> = LazyLock::new(|| {
         "server is starting: catalog load / WAL replay in progress\n",
     )
 });
+
+fn metrics_response(registry: &Registry) -> Vec<u8> {
+    let mut body: Vec<u8> = Default::default();
+    let mut reporter = metric_exporters::PrometheusTextEncoder::new(&mut body);
+    registry.report(&mut reporter);
+    // Same OpenMetrics EOF marker as the real `/metrics` handler
+    body.extend_from_slice(b"# EOF\n");
+
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         content-type: text/plain; version=0.0.4; charset=utf-8\r\n\
+         content-length: {}\r\n\
+         connection: close\r\n\
+         \r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&body);
+    response
+}
 
 fn probe_response(status: &str, body: &str) -> String {
     format!(
@@ -66,24 +91,28 @@ pub struct StartupProbe {
 impl StartupProbe {
     /// Start answering probe requests on `listener`. Pass the same cert
     /// and key the real server will use so HTTPS health checks succeed
-    /// during startup too.
+    /// during startup too. Pass `metrics` only when the real server serves
+    /// `/metrics` without authorization; it is then served from that registry.
     pub fn spawn(
         listener: TcpListener,
         cert_file: Option<&PathBuf>,
         key_file: Option<&PathBuf>,
         tls_minimum_version: &[&'static SupportedProtocolVersion],
+        metrics: Option<Arc<Registry>>,
     ) -> Result<Self, crate::Error> {
         let tls_acceptor = match (cert_file, key_file) {
-            (Some(cert_file), Some(key_file)) => {
-                Some(build_tls_acceptor(cert_file, key_file, tls_minimum_version)?)
-            }
+            (Some(cert_file), Some(key_file)) => Some(build_tls_acceptor(
+                cert_file,
+                key_file,
+                tls_minimum_version,
+            )?),
             _ => None,
         };
         if let Ok(addr) = listener.local_addr() {
             info!(address = %addr, "answering health probes while startup completes");
         }
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(accept_loop(listener, tls_acceptor, cancel.clone()));
+        let handle = tokio::spawn(accept_loop(listener, tls_acceptor, metrics, cancel.clone()));
         Ok(Self { cancel, handle })
     }
 
@@ -118,6 +147,7 @@ fn build_tls_acceptor(
 async fn accept_loop(
     listener: TcpListener,
     tls_acceptor: Option<TlsAcceptor>,
+    metrics: Option<Arc<Registry>>,
     cancel: CancellationToken,
 ) -> TcpListener {
     loop {
@@ -127,13 +157,15 @@ async fn accept_loop(
             res = listener.accept() => match res {
                 Ok((stream, remote_addr)) => {
                     let tls_acceptor = tls_acceptor.clone();
+                    let metrics = metrics.clone();
                     tokio::spawn(async move {
                         let answer = async {
                             match tls_acceptor {
                                 Some(acceptor) => {
-                                    answer_probe(acceptor.accept(stream).await?).await
+                                    answer_probe(acceptor.accept(stream).await?, metrics.as_deref())
+                                        .await
                                 }
-                                None => answer_probe(stream).await,
+                                None => answer_probe(stream, metrics.as_deref()).await,
                             }
                         };
                         match tokio::time::timeout(PROBE_CONNECTION_TIMEOUT, answer).await {
@@ -154,7 +186,7 @@ async fn accept_loop(
     }
 }
 
-async fn answer_probe<S>(mut stream: S) -> std::io::Result<()>
+async fn answer_probe<S>(mut stream: S, metrics: Option<&Registry>) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -181,16 +213,15 @@ where
         .next()
         .unwrap_or("");
 
-    let response: &str = if method == "GET"
-        && matches!(
-            path,
-            all_paths::API_V3_HEALTH | all_paths::API_V1_HEALTH | all_paths::API_PING
-        ) {
-        &OK_RESPONSE
-    } else {
-        &UNAVAILABLE_RESPONSE
-    };
-    stream.write_all(response.as_bytes()).await?;
+    match (method, path, metrics) {
+        ("GET", all_paths::API_V3_HEALTH | all_paths::API_V1_HEALTH | all_paths::API_PING, _) => {
+            stream.write_all(OK_RESPONSE.as_bytes()).await?
+        }
+        ("GET", all_paths::API_METRICS, Some(registry)) => {
+            stream.write_all(&metrics_response(registry)).await?
+        }
+        _ => stream.write_all(UNAVAILABLE_RESPONSE.as_bytes()).await?,
+    }
     stream.shutdown().await
 }
 
@@ -212,11 +243,10 @@ mod tests {
     async fn health_paths_return_200_everything_else_503() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let probe = StartupProbe::spawn(listener, None, None, &[]).unwrap();
+        let probe = StartupProbe::spawn(listener, None, None, &[], None).unwrap();
 
         for path in ["/health", "/api/v1/health", "/ping"] {
-            let response =
-                request(addr, &format!("GET {path} HTTP/1.1\r\nhost: x\r\n\r\n")).await;
+            let response = request(addr, &format!("GET {path} HTTP/1.1\r\nhost: x\r\n\r\n")).await;
             assert!(
                 response.starts_with("HTTP/1.1 200 OK"),
                 "{path}: {response}"
@@ -224,7 +254,18 @@ mod tests {
             assert!(response.ends_with("OK"), "{path}: {response}");
         }
 
-        let response = request(addr, "GET /api/v3/query_sql?q=x HTTP/1.1\r\nhost: x\r\n\r\n").await;
+        // `/metrics` stays unavailable when it needs authorization
+        let response = request(addr, "GET /metrics HTTP/1.1\r\nhost: x\r\n\r\n").await;
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{response}"
+        );
+
+        let response = request(
+            addr,
+            "GET /api/v3/query_sql?q=x HTTP/1.1\r\nhost: x\r\n\r\n",
+        )
+        .await;
         assert!(
             response.starts_with("HTTP/1.1 503 Service Unavailable"),
             "{response}"
@@ -239,5 +280,39 @@ mod tests {
         // Handover returns the same socket.
         let listener = probe.into_listener().await.unwrap();
         assert_eq!(listener.local_addr().unwrap(), addr);
+    }
+
+    #[tokio::test]
+    async fn metrics_served_from_registry_when_unauthenticated() {
+        let registry = Arc::new(Registry::default());
+        registry
+            .register_metric::<metric::U64Gauge>("influxdb3_wal_replay_files_pending", "test")
+            .recorder(&[])
+            .set(42);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let probe = StartupProbe::spawn(listener, None, None, &[], Some(registry)).unwrap();
+
+        let response = request(addr, "GET /metrics HTTP/1.1\r\nhost: x\r\n\r\n").await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            response.contains("influxdb3_wal_replay_files_pending 42"),
+            "{response}"
+        );
+        assert!(response.ends_with("# EOF\n"), "{response}");
+
+        // the rest of the API is still unavailable
+        let response = request(
+            addr,
+            "GET /api/v3/query_sql?q=x HTTP/1.1\r\nhost: x\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{response}"
+        );
+
+        probe.into_listener().await.unwrap();
     }
 }

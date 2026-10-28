@@ -475,6 +475,7 @@ impl WriteBufferImpl {
             snapshotted_wal_files_to_keep,
             shutdown,
             wal_replay_concurrency_limit,
+            metric_registry: Arc::clone(&metric_registry),
         })
         .await?;
 

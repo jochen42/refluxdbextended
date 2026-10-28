@@ -7,7 +7,7 @@ use influxdb3_id::{ParquetFileId, SerdeVecMap};
 use influxdb3_shutdown::ShutdownManager;
 use influxdb3_wal::{SnapshotSequenceNumber, WalFileSequenceNumber};
 use iox_time::{MockProvider, Time};
-use metric::Registry;
+use metric::{Attributes, Metric, Registry, U64Gauge};
 use object_store::{ObjectStore, memory::InMemory};
 
 #[tokio::test]
@@ -114,6 +114,7 @@ async fn test_retention_handler_syncs_table_indices_without_policies() {
         TableIndexCacheConfig::default(),
         Arc::clone(&object_store),
     );
+    table_index_cache.register_metrics(&registry);
     // startup with no snapshots yet
     table_index_cache.initialize().await.unwrap();
 
@@ -181,4 +182,17 @@ async fn test_retention_handler_syncs_table_indices_without_policies() {
         .head(TableIndexPath::new("test_host", db_id.get(), table_id.get()).as_ref())
         .await
         .expect("table index should exist after the periodic sync");
+
+    for name in [
+        "influxdb3_table_index_sync_snapshots_pending",
+        "influxdb3_table_index_sync_tables_pending",
+    ] {
+        let pending = registry
+            .get_instrument::<Metric<U64Gauge>>(name)
+            .unwrap()
+            .get_observer(&Attributes::from(&[]))
+            .unwrap()
+            .fetch();
+        assert_eq!(pending, 0, "{name} after the sync completed");
+    }
 }

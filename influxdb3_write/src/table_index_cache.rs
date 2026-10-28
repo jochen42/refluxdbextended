@@ -6,7 +6,7 @@
 use std::{
     collections::BTreeSet,
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -14,6 +14,7 @@ use std::{
 
 use futures::TryStreamExt;
 use hashbrown::{HashMap, HashSet};
+use metric::{Registry, U64Gauge};
 use object_store::{ObjectStore, path::Path as ObjPath};
 use object_store_utils::RetryableObjectStore;
 use observability_deps::tracing::{debug, info, trace, warn};
@@ -268,6 +269,15 @@ struct TableIndexCacheInner {
     indices: RwLock<DbIndicesInner>,
     config: TableIndexCacheConfig,
     object_store: Arc<dyn ObjectStore>,
+    sync_metrics: OnceLock<SyncProgressMetrics>,
+}
+
+/// Progress of a table index sync. At startup the sync blocks WAL replay, so these show how far
+/// a long catch-up has got while the rest of the server is still unavailable.
+#[derive(Debug)]
+struct SyncProgressMetrics {
+    snapshots_pending: U64Gauge,
+    tables_pending: U64Gauge,
 }
 
 /// This data structure contains information about the state of the database index at the time that
@@ -293,7 +303,38 @@ impl TableIndexCache {
                 config,
                 object_store,
                 node_identifier_prefix,
+                sync_metrics: OnceLock::new(),
             }),
+        }
+    }
+
+    /// Register the sync progress gauges. Only the first call has an effect.
+    pub fn register_metrics(&self, registry: &Registry) {
+        self.inner.sync_metrics.get_or_init(|| SyncProgressMetrics {
+            snapshots_pending: registry
+                .register_metric::<U64Gauge>(
+                    "influxdb3_table_index_sync_snapshots_pending",
+                    "persisted snapshots not yet split into table index snapshots by the running sync",
+                )
+                .recorder(&[]),
+            tables_pending: registry
+                .register_metric::<U64Gauge>(
+                    "influxdb3_table_index_sync_tables_pending",
+                    "table indices not yet updated by the running sync",
+                )
+                .recorder(&[]),
+        });
+    }
+
+    fn set_snapshots_pending(&self, pending: usize) {
+        if let Some(metrics) = self.inner.sync_metrics.get() {
+            metrics.snapshots_pending.set(pending as u64);
+        }
+    }
+
+    fn set_tables_pending(&self, pending: usize) {
+        if let Some(metrics) = self.inner.sync_metrics.get() {
+            metrics.tables_pending.set(pending as u64);
         }
     }
 
@@ -449,6 +490,7 @@ impl TableIndexCache {
         let mut processed_count = 0;
         let snapshots_to_process = snapshot_metas.len();
         let large_backlog = snapshots_to_process >= LARGE_SNAPSHOT_BACKLOG;
+        self.set_snapshots_pending(snapshots_to_process);
 
         if large_backlog {
             warn!(
@@ -489,6 +531,7 @@ impl TableIndexCache {
                         "Finished splitting snapshot into table index snapshots",
                     );
                     processed_count += 1;
+                    self.set_snapshots_pending(snapshots_to_process - processed_count);
                     if large_backlog && processed_count % LARGE_SNAPSHOT_BACKLOG == 0 {
                         warn!(
                             snapshots_processed = processed_count,
@@ -1255,11 +1298,13 @@ impl TableIndexCache {
         }
 
         let mut updated_count = 0;
+        self.set_tables_pending(table_index_paths.len());
         while let Some(res) = js.join_next().await {
             match res.map_err(TableIndexCacheError::UpdateTaskFailed)? {
                 Ok(table_id) => {
                     debug!("updated table index for {:?}", table_id);
                     updated_count += 1;
+                    self.set_tables_pending(table_index_paths.len() - updated_count);
                 }
                 Err(e) => return Err(e),
             }
