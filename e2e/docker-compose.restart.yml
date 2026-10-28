@@ -1,0 +1,42 @@
+# Overlay for `run-restart-integrity-test.sh`: per-role images (switched one
+# role at a time during the run) and a compactor that cycles every second so
+# compaction manifests pile up quickly. Delete grace stays at the prod default
+# (10m) so the run exercises the deployed behavior, not the benchmark's 0s.
+#
+# minio/minio and minio/mc are no longer pullable from Docker Hub; the
+# bitnamilegacy build ships the same server plus mc in one image.
+services:
+  minio:
+    image: ${MINIO_IMAGE:-bitnamilegacy/minio:2024.12.18}
+    user: "0"
+    entrypoint: ["minio"]
+    command: ["server", "/data", "--console-address", ":9001"]
+  minio-setup:
+    image: ${MINIO_IMAGE:-bitnamilegacy/minio:2024.12.18}
+    user: "0"
+  writer:
+    image: ${WRITER_IMAGE:-influxdb3-unlocked:e2e}
+  querier:
+    image: ${QUERIER_IMAGE:-influxdb3-unlocked:e2e}
+  compactor:
+    image: ${COMPACTOR_IMAGE:-influxdb3-unlocked:e2e}
+    environment:
+      LOG_FILTER: ${COMPACTOR_LOG_FILTER:-info,influxdb3_write::persister=debug}
+    command:
+      - serve
+      - --object-store=s3
+      - --mode=compactor
+      - --node-id=compactor-1
+      - --gen1-duration=${GEN1:-1m}
+      - --gen2-duration=${GEN2:-1h}
+      - --gen3-duration=${GEN3:-1d}
+      - --gen4-duration=${GEN4:-7d}
+      - --gen5-duration=${GEN5:-30d}
+      - --compaction-interval=${COMPACTION_INTERVAL:-1s}
+      - --min-files-for-compaction=${MIN_FILES:-2}
+      - --max-compaction-files=${MAX_FILES:-100}
+      - --compaction-delete-grace=${DELETE_GRACE:-10m}
+      - --compactor-lease-ttl=30s
+      - --without-auth
+    ports:
+      - "${COMPACTOR_PORT:-18381}:8181"
