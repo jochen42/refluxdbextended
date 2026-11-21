@@ -6,19 +6,21 @@
 //! assert on its exact value. Running this in its own test binary gives it a
 //! fresh process and avoids cross-test interference.
 
-use influxdb3_types::DatabaseName;
 use futures_util::StreamExt;
 use influxdb3_cache::distinct_cache::DistinctCacheProvider;
 use influxdb3_cache::last_cache::LastCacheProvider;
 use influxdb3_catalog::catalog::Catalog;
 use influxdb3_shutdown::ShutdownManager;
+use influxdb3_types::DatabaseName;
 use influxdb3_wal::WalConfig;
 use influxdb3_write::compaction::{CompactionConfig, CompactionService};
 use influxdb3_write::paths::CompactionInfoFilePath;
 use influxdb3_write::persister::Persister;
 use influxdb3_write::write_buffer::persisted_files::PersistedFiles;
 use influxdb3_write::write_buffer::{WriteBufferImpl, WriteBufferImplArgs};
-use influxdb3_write::{Bufferer, PersistedSnapshot, PersistedSnapshotVersion, Precision, WriteBuffer};
+use influxdb3_write::{
+    Bufferer, PersistedSnapshot, PersistedSnapshotVersion, Precision, WriteBuffer,
+};
 use iox_query::exec::Executor;
 use iox_time::MockProvider;
 use metric::Registry;
@@ -32,9 +34,8 @@ use std::time::Duration;
 #[tokio::test]
 async fn compaction_publishes_and_replaces_files() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let time_provider: Arc<dyn iox_time::TimeProvider> = Arc::new(MockProvider::new(
-        iox_time::Time::from_timestamp_nanos(0),
-    ));
+    let time_provider: Arc<dyn iox_time::TimeProvider> =
+        Arc::new(MockProvider::new(iox_time::Time::from_timestamp_nanos(0)));
     let catalog = Arc::new(
         Catalog::new(
             "test-host",
@@ -54,12 +55,10 @@ async fn compaction_publishes_and_replaces_files() {
     let last_cache = LastCacheProvider::new_from_catalog(Arc::clone(&catalog))
         .await
         .unwrap();
-    let distinct_cache = DistinctCacheProvider::new_from_catalog(
-        Arc::clone(&time_provider),
-        Arc::clone(&catalog),
-    )
-    .await
-    .unwrap();
+    let distinct_cache =
+        DistinctCacheProvider::new_from_catalog(Arc::clone(&time_provider), Arc::clone(&catalog))
+            .await
+            .unwrap();
     let metric_registry = Arc::new(Registry::default());
     let write_buffer = WriteBufferImpl::new(WriteBufferImplArgs {
         persister: Arc::clone(&persister),
@@ -192,8 +191,7 @@ async fn compaction_publishes_and_replaces_files() {
     );
 
     let after = write_buffer.persisted_files().get_files(db_id, table_id);
-    let after_paths: std::collections::HashSet<_> =
-        after.iter().map(|f| f.path.clone()).collect();
+    let after_paths: std::collections::HashSet<_> = after.iter().map(|f| f.path.clone()).collect();
     assert!(
         after_paths.contains(&result.compacted_files[0].path),
         "compacted file not in PersistedFiles"

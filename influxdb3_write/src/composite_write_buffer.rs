@@ -14,13 +14,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use influxdb3_types::DatabaseName;
 use datafusion::catalog::Session;
 use datafusion::common::DataFusionError;
 use influxdb3_cache::distinct_cache::DistinctCacheProvider;
 use influxdb3_cache::last_cache::LastCacheProvider;
 use influxdb3_catalog::catalog::{Catalog, DatabaseSchema, TableDefinition};
 use influxdb3_id::{DbId, TableId};
+use influxdb3_types::DatabaseName;
 use influxdb3_wal::Wal;
 use iox_query::QueryChunk;
 use iox_time::Time;
@@ -67,7 +67,14 @@ impl Bufferer for CompositeWriteBuffer {
         no_sync: bool,
     ) -> crate::write_buffer::Result<BufferedWriteRequest> {
         self.local
-            .write_lp(database, lp, ingest_time, accept_partial, precision, no_sync)
+            .write_lp(
+                database,
+                lp,
+                ingest_time,
+                accept_partial,
+                precision,
+                no_sync,
+            )
             .await
     }
 

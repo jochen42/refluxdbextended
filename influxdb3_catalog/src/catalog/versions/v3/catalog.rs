@@ -437,8 +437,7 @@ impl Catalog {
     /// Default duration used to resolve hard-delete time when a constructor
     /// caller doesn't supply an explicit value.
     // Fork default: 10 years, effectively infinite (upstream: 72 hours).
-    pub const DEFAULT_HARD_DELETE_DURATION: Duration =
-        Duration::from_secs(10 * 365 * 24 * 60 * 60);
+    pub const DEFAULT_HARD_DELETE_DURATION: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
     /// Construct a `Catalog` for Core. `node_id` is used as both the object-store
     /// prefix and the current node identifier.
@@ -2942,7 +2941,11 @@ impl Catalog {
         level: u8,
         duration: Duration,
     ) -> Result<()> {
-        info!(level, duration_ns = duration.as_nanos(), "set generation duration");
+        info!(
+            level,
+            duration_ns = duration.as_nanos(),
+            "set generation duration"
+        );
         self.update::<SetGenerationDurationOp>(SetGenerationDurationArgs { level, duration })
             .await
     }

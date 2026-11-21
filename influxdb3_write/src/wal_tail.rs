@@ -218,11 +218,8 @@ impl WalTailBuffer {
                 .get(writer_id)
                 .copied()
                 .unwrap_or(0);
-            let paths = load_all_wal_file_paths(
-                Arc::clone(&self.object_store),
-                writer_id.clone(),
-            )
-            .await?;
+            let paths =
+                load_all_wal_file_paths(Arc::clone(&self.object_store), writer_id.clone()).await?;
             for path in paths {
                 let Some(seq) = parse_wal_seq(&path) else {
                     continue;
@@ -299,9 +296,7 @@ impl WalTailBuffer {
                 }
                 let partitioned = table_buffer
                     .partitioned_record_batches(Arc::clone(&table_def), filter)
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!("wal tail batches: {e}"))
-                    })?;
+                    .map_err(|e| DataFusionError::Execution(format!("wal tail batches: {e}")))?;
                 for (chunk_time, buffered) in partitioned {
                     // Frozen (snapshotting) batches before live ones, matching
                     // the writer's rank: a later overwrite in the live part must
@@ -336,9 +331,7 @@ impl WalTailBuffer {
             // emitting per-file batches. Coalescing to one chunk alone was not
             // enough.
             let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("wal tail concat: {e}"))
-                })?;
+                .map_err(|e| DataFusionError::Execution(format!("wal tail concat: {e}")))?;
             let row_count = batch.num_rows();
             let stats = create_chunk_statistics(
                 Some(row_count),
@@ -425,11 +418,7 @@ mod tests {
 
     /// Build a tail buffer with `n_files` WAL files, each replaying `op`, under a
     /// single writer.
-    fn tail_with_n_files(
-        catalog: &Arc<Catalog>,
-        op: &WalOp,
-        n_files: u64,
-    ) -> Arc<WalTailBuffer> {
+    fn tail_with_n_files(catalog: &Arc<Catalog>, op: &WalOp, n_files: u64) -> Arc<WalTailBuffer> {
         let buf = WalTailBuffer::new(
             Arc::new(InMemory::new()),
             Arc::clone(catalog),
@@ -575,12 +564,7 @@ mod tests {
         let c = one
             .get_table_chunks(Arc::clone(&db_schema), Arc::clone(&table_def), &filter, 0)
             .unwrap();
-        let rb = c[0]
-            .as_any()
-            .downcast_ref::<BufferChunk>()
-            .unwrap()
-            .batches[0]
-            .clone();
+        let rb = c[0].as_any().downcast_ref::<BufferChunk>().unwrap().batches[0].clone();
 
         let executor = Executor::new_testing();
         let sort_key = SortKeyBuilder::with_capacity(2)
@@ -605,10 +589,9 @@ mod tests {
                 let ctx = executor.new_context();
                 let physical = ctx.create_physical_plan(&plan).await.unwrap();
                 let start = std::time::Instant::now();
-                let batches =
-                    datafusion::physical_plan::collect(physical, ctx.inner().task_ctx())
-                        .await
-                        .unwrap();
+                let batches = datafusion::physical_plan::collect(physical, ctx.inner().task_ctx())
+                    .await
+                    .unwrap();
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 (start.elapsed(), rows)
             }
@@ -618,8 +601,9 @@ mod tests {
         println!("----+------------------+---------------------+--------");
         for n in [100usize, 500, 1000, 2000] {
             // Naive = the old fan-out: one chunk per file, each a 1-row batch.
-            let naive: Vec<Arc<dyn QueryChunk>> =
-                (0..n).map(|_| buffer_chunk(vec![rb.clone()], &influx_schema)).collect();
+            let naive: Vec<Arc<dyn QueryChunk>> = (0..n)
+                .map(|_| buffer_chunk(vec![rb.clone()], &influx_schema))
+                .collect();
             // Coalesced = the REAL get_table_chunks output for an n-file tail
             // (one chunk, batches concatenated).
             let tail_n = tail_with_n_files(&catalog, &WalOp::Write(batch.clone()), n as u64);

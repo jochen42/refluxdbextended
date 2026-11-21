@@ -3,12 +3,11 @@ use crate::persister::Persister;
 use crate::shared_inventory::SharedInventory;
 use crate::write_buffer::persisted_files::PersistedFiles;
 use crate::{DatabaseTables, ParquetFile, ParquetFileId, PersistedSnapshot, WriteBuffer};
-use bytes::Bytes;
-use futures_util::StreamExt;
-use object_store::{PutMode, PutOptions};
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use datafusion_util::stream_from_batches;
+use futures_util::StreamExt;
 use influxdb3_catalog::catalog::Catalog;
 use influxdb3_id::{DbId, SerdeVecMap, TableId};
 use influxdb3_wal::{SnapshotSequenceNumber, WalFileSequenceNumber};
@@ -16,6 +15,7 @@ use iox_query::exec::Executor;
 use iox_query::frontend::reorg::ReorgPlanner;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjPath;
+use object_store::{PutMode, PutOptions};
 use observability_deps::tracing::{debug, error, info, warn};
 use schema::Schema;
 use schema::sort::SortKey;
@@ -600,7 +600,9 @@ impl CompactionService {
                     }
                 }
             }
-            Err(e) => warn!(%e, "checkpoint: failed to load live WAL manifests for survivor tombstones"),
+            Err(e) => {
+                warn!(%e, "checkpoint: failed to load live WAL manifests for survivor tombstones")
+            }
         }
         drop(merged_paths);
         // Only tombstone candidates CONFIRMED MISSING from object store; a
@@ -637,9 +639,7 @@ impl CompactionService {
         // Each candidate is gated by `cold_gc_should_delete` against `merged`
         // (live set) + physical age; gen1-only, bounded per run. Off unless
         // `cold_gc_enabled` and a window is set.
-        if self.config.cold_gc_enabled
-            && !self.config.keep_generations_trailing_window.is_zero()
-        {
+        if self.config.cold_gc_enabled && !self.config.keep_generations_trailing_window.is_zero() {
             let live: std::collections::HashSet<&str> = merged
                 .databases
                 .iter()
@@ -650,7 +650,10 @@ impl CompactionService {
             let prefixes: std::collections::HashSet<String> = live
                 .iter()
                 .filter_map(|p| {
-                    p.split('/').next().filter(|s| !s.is_empty()).map(str::to_string)
+                    p.split('/')
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
                 })
                 .collect();
             let cutoff_ms = self.time_provider.now().timestamp_millis()
@@ -871,10 +874,7 @@ impl CompactionService {
     /// If the process crashes before step 3 finishes, the inputs remain referenced and
     /// the compaction is a no-op on the next run. If it crashes between step 3 and 5,
     /// the inputs become orphaned objects but no data is lost.
-    pub async fn execute_compaction_job(
-        &self,
-        job: CompactionJob,
-    ) -> Result<CompactionResult> {
+    pub async fn execute_compaction_job(&self, job: CompactionJob) -> Result<CompactionResult> {
         info!(
             "Starting compaction job: db={}, table={}, gen{}->gen{}, inputs={}",
             job.database_name,
@@ -1138,11 +1138,7 @@ impl CompactionService {
                 for file in new_files {
                     persisted_files.add_persisted_file(&job.database_id, &job.table_id, file);
                 }
-                persisted_files.remove_persisted_files(
-                    &job.database_id,
-                    &job.table_id,
-                    old_files,
-                );
+                persisted_files.remove_persisted_files(&job.database_id, &job.table_id, old_files);
             }
             Err(_) => {
                 warn!(
@@ -1181,8 +1177,10 @@ impl CompactionService {
         // Wall-clock at publish; the cold gate keeps inputs `keep_window` past this.
         let publish_ms = self.time_provider.now().timestamp_millis();
         let compaction_id = compaction_id.to_string();
-        let old_paths: Vec<ObjPath> =
-            old_files.iter().map(|f| ObjPath::from(f.path.as_ref())).collect();
+        let old_paths: Vec<ObjPath> = old_files
+            .iter()
+            .map(|f| ObjPath::from(f.path.as_ref()))
+            .collect();
         let object_store = Arc::clone(&self.object_store);
         let deletes = self.metrics.input_deletes.clone();
         // Retained-overhang gauges: how much gen{N-1} the cold-gate is holding.
@@ -1204,7 +1202,10 @@ impl CompactionService {
                 loop {
                     let now_ms = time_provider.now().timestamp_millis();
                     let ttl_ms = cfg.staleness_ttl.as_millis() as i64;
-                    match inv.all_live_consumers_folded(&compaction_id, now_ms, ttl_ms).await {
+                    match inv
+                        .all_live_consumers_folded(&compaction_id, now_ms, ttl_ms)
+                        .await
+                    {
                         Ok(true) => break,
                         Ok(false) => {}
                         Err(e) => warn!("convergence gate check failed: {e}"),
@@ -1313,11 +1314,7 @@ impl CompactionService {
         }
     }
 
-    fn can_compact_to_generation(
-        &self,
-        files: &[ParquetFile],
-        target_duration: Duration,
-    ) -> bool {
+    fn can_compact_to_generation(&self, files: &[ParquetFile], target_duration: Duration) -> bool {
         if files.len() < self.config.min_files_for_compaction {
             return false;
         }
@@ -1398,8 +1395,8 @@ impl CompactionService {
                         }
                         Err(e) => return Err(e).context("get existing claim"),
                     };
-                    let existing: ClaimBody = serde_json::from_slice(&bytes)
-                        .context("parse existing claim body")?;
+                    let existing: ClaimBody =
+                        serde_json::from_slice(&bytes).context("parse existing claim body")?;
                     let age_ms = (now_ms - existing.acquired_at_unix_ms).max(0) as u128;
                     if age_ms < self.config.claim_ttl.as_millis() {
                         return Ok(false);
@@ -1575,7 +1572,10 @@ mod tests {
         // publish_compaction must skip the in-process delete task.
         assert!(defer_deletion_to_cold_gc(true, Duration::from_secs(86_400)));
         // cold-GC disabled: in-process task is the only deleter — must run.
-        assert!(!defer_deletion_to_cold_gc(false, Duration::from_secs(86_400)));
+        assert!(!defer_deletion_to_cold_gc(
+            false,
+            Duration::from_secs(86_400)
+        ));
         // window zero: cold-GC sweep is gated off, in-process task deletes
         // immediately after grace+convergence — must run.
         assert!(!defer_deletion_to_cold_gc(true, Duration::ZERO));
@@ -1644,7 +1644,10 @@ mod tests {
 
         let (min_time, max_time, rows) = batches_time_range_and_rows(&[batch]).unwrap();
         assert_eq!(min_time, 0, "min must be the global min, not the first row");
-        assert_eq!(max_time, 100, "max must be the global max, not the last row");
+        assert_eq!(
+            max_time, 100,
+            "max must be the global max, not the last row"
+        );
         assert_eq!(rows, 6);
     }
 
@@ -1664,9 +1667,9 @@ mod tests {
     async fn per_table_claim_blocks_concurrent_worker() {
         use crate::leases::LeaseConfig;
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let time_provider: Arc<dyn iox_time::TimeProvider> = Arc::new(
-            iox_time::MockProvider::new(iox_time::Time::from_timestamp_nanos(0)),
-        );
+        let time_provider: Arc<dyn iox_time::TimeProvider> = Arc::new(iox_time::MockProvider::new(
+            iox_time::Time::from_timestamp_nanos(0),
+        ));
         let path = ObjPath::from("_compactor/claims/1-1-gen1-to-gen2.claim");
 
         // Two minimal services sharing the same store. We don't actually run
@@ -1702,9 +1705,8 @@ mod tests {
         let _ = (Arc::clone(&store), Arc::clone(&time_provider));
         // Minimal catalog/persister/executor stubs. The fields we exercise in
         // `acquire_claim` are only `object_store`, `time_provider`, `config`.
-        let catalog = futures::executor::block_on(async {
-            Catalog::new_in_memory("test").await.unwrap()
-        });
+        let catalog =
+            futures::executor::block_on(async { Catalog::new_in_memory("test").await.unwrap() });
         let persister = Arc::new(crate::persister::Persister::new(
             Arc::clone(&store),
             "test-host",
@@ -1713,11 +1715,10 @@ mod tests {
         ));
         // We need a WriteBuffer; reuse the catalog/persister with a no-op
         // write buffer.  The test doesn't call methods that touch it.
-        let last_cache =
-            futures::executor::block_on(influxdb3_cache::last_cache::LastCacheProvider::new_from_catalog(
-                Arc::clone(&catalog),
-            ))
-            .unwrap();
+        let last_cache = futures::executor::block_on(
+            influxdb3_cache::last_cache::LastCacheProvider::new_from_catalog(Arc::clone(&catalog)),
+        )
+        .unwrap();
         let distinct_cache = futures::executor::block_on(
             influxdb3_cache::distinct_cache::DistinctCacheProvider::new_from_catalog(
                 Arc::clone(&time_provider),
@@ -1725,8 +1726,8 @@ mod tests {
             ),
         )
         .unwrap();
-        let wb = futures::executor::block_on(
-            crate::write_buffer::WriteBufferImpl::new(crate::write_buffer::WriteBufferImplArgs {
+        let wb = futures::executor::block_on(crate::write_buffer::WriteBufferImpl::new(
+            crate::write_buffer::WriteBufferImplArgs {
                 persister: Arc::clone(&persister),
                 catalog: Arc::clone(&catalog),
                 last_cache,
@@ -1743,8 +1744,8 @@ mod tests {
                 wal_replay_concurrency_limit: 1,
                 parquet_snapshot_concurrency_limit: std::num::NonZeroUsize::new(1).unwrap(),
                 shared_inventory: None,
-            }),
-        )
+            },
+        ))
         .unwrap();
         CompactionService::new(
             CompactionConfig {

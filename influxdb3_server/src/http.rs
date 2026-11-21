@@ -1229,8 +1229,12 @@ impl HttpApi {
 
     async fn write_lp_inner(&self, params: WriteParams, req: Request) -> Result<Response> {
         validate_db_name(&params.db)?;
-        self.authorize_database(request_token_id(&req), &params.db, DatabaseActions::from(DatabaseActions::WRITE))
-            .await?;
+        self.authorize_database(
+            request_token_id(&req),
+            &params.db,
+            DatabaseActions::from(DatabaseActions::WRITE),
+        )
+        .await?;
         // DatabaseName contains additional validation; do it early
         let database = DatabaseName::new(params.db)?;
         let body = self.read_body(req).await?;
@@ -1353,8 +1357,12 @@ impl HttpApi {
             format,
             params,
         } = self.extract_query_request::<String>(req).await?;
-        self.authorize_database(token_id, &database, DatabaseActions::from(DatabaseActions::READ))
-            .await?;
+        self.authorize_database(
+            token_id,
+            &database,
+            DatabaseActions::from(DatabaseActions::READ),
+        )
+        .await?;
 
         info!(%database, %query_str, ?format, "handling query_sql");
 
@@ -1645,7 +1653,10 @@ impl HttpApi {
             None => {
                 self.authorize_access(
                     token_id,
-                    AccessRequest::MaybeDatabase(None, DatabaseActions::from(DatabaseActions::READ)),
+                    AccessRequest::MaybeDatabase(
+                        None,
+                        DatabaseActions::from(DatabaseActions::READ),
+                    ),
                 )
                 .await?
             }

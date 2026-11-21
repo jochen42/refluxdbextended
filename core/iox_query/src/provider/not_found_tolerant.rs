@@ -28,9 +28,11 @@ use datafusion::datasource::physical_plan::{
 };
 use datafusion::datasource::table_schema::TableSchema;
 use datafusion::physical_expr::projection::ProjectionExprs;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalSortExpr};
-use datafusion::physical_plan::SortOrderPushdownResult;
+use datafusion::physical_expr::{
+    EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalSortExpr,
+};
 use datafusion::physical_plan::DisplayFormatType;
+use datafusion::physical_plan::SortOrderPushdownResult;
 use datafusion::physical_plan::filter_pushdown::FilterPushdownPropagation;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::{FutureExt, StreamExt};
@@ -311,17 +313,15 @@ impl FileSource for NotFoundTolerantSource {
         order: &[PhysicalSortExpr],
         eq_properties: &EquivalenceProperties,
     ) -> Result<SortOrderPushdownResult<Arc<dyn FileSource>>> {
-        Ok(
-            match self.inner.try_reverse_output(order, eq_properties)? {
-                SortOrderPushdownResult::Exact { inner } => SortOrderPushdownResult::Exact {
-                    inner: Self::rewrap(inner),
-                },
-                SortOrderPushdownResult::Inexact { inner } => SortOrderPushdownResult::Inexact {
-                    inner: Self::rewrap(inner),
-                },
-                SortOrderPushdownResult::Unsupported => SortOrderPushdownResult::Unsupported,
+        Ok(match self.inner.try_reverse_output(order, eq_properties)? {
+            SortOrderPushdownResult::Exact { inner } => SortOrderPushdownResult::Exact {
+                inner: Self::rewrap(inner),
             },
-        )
+            SortOrderPushdownResult::Inexact { inner } => SortOrderPushdownResult::Inexact {
+                inner: Self::rewrap(inner),
+            },
+            SortOrderPushdownResult::Unsupported => SortOrderPushdownResult::Unsupported,
+        })
     }
 
     fn try_pushdown_projection(
@@ -345,7 +345,8 @@ mod tests {
     fn optimizer_helpers_see_through_wrapper() {
         let table_schema = TableSchema::new(Arc::new(arrow::datatypes::Schema::empty()), vec![]);
         let parquet: Arc<dyn FileSource> = Arc::new(
-            ParquetSource::new(table_schema).with_table_parquet_options(TableParquetOptions::default()),
+            ParquetSource::new(table_schema)
+                .with_table_parquet_options(TableParquetOptions::default()),
         );
         let wrapped: Arc<dyn FileSource> =
             Arc::new(NotFoundTolerantSource::new(Arc::clone(&parquet)));

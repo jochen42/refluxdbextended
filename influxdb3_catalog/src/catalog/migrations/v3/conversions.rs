@@ -297,13 +297,21 @@ fn remap_bits(bits: u16, mapping: &[(u16, u16)]) -> u16 {
 
 pub(crate) fn remap_fork_database_actions(bits: u16) -> u16 {
     use influxdb3_authz::DatabaseActions as A;
-    remap_bits(bits, &[(1, A::READ), (1 << 1, A::WRITE), (1 << 2, A::CREATE)])
+    remap_bits(
+        bits,
+        &[(1, A::READ), (1 << 1, A::WRITE), (1 << 2, A::CREATE)],
+    )
 }
 
 pub(crate) fn remap_fork_crud_actions(bits: u16) -> u16 {
     use influxdb3_authz::CrudActions as A;
     remap_bits(
         bits,
-        &[(1, A::READ), (1 << 1, A::UPDATE), (1 << 2, A::CREATE), (1 << 3, A::DELETE)],
+        &[
+            (1, A::READ),
+            (1 << 1, A::UPDATE),
+            (1 << 2, A::CREATE),
+            (1 << 3, A::DELETE),
+        ],
     )
 }

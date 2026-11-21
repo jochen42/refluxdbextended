@@ -296,11 +296,15 @@ async fn tick(
             let after_seq = catalog.sequence_number().get();
             if after_seq != before_seq {
                 observability_deps::tracing::info!(
-                    before_seq, after_seq,
+                    before_seq,
+                    after_seq,
                     "inventory poller advanced catalog"
                 );
             } else {
-                debug!(seq = before_seq, "inventory poller catalog tick (no advance)");
+                debug!(
+                    seq = before_seq,
+                    "inventory poller catalog tick (no advance)"
+                );
             }
         }
         Err(e) => warn!("catalog refresh failed during inventory poll: {}", e),
@@ -403,9 +407,7 @@ mod tests {
         let object_store = Arc::new(InMemory::new());
         let inv = SharedInventory::new(object_store.clone());
         let persisted = Arc::new(PersistedFiles::new(None));
-        let catalog = Arc::new(
-            Catalog::new_in_memory("test").await.unwrap(),
-        );
+        let catalog = Arc::new(Catalog::new_in_memory("test").await.unwrap());
 
         // initial: write one snapshot before poller starts
         inv.publish_wal_snapshot("writer-1", &snap("writer-1", 1, "a/1.parquet"))
@@ -413,25 +415,46 @@ mod tests {
             .unwrap();
         let mut wal_cursors: HashMap<String, u64> = HashMap::new();
         let mut comp_cursor: Option<String> = None;
-        let n = tick(&inv, &persisted, &catalog, &mut wal_cursors, &mut comp_cursor, None)
-            .await
-            .unwrap();
+        let n = tick(
+            &inv,
+            &persisted,
+            &catalog,
+            &mut wal_cursors,
+            &mut comp_cursor,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(n.total(), 1);
         assert_eq!(wal_cursors.get("writer-1"), Some(&1));
 
         // empty tick: nothing new
-        let n = tick(&inv, &persisted, &catalog, &mut wal_cursors, &mut comp_cursor, None)
-            .await
-            .unwrap();
+        let n = tick(
+            &inv,
+            &persisted,
+            &catalog,
+            &mut wal_cursors,
+            &mut comp_cursor,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(n.total(), 0);
 
         // publish another, tick picks it up
         inv.publish_wal_snapshot("writer-1", &snap("writer-1", 2, "a/2.parquet"))
             .await
             .unwrap();
-        let n = tick(&inv, &persisted, &catalog, &mut wal_cursors, &mut comp_cursor, None)
-            .await
-            .unwrap();
+        let n = tick(
+            &inv,
+            &persisted,
+            &catalog,
+            &mut wal_cursors,
+            &mut comp_cursor,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(n.total(), 1);
         assert_eq!(n.wal_snapshots, 1);
         assert_eq!(wal_cursors.get("writer-1"), Some(&2));
@@ -449,9 +472,7 @@ mod tests {
         let object_store = Arc::new(InMemory::new());
         let inv = SharedInventory::new(object_store.clone());
         let persisted = Arc::new(PersistedFiles::new(None));
-        let catalog = Arc::new(
-            Catalog::new_in_memory("test").await.unwrap(),
-        );
+        let catalog = Arc::new(Catalog::new_in_memory("test").await.unwrap());
 
         let shutdown_mgr = ShutdownManager::new_testing();
         let token = shutdown_mgr.register("test");

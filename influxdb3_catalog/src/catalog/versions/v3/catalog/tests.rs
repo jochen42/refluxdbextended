@@ -3919,13 +3919,19 @@ mod cluster_config {
             .set_generation_duration(5, Duration::from_secs(30 * day))
             .await
             .unwrap_err();
-        assert!(matches!(&err, CatalogError::NoCatalogChange { .. }), "got {err:?}");
+        assert!(
+            matches!(&err, CatalogError::NoCatalogChange { .. }),
+            "got {err:?}"
+        );
         let err = catalog
             .set_generation_duration(5, Duration::from_secs(90 * day))
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, CatalogError::CannotChangeGenerationDuration { level: 5, .. }),
+            matches!(
+                &err,
+                CatalogError::CannotChangeGenerationDuration { level: 5, .. }
+            ),
             "got {err:?}"
         );
     }

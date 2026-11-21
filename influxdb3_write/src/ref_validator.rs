@@ -398,7 +398,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert!(flipped, "readiness flag should flip after the boot-time pass");
+        assert!(
+            flipped,
+            "readiness flag should flip after the boot-time pass"
+        );
 
         shutdown_mgr.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;

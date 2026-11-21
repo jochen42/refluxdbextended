@@ -37,13 +37,13 @@ use crate::log::versions::v4::{
     TriggerSettings, TriggerSpecificationDefinition,
 };
 use crate::snapshot::versions::v4::{
-    ActionsSnapshot, CatalogSnapshot, ColumnDefinitionSnapshot, ColumnSetSnapshot, CrudActionsSnapshot,
-    DatabaseActionsSnapshot, DatabaseSnapshot, DistinctCacheSnapshot, FieldColumnSnapshot,
-    FieldDataType, FieldFamilySnapshot, GenerationConfigSnapshot, LastCacheSnapshot, NodeSnapshot,
-    NodeStateSnapshot, PermissionSnapshot, ProcessingEngineTriggerSnapshot, RepositorySnapshot,
-    ResourceIdentifierSnapshot, ResourceTypeSnapshot, RetentionPeriodSnapshot,
-    SystemActionsSnapshot, TableSnapshot, TagColumnSnapshot, TimestampColumnSnapshot,
-    TokenInfoSnapshot,
+    ActionsSnapshot, CatalogSnapshot, ColumnDefinitionSnapshot, ColumnSetSnapshot,
+    CrudActionsSnapshot, DatabaseActionsSnapshot, DatabaseSnapshot, DistinctCacheSnapshot,
+    FieldColumnSnapshot, FieldDataType, FieldFamilySnapshot, GenerationConfigSnapshot,
+    LastCacheSnapshot, NodeSnapshot, NodeStateSnapshot, PermissionSnapshot,
+    ProcessingEngineTriggerSnapshot, RepositorySnapshot, ResourceIdentifierSnapshot,
+    ResourceTypeSnapshot, RetentionPeriodSnapshot, SystemActionsSnapshot, TableSnapshot,
+    TagColumnSnapshot, TimestampColumnSnapshot, TokenInfoSnapshot,
 };
 use crate::{catalog::CatalogSequenceNumber, format::RecordId};
 
@@ -1287,7 +1287,9 @@ fn resource_scoped_token_emits_create_resource_scoped_token() {
     // 0b11 is the fork's v2 READ|WRITE; v3 records use upstream's bits.
     assert_eq!(
         perm.actions,
-        WireActions::Database(influxdb3_authz::DatabaseActions::READ | influxdb3_authz::DatabaseActions::WRITE)
+        WireActions::Database(
+            influxdb3_authz::DatabaseActions::READ | influxdb3_authz::DatabaseActions::WRITE
+        )
     );
     assert!(perm.resource_names.is_empty());
 }
@@ -1326,7 +1328,11 @@ fn fork_read_only_token_stays_read_only() {
     let batch = synthesize_records(&snap);
     let token = CreateResourceScopedToken::decode(&batch.as_slice()[0].data)
         .expect("decode CreateResourceScopedToken");
-    let actions: Vec<_> = token.permissions.iter().map(|p| p.actions.clone()).collect();
+    let actions: Vec<_> = token
+        .permissions
+        .iter()
+        .map(|p| p.actions.clone())
+        .collect();
     assert_eq!(
         actions,
         vec![

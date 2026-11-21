@@ -40,9 +40,9 @@ use influxdb3_processing_engine_telemetry::{
 };
 use influxdb3_query_executor::{CreateQueryExecutorArgs, QueryExecutorImpl};
 use influxdb3_server::http::HttpApi;
-use influxdb3_server::startup_probe::StartupProbe;
 #[cfg(all(unix, feature = "operator_socket"))]
 use influxdb3_server::http::route_operator_request;
+use influxdb3_server::startup_probe::StartupProbe;
 use influxdb3_server::{
     CommonServerState, CreateServerArgs, Server, serve, serve_admin_token_recovery_endpoint,
 };
@@ -424,38 +424,22 @@ pub struct Config {
 
     /// Duration for generation 2 files (compacted from gen1 files). 1h, 6h, 12h, 1d, 7d, 30d are supported.
     /// These files are created by compacting multiple gen1 files together for better query performance.
-    #[clap(
-        long = "gen2-duration",
-        env = "INFLUXDB3_GEN2_DURATION",
-        action
-    )]
+    #[clap(long = "gen2-duration", env = "INFLUXDB3_GEN2_DURATION", action)]
     pub gen2_duration: Option<Gen1Duration>,
 
     /// Duration for generation 3 files (compacted from gen2 files). 1d, 7d, 30d, 90d are supported.
     /// These files are created by compacting multiple gen2 files together for long-term storage optimization.
-    #[clap(
-        long = "gen3-duration",
-        env = "INFLUXDB3_GEN3_DURATION",
-        action
-    )]
+    #[clap(long = "gen3-duration", env = "INFLUXDB3_GEN3_DURATION", action)]
     pub gen3_duration: Option<Gen1Duration>,
 
     /// Duration for generation 4 files (compacted from gen3 files). 7d, 30d, 90d, 365d are supported.
     /// These files are created by compacting multiple gen3 files together for archival storage.
-    #[clap(
-        long = "gen4-duration",
-        env = "INFLUXDB3_GEN4_DURATION",
-        action
-    )]
+    #[clap(long = "gen4-duration", env = "INFLUXDB3_GEN4_DURATION", action)]
     pub gen4_duration: Option<Gen1Duration>,
 
     /// Duration for generation 5 files (compacted from gen4 files). 30d, 90d, 365d are supported.
     /// These files are created by compacting multiple gen4 files together for long-term archival.
-    #[clap(
-        long = "gen5-duration",
-        env = "INFLUXDB3_GEN5_DURATION",
-        action
-    )]
+    #[clap(long = "gen5-duration", env = "INFLUXDB3_GEN5_DURATION", action)]
     pub gen5_duration: Option<Gen1Duration>,
 
     /// Enable automatic background compaction. When enabled, the system will automatically
@@ -1465,7 +1449,6 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
         );
     }
 
-
     // Wire the NotFound-tolerant read path's swallow counter to the main
     // registry (the one CommonServerState / query executor expose at /metrics).
     // Built deep in the DataFusion planner with no registry in scope, so it
@@ -2074,22 +2057,19 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
     // live cursors here and the compactor stamps them into each checkpoint it
     // writes. Only the multi-node compactor writes checkpoints, so only it needs
     // the handle; seed it with the boot-load cursors.
-    let inventory_watermarks: Option<
-        influxdb3_write::inventory_poller::SharedInventoryWatermarks,
-    > = matches!(config.mode, NodeMode::Compactor).then(|| {
-        influxdb3_write::inventory_poller::InventoryWatermarks::shared(
-            write_buffer_impl.initial_wal_watermarks(),
-            write_buffer_impl.initial_compaction_watermark(),
-        )
-    });
+    let inventory_watermarks: Option<influxdb3_write::inventory_poller::SharedInventoryWatermarks> =
+        matches!(config.mode, NodeMode::Compactor).then(|| {
+            influxdb3_write::inventory_poller::InventoryWatermarks::shared(
+                write_buffer_impl.initial_wal_watermarks(),
+                write_buffer_impl.initial_compaction_watermark(),
+            )
+        });
 
     // Inventory poller: pulls peer WAL snapshots + compaction manifests into
     // PersistedFiles + catalog without a restart. Only meaningful in modes
     // that share an inventory namespace.
     let inventory_poll_interval: Duration = config.inventory_poll_interval.into();
-    if config.mode != NodeMode::All
-        && !inventory_poll_interval.is_zero()
-    {
+    if config.mode != NodeMode::All && !inventory_poll_interval.is_zero() {
         if let Some(inv) = &shared_inventory {
             // Gate 2: first poll tick folds the live inventory onto the loaded
             // view, so a querier doesn't return empty results in the cold-load
@@ -2110,8 +2090,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
                     catalog: Arc::clone(&catalog),
                     interval: inventory_poll_interval,
                     initial_wal_watermarks: write_buffer_impl.initial_wal_watermarks(),
-                    initial_compaction_watermark: write_buffer_impl
-                        .initial_compaction_watermark(),
+                    initial_compaction_watermark: write_buffer_impl.initial_compaction_watermark(),
                     shutdown: shutdown_manager.register("inventory_poller"),
                     wal_tail: wal_tail_buffer.clone(),
                     metric_registry: Arc::clone(&metrics),
@@ -2283,10 +2262,12 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
     // locally-folded inventory (Layer A). Writer / compactor / all pass the
     // WriteBufferImpl through unchanged.
     let write_buffer: Arc<dyn WriteBuffer> = if matches!(config.mode, NodeMode::Querier) {
-        Arc::new(influxdb3_write::composite_write_buffer::CompositeWriteBuffer::new(
-            Arc::clone(&write_buffer_impl),
-            wal_tail_buffer.clone(),
-        )) as Arc<dyn WriteBuffer>
+        Arc::new(
+            influxdb3_write::composite_write_buffer::CompositeWriteBuffer::new(
+                Arc::clone(&write_buffer_impl),
+                wal_tail_buffer.clone(),
+            ),
+        ) as Arc<dyn WriteBuffer>
     } else {
         write_buffer_impl
     };
@@ -2389,32 +2370,34 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
         allow_write: config.mode.runs_ingest(),
         allow_query: config.mode.runs_query(),
     };
-    let http = Arc::new(if config.test_mode {
-        HttpApi::with_test_mode(
-            common_state.clone(),
-            Arc::clone(&time_provider) as _,
-            Arc::clone(&write_buffer),
-            Arc::clone(&query_executor) as _,
-            Arc::clone(&processing_engine),
-            restricted_plugin_trigger_types(&config.processing_engine_config),
-            config.max_http_request_size.as_num_bytes(),
-            Arc::clone(&authorizer),
-            true,
-        )
-    } else {
-        HttpApi::new(
-            common_state.clone(),
-            Arc::clone(&time_provider) as _,
-            Arc::clone(&write_buffer),
-            Arc::clone(&query_executor) as _,
-            Arc::clone(&processing_engine),
-            restricted_plugin_trigger_types(&config.processing_engine_config),
-            config.max_http_request_size.as_num_bytes(),
-            Arc::clone(&authorizer),
-        )
-    }
-    .with_endpoint_policy(endpoint_policy)
-    .with_readiness_gate(query_readiness));
+    let http = Arc::new(
+        if config.test_mode {
+            HttpApi::with_test_mode(
+                common_state.clone(),
+                Arc::clone(&time_provider) as _,
+                Arc::clone(&write_buffer),
+                Arc::clone(&query_executor) as _,
+                Arc::clone(&processing_engine),
+                restricted_plugin_trigger_types(&config.processing_engine_config),
+                config.max_http_request_size.as_num_bytes(),
+                Arc::clone(&authorizer),
+                true,
+            )
+        } else {
+            HttpApi::new(
+                common_state.clone(),
+                Arc::clone(&time_provider) as _,
+                Arc::clone(&write_buffer),
+                Arc::clone(&query_executor) as _,
+                Arc::clone(&processing_engine),
+                restricted_plugin_trigger_types(&config.processing_engine_config),
+                config.max_http_request_size.as_num_bytes(),
+                Arc::clone(&authorizer),
+            )
+        }
+        .with_endpoint_policy(endpoint_policy)
+        .with_readiness_gate(query_readiness),
+    );
 
     // Only create recovery server if listener was created
     let admin_token_recovery_server = admin_token_recovery_listener.map(|listener| {
