@@ -65,8 +65,8 @@ freshness layer for sub-second visibility of recent writes.
 - Advisory leases at `_locks/writer.lease` and `_locks/compactor.lease`
 - HTTP listener enforcement: writes return `405` on querier/compactor;
   queries return `405` on compactor
-- `influxdb3 migrate catalog --to-shared` to move a single-node catalog
-  into the shared layout
+- Upgrading from a 3.9.x-based release migrates the shared catalog from
+  format v2 to v3 on first start (one-way; see REFLUXEXTENDED.md §3)
 
 ### Read-your-writes freshness (A/C layers)
 - Sub-second visibility of recent writes on a separate querier without waiting

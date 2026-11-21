@@ -102,7 +102,9 @@ data dirs.
 ```
 <bucket>/
 ├── _catalog/                       shared catalog (OCC, PutMode::Create)
-│   └── catalogs/<seq>.…            sequenced catalog logs + checkpoints
+│   ├── catalog/v3/logs/<seq>.catalog   sequenced catalog logs
+│   ├── catalog/v3/snapshot             catalog checkpoint
+│   └── catalog/v2/…                    pre-3.12 catalog, left behind by the migration
 │
 ├── _inventory/                     cluster-wide file inventory
 │   ├── wal/<node_id>/<seq>.info.json        writer WAL snapshot manifests
@@ -148,17 +150,41 @@ from two sources (a checkpoint and a WAL manifest) de-duplicates correctly.
 
 In any split mode (and optionally in `all` via `--shared-catalog`) the catalog
 is opened under the `_catalog` prefix instead of a per-node path —
-`Catalog::open_shared` (`influxdb3_catalog/.../v2.rs:236`, prefix constant
-`SHARED_CATALOG_PREFIX = "_catalog"` at `:123`). Mode selection is at
-`serve.rs:1242`: any mode other than `all` defaults to shared.
+`Catalog::new_shared_with_shutdown` (`influxdb3_catalog/.../v3/catalog.rs`,
+prefix constant `SHARED_CATALOG_PREFIX = "_catalog"`), which passes the prefix
+as the catalog id and the node's `--node-id` as the current node to upstream's
+`load_or_create`. Mode selection is in `serve.rs` (`shared_catalog`): any mode
+other than `all` defaults to shared.
+
+### Catalog format v3 and the one-way migration
+
+Since the v3.12 merge the live catalog is upstream's **format v3**
+(`_catalog/catalog/v3/`). On first open, a node that finds a v2 catalog at the
+prefix and no v3 snapshot migrates it (`catalog/migrations/v3.rs`): it is
+idempotent and safe when several nodes start at once, but **one-way** — a
+3.9-based binary cannot read v3, so an environment cannot run a mixed fleet
+across this upgrade. Stop every node, back up `_catalog/`, start the writer
+first, then the compactor, then the queriers.
+
+The migration carries one fork-specific step: the fork's v2 scoped tokens
+stored their actions with the fork's own bits (db `read=1, write=2,
+create=4`), while v3 uses upstream's (`create=1 … read=16, write=32`).
+`fork_v2_permission_to_wire` remaps them; without it a read-only token would
+come out create-only.
+
+Scoped tokens are enforced by upstream's `TokenAuthenticatorAndAuthorizer`
+(upstream Core ships it but wires a no-op authorizer). Data-plane handlers ask
+for `read`/`write` on the target database; a database not yet in the catalog,
+listing databases and database-less InfluxQL only match a `db:*` grant;
+everything else is admin-only. A `read` grant also covers `describe`.
 
 There is **no catalog server**. Concurrency control is optimistic, implemented
 with conditional object-store writes:
 
 - Sequenced catalog logs are written with `PutMode::Create` (If-None-Match)
-  (`v2.rs:206`); a collision returns `AlreadyExists`, which the writer treats
-  as "someone else took that sequence — re-read and retry".
-- Catalog checkpoints likewise use `PutMode::Create` (`v2.rs:141`).
+  (`object_store/versions/v3.rs`); a collision returns `AlreadyExists`, which
+  the writer treats as "someone else took that sequence — re-read and retry".
+- Catalog checkpoints likewise use `PutMode::Create`.
 
 Every node *reads* the catalog forward on each inventory tick (§6), so a new
 table created on the writer becomes queryable on the querier within a poll
@@ -668,7 +694,7 @@ Extension flags added/changed by this fork (defaults in parentheses):
 | `--mode` | `INFLUXDB3_MODE` | `all` | all | `all` / `writer` / `compactor` / `querier` |
 | `--shared-catalog` | `INFLUXDB3_SHARED_CATALOG` | (auto) | all | forced on for non-`all` modes |
 | `--gen1-duration` | `INFLUXDB3_GEN1_DURATION` | `10m` | writer (catalog-wide) | **set-once, immutable**; set on all roles |
-| `--gen2-duration`…`--gen5-duration` | `INFLUXDB3_GEN{2..5}_DURATION` | — | compactor | per-generation window |
+| `--gen2-duration`…`--gen5-duration` | `INFLUXDB3_GEN{2..5}_DURATION` | — | compactor (catalog-wide) | per-generation window; each level **set-once** in the catalog, the compactor compacts with the catalog's ladder |
 | `--enable-compaction` | `INFLUXDB3_ENABLE_COMPACTION` | `true` | compactor/all | |
 | `--compaction-interval` | `INFLUXDB3_COMPACTION_INTERVAL` | `1h` | compactor | cycle cadence |
 | `--max-compaction-files` | `INFLUXDB3_MAX_COMPACTION_FILES` | `100` | compactor | inputs per job |
@@ -702,7 +728,6 @@ rejected at startup.
 | 404 `NoSuchKey` on a recent query | live-but-slow querier mis-classified dead → premature input delete (§9) | fixed by 30s decoupled heartbeat; keep fold-lag ≪ `delete_grace`, raise `--wal-tail-max-files`, compact faster |
 | Recent data missing on querier until next snapshot | `--wal-tail-max-files` below the writer's unpersisted window (§11) | set it ≥ `3 × --wal-snapshot-size` |
 | `gen1` stuck at `10m` despite `--gen1-duration=1h` | catalog set-once won by an earlier node (often a querier with the default) (§3) | set `--gen1-duration` on **all** roles; recreate the bucket to change |
-| Compactor mis-buckets gen1 | compactor's `generation_durations[1]` reads the **flag**, not the catalog value | keep `--gen1-duration` identical to the writer/catalog on the compactor |
 | Slow wide aggregations under backfill | global dedup not split because backfill overlaps compacted data (§12) | compact the backfill window faster (shrinks the overlapping un-compacted set) |
 | Whole historical window silently empty until querier reboot | querier re-lists a compaction-deleted gen1 from a still-foldable WAL snapshot; NotFound-tolerant reads swallow it to empty (§9/§10). Tracks WAL recency, so hits backfilled old data too | enable the cold-gate `--keep-generations-trailing-window` ≥ the WAL re-fold window; watch `_parquet_notfound_tolerated`; reboot queriers to clear an existing gap |
 | Querier OOM-killed → autoheal recreate → cascade/outage | heavy `DeduplicateExec`/sort over backfill-overlap exceeds RAM; no disk spill (§12). With few queriers the load shifts to the survivor, which OOMs too | `--exec-spill-enabled` (query spills instead of OOM); more querier replicas / RAM; compact faster to shrink the overlap |
