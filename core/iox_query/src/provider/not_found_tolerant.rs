@@ -20,15 +20,16 @@ use std::any::Any;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::{Arc, OnceLock};
 
-use datafusion::common::{Result, Statistics};
+use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{
     FileOpenFuture, FileOpener, FileScanConfig, FileSource, ParquetSource,
 };
-use datafusion::datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion::datasource::table_schema::TableSchema;
-use datafusion::physical_expr::{LexOrdering, PhysicalExpr};
+use datafusion::physical_expr::projection::ProjectionExprs;
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalSortExpr};
+use datafusion::physical_plan::SortOrderPushdownResult;
 use datafusion::physical_plan::DisplayFormatType;
 use datafusion::physical_plan::filter_pushdown::FilterPushdownPropagation;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -222,50 +223,46 @@ impl Debug for NotFoundTolerantSource {
     }
 }
 
+// Delegate every `FileSource` method `ParquetSource` overrides: a method left
+// on its trait default silently disables that optimisation for wrapped scans
+// (projection/filter/sort pushdown, repartitioning). Methods that return a new
+// source re-wrap it so the tolerance survives optimizer rewrites.
 impl FileSource for NotFoundTolerantSource {
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
         base_config: &FileScanConfig,
         partition: usize,
-    ) -> Arc<dyn FileOpener> {
-        Arc::new(NotFoundTolerantOpener {
+    ) -> Result<Arc<dyn FileOpener>> {
+        Ok(Arc::new(NotFoundTolerantOpener {
             inner: self
                 .inner
-                .create_file_opener(object_store, base_config, partition),
-        })
+                .create_file_opener(object_store, base_config, partition)?,
+        }))
     }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
 
+    fn table_schema(&self) -> &TableSchema {
+        self.inner.table_schema()
+    }
+
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
         Self::rewrap(self.inner.with_batch_size(batch_size))
-    }
-
-    fn with_schema(&self, schema: TableSchema) -> Arc<dyn FileSource> {
-        Self::rewrap(self.inner.with_schema(schema))
-    }
-
-    fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
-        Self::rewrap(self.inner.with_projection(config))
-    }
-
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
-        Self::rewrap(self.inner.with_statistics(statistics))
     }
 
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
         self.inner.filter()
     }
 
-    fn metrics(&self) -> &ExecutionPlanMetricsSet {
-        self.inner.metrics()
+    fn projection(&self) -> Option<&ProjectionExprs> {
+        self.inner.projection()
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        self.inner.statistics()
+    fn metrics(&self) -> &ExecutionPlanMetricsSet {
+        self.inner.metrics()
     }
 
     fn file_type(&self) -> &str {
@@ -274,6 +271,10 @@ impl FileSource for NotFoundTolerantSource {
 
     fn fmt_extra(&self, t: DisplayFormatType, f: &mut Formatter<'_>) -> fmt::Result {
         self.inner.fmt_extra(t, f)
+    }
+
+    fn supports_repartitioning(&self) -> bool {
+        self.inner.supports_repartitioning()
     }
 
     fn repartitioned(
@@ -305,17 +306,32 @@ impl FileSource for NotFoundTolerantSource {
         Ok(prop)
     }
 
-    fn with_schema_adapter_factory(
+    fn try_reverse_output(
         &self,
-        factory: Arc<dyn SchemaAdapterFactory>,
-    ) -> Result<Arc<dyn FileSource>> {
-        Ok(Self::rewrap(
-            self.inner.with_schema_adapter_factory(factory)?,
-        ))
+        order: &[PhysicalSortExpr],
+        eq_properties: &EquivalenceProperties,
+    ) -> Result<SortOrderPushdownResult<Arc<dyn FileSource>>> {
+        Ok(
+            match self.inner.try_reverse_output(order, eq_properties)? {
+                SortOrderPushdownResult::Exact { inner } => SortOrderPushdownResult::Exact {
+                    inner: Self::rewrap(inner),
+                },
+                SortOrderPushdownResult::Inexact { inner } => SortOrderPushdownResult::Inexact {
+                    inner: Self::rewrap(inner),
+                },
+                SortOrderPushdownResult::Unsupported => SortOrderPushdownResult::Unsupported,
+            },
+        )
     }
 
-    fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
-        self.inner.schema_adapter_factory()
+    fn try_pushdown_projection(
+        &self,
+        projection: &ProjectionExprs,
+    ) -> Result<Option<Arc<dyn FileSource>>> {
+        Ok(self
+            .inner
+            .try_pushdown_projection(projection)?
+            .map(Self::rewrap))
     }
 }
 
