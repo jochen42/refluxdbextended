@@ -20,13 +20,18 @@ pub use authorizer::{
     CatalogProvider, IdProvider, TokenAuthenticatorAndAuthorizer, TokenPermissionProvider,
 };
 
-#[derive(Debug, Copy, Clone, PartialEq, Serialize)]
+// Eq + Deserialize (here and on `Permission` and its parts): the fork's v2
+// catalog logs persist `Permission` inside its `CreateScopedToken` op. Those
+// logs are serde_json, so enum variants are matched by name and upstream's
+// added `System` variants do not shift them. Read only by the v2 -> v3
+// catalog migration.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DatabaseActions(u16);
 
-#[derive(Debug, Copy, Clone, PartialEq, Serialize)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CrudActions(u16);
 
-#[derive(Debug, Copy, Clone, PartialEq, Serialize)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SystemActions(u16);
 
 #[derive(Debug, Copy, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -347,7 +352,7 @@ impl TokenInfo {
 // common types
 
 /// Metadata about a resource, including its name and deletion status
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResourceMetadata {
     pub name: String,
     pub deleted: bool,
@@ -366,7 +371,7 @@ pub struct ResourceMetadata {
 /// itself. The wildcards at each level makes the setup harder to model everything within a single
 /// enum for example. So, once we add few more resources this should be fairly straightforward to
 /// refine to make certain combinations impossible to set
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Permission {
     pub resource_type: ResourceType,
     pub resource_identifier: ResourceIdentifier,
@@ -377,7 +382,7 @@ pub struct Permission {
     pub resource_names: Option<IndexMap<String, ResourceMetadata>>,
 }
 
-#[derive(Debug, Copy, Clone, Eq, Hash, PartialEq, Serialize)]
+#[derive(Debug, Copy, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ResourceType {
     Database,
     Token,
@@ -385,7 +390,7 @@ pub enum ResourceType {
     Wildcard,
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ResourceIdentifier {
     Database(Vec<DbId>),
     Token(Vec<TokenId>),
@@ -393,7 +398,7 @@ pub enum ResourceIdentifier {
     Wildcard,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Serialize)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Actions {
     Database(DatabaseActions),
     Token(CrudActions),

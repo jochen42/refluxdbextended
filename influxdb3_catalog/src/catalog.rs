@@ -10,7 +10,7 @@ pub use versions::v3::backup::{
 pub use versions::v3::catalog::CatalogBuilder;
 pub use versions::v3::catalog::{
     ApiNodeSpec, Catalog, CatalogArgs, Committed, CreateDatabaseOptions, CreateTableOptions,
-    HardDeletionTime,
+    HardDeletionTime, SHARED_CATALOG_PREFIX,
 };
 pub use versions::v3::deletes::DeletionScope;
 pub use versions::v3::events::{

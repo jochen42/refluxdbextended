@@ -1229,7 +1229,7 @@ impl HttpApi {
 
     async fn write_lp_inner(&self, params: WriteParams, req: Request) -> Result<Response> {
         validate_db_name(&params.db)?;
-        self.authorize_database(request_token_id(&req), &params.db, DatabaseActions::WRITE)
+        self.authorize_database(request_token_id(&req), &params.db, DatabaseActions::from(DatabaseActions::WRITE))
             .await?;
         // DatabaseName contains additional validation; do it early
         let database = DatabaseName::new(params.db)?;
@@ -1303,95 +1303,19 @@ impl HttpApi {
         let request: CreateScopedTokenRequest = self.read_body_json(req).await?;
         let catalog = self.write_buffer.catalog();
 
-        // Convert the request permissions to the internal permission format
-        let mut permissions = Vec::new();
-        for perm_req in request.permissions {
-            let resource_type = match perm_req.resource_type.as_str() {
-                "db" => influxdb3_authz::ResourceType::Database,
-                "token" => influxdb3_authz::ResourceType::Token,
-                _ => {
-                    return Err(Error::InvalidContentType {
-                        expected: mime::APPLICATION_JSON,
-                    });
-                }
-            };
-
-            let resource_identifier = if perm_req.resource_names.contains(&"*".to_string()) {
-                influxdb3_authz::ResourceIdentifier::Wildcard
-            } else {
-                match resource_type {
-                    influxdb3_authz::ResourceType::Database => {
-                        // Convert database names to IDs
-                        let mut db_ids = Vec::new();
-                        for db_name in perm_req.resource_names {
-                            if let Some(db_id) = catalog.db_name_to_id(&db_name) {
-                                db_ids.push(db_id);
-                            } else {
-                                return Err(Error::MissingDb(db_name));
-                            }
-                        }
-                        influxdb3_authz::ResourceIdentifier::Database(db_ids)
-                    }
-                    influxdb3_authz::ResourceType::Token => {
-                        // For now, we'll use wildcard for tokens since we don't have token name to ID mapping
-                        influxdb3_authz::ResourceIdentifier::Wildcard
-                    }
-                    _ => influxdb3_authz::ResourceIdentifier::Wildcard,
-                }
-            };
-
-            let actions = if perm_req.actions.contains(&"*".to_string()) {
-                influxdb3_authz::Actions::Wildcard
-            } else {
-                match resource_type {
-                    influxdb3_authz::ResourceType::Database => {
-                        let mut db_actions = 0u16;
-                        for action in perm_req.actions {
-                            match action.as_str() {
-                                "read" => db_actions |= DatabaseActions::READ.0,
-                                "write" => db_actions |= DatabaseActions::WRITE.0,
-                                "create" => db_actions |= DatabaseActions::CREATE.0,
-                                _ => {
-                                    return Err(Error::InvalidContentType {
-                                        expected: mime::APPLICATION_JSON,
-                                    });
-                                }
-                            }
-                        }
-                        influxdb3_authz::Actions::Database(influxdb3_authz::DatabaseActions(
-                            db_actions,
-                        ))
-                    }
-                    influxdb3_authz::ResourceType::Token => {
-                        let mut token_actions = 0u16;
-                        for action in perm_req.actions {
-                            match action.as_str() {
-                                "read" => token_actions |= influxdb3_authz::CrudActions::READ.0,
-                                "write" => token_actions |= influxdb3_authz::CrudActions::WRITE.0,
-                                "create" => token_actions |= influxdb3_authz::CrudActions::CREATE.0,
-                                "delete" => token_actions |= influxdb3_authz::CrudActions::DELETE.0,
-                                _ => {
-                                    return Err(Error::InvalidContentType {
-                                        expected: mime::APPLICATION_JSON,
-                                    });
-                                }
-                            }
-                        }
-                        influxdb3_authz::Actions::Token(influxdb3_authz::CrudActions(token_actions))
-                    }
-                    _ => influxdb3_authz::Actions::Wildcard,
-                }
-            };
-
-            permissions.push(influxdb3_authz::Permission {
-                resource_type,
-                resource_identifier,
-                actions,
-            });
-        }
-
+        // `db`/`token` resource types, names (or `*`) and action names are
+        // validated and resolved to ids by the catalog.
+        let permissions = request
+            .permissions
+            .into_iter()
+            .map(|perm| influxdb3_authz::permissions::PermissionDetailsSpec {
+                resource_type: perm.resource_type,
+                resource_identifier: perm.resource_names,
+                actions: perm.actions,
+            })
+            .collect();
         let (token_info, token) = catalog
-            .create_scoped_token(request.token_name, permissions, request.expiry_secs)
+            .create_token_with_permission(permissions, request.token_name, request.expiry_secs)
             .await?;
 
         let response = CreateTokenWithPermissionsResponse::from_token_info(token_info, token);
@@ -1429,7 +1353,7 @@ impl HttpApi {
             format,
             params,
         } = self.extract_query_request::<String>(req).await?;
-        self.authorize_database(token_id, &database, DatabaseActions::READ)
+        self.authorize_database(token_id, &database, DatabaseActions::from(DatabaseActions::READ))
             .await?;
 
         info!(%database, %query_str, ?format, "handling query_sql");
@@ -1715,13 +1639,13 @@ impl HttpApi {
         // read grant.
         match database.as_deref() {
             Some(db) => {
-                self.authorize_database(token_id, db, DatabaseActions::READ)
+                self.authorize_database(token_id, db, DatabaseActions::from(DatabaseActions::READ))
                     .await?
             }
             None => {
                 self.authorize_access(
                     token_id,
-                    AccessRequest::UnknownDatabase(DatabaseActions::READ),
+                    AccessRequest::MaybeDatabase(None, DatabaseActions::from(DatabaseActions::READ)),
                 )
                 .await?
             }
@@ -2067,7 +1991,7 @@ impl HttpApi {
         // Lists every database, so it needs a wildcard read grant.
         self.authorize_access(
             request_token_id(&req),
-            AccessRequest::UnknownDatabase(DatabaseActions::READ),
+            AccessRequest::MaybeDatabase(None, DatabaseActions::from(DatabaseActions::READ)),
         )
         .await?;
         let query = req.uri().query().unwrap_or("");
@@ -2433,11 +2357,9 @@ impl HttpApi {
         db: &str,
         actions: DatabaseActions,
     ) -> Result<()> {
-        let request = match self.write_buffer.catalog().db_name_to_id(db) {
-            Some(db_id) => AccessRequest::Database(db_id, actions),
-            None => AccessRequest::UnknownDatabase(actions),
-        };
-        self.authorize_access(token_id, request).await
+        let db_id = self.write_buffer.catalog().db_name_to_id(db);
+        self.authorize_access(token_id, AccessRequest::MaybeDatabase(db_id, actions))
+            .await
     }
 
     async fn authorize_access(
@@ -2447,7 +2369,7 @@ impl HttpApi {
     ) -> Result<()> {
         let token_id = token_id.ok_or(Error::Unauthenticated)?;
         self.authorizer
-            .authorize_action(&token_id, request)
+            .authorize_action(Some(&Subject::Token(token_id)), request)
             .await
             .map_err(|_| Error::ResourceAuthorization(ResourceAuthorizationError::Unauthorized))
     }

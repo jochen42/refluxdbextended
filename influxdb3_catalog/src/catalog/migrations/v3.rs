@@ -496,7 +496,8 @@ fn synthesize_last_cache(cache: &LastCacheSnapshot, db_id: u32, batch: &mut Reco
 impl FromV2 for TokenInfoSnapshot {
     /// A token with a single wildcard-everywhere permission is an admin
     /// token; emit `CreateAdminToken`. Anything else is resource-scoped and
-    /// carries its permissions as-is in `CreateResourceScopedToken`.
+    /// becomes `CreateResourceScopedToken`, with the fork's action bits
+    /// remapped to upstream's (see [`conversions::fork_v2_permission_to_wire`]).
     fn from_v2(&self, batch: &mut RecordBatch) {
         let token_id = self.id.get();
         let expiry = optional_expiry(self.expiry);
@@ -523,7 +524,11 @@ impl FromV2 for TokenInfoSnapshot {
                 description: self.description.clone(),
                 created_by: self.created_by.map(|id| id.get()),
                 updated_by: self.updated_by.map(|id| id.get()),
-                permissions: self.permissions.iter().map(Into::into).collect(),
+                permissions: self
+                    .permissions
+                    .iter()
+                    .map(conversions::fork_v2_permission_to_wire)
+                    .collect(),
             });
         }
     }

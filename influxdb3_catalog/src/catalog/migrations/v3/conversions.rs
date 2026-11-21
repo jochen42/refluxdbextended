@@ -266,3 +266,44 @@ impl From<&ColumnDefinitionSnapshot> for WireColumnDef {
         }
     }
 }
+
+/// Remap a fork-written v2 scoped-token permission to upstream's action bits.
+///
+/// The fork's v2 catalog (RefluxDB Extended up to 3.9.x) stored scoped-token
+/// actions with its own bit layout — database `READ=1, WRITE=2, CREATE=4`,
+/// token `READ=1, WRITE=2, CREATE=4, DELETE=8` — while upstream's v3 records
+/// use `CREATE=1, DESCRIBE=2, …, READ=16, WRITE=32` (database) and
+/// `CREATE=1, READ=2, UPDATE=4, DELETE=8` (token). Passing the raw bits
+/// through would turn a fork read-only token into a create-only one.
+///
+/// Every non-admin token in a fork v2 catalog was created by the fork: Core
+/// v2 had no resource-scoped tokens, so the remap applies unconditionally.
+pub(crate) fn fork_v2_permission_to_wire(p: &PermissionSnapshot) -> WirePermission {
+    let mut wire = WirePermission::from(p);
+    wire.actions = match &p.actions {
+        ActionsSnapshot::Database(d) => WireActions::Database(remap_fork_database_actions(d.0)),
+        ActionsSnapshot::Token(t) => WireActions::Token(remap_fork_crud_actions(t.0)),
+        ActionsSnapshot::System(_) | ActionsSnapshot::Wildcard => wire.actions,
+    };
+    wire
+}
+
+fn remap_bits(bits: u16, mapping: &[(u16, u16)]) -> u16 {
+    mapping
+        .iter()
+        .filter(|(fork, _)| bits & fork == *fork)
+        .fold(0, |acc, (_, upstream)| acc | upstream)
+}
+
+pub(crate) fn remap_fork_database_actions(bits: u16) -> u16 {
+    use influxdb3_authz::DatabaseActions as A;
+    remap_bits(bits, &[(1, A::READ), (1 << 1, A::WRITE), (1 << 2, A::CREATE)])
+}
+
+pub(crate) fn remap_fork_crud_actions(bits: u16) -> u16 {
+    use influxdb3_authz::CrudActions as A;
+    remap_bits(
+        bits,
+        &[(1, A::READ), (1 << 1, A::UPDATE), (1 << 2, A::CREATE), (1 << 3, A::DELETE)],
+    )
+}

@@ -179,6 +179,10 @@ impl std::fmt::Display for HardDeletionTime {
     }
 }
 
+/// Object-store prefix of the catalog shared by all nodes of a multi-node
+/// deployment (`serve --mode writer|compactor|querier`).
+pub const SHARED_CATALOG_PREFIX: &str = "_catalog";
+
 /// Construction-time configuration for [`Catalog`].
 #[derive(Clone, Copy, Debug)]
 pub struct CatalogArgs {
@@ -432,7 +436,9 @@ impl Catalog {
     pub const MAX_TOTAL_COLUMNS: u32 = 10_000_000;
     /// Default duration used to resolve hard-delete time when a constructor
     /// caller doesn't supply an explicit value.
-    pub const DEFAULT_HARD_DELETE_DURATION: Duration = Duration::from_secs(60 * 60 * 72);
+    // Fork default: 10 years, effectively infinite (upstream: 72 hours).
+    pub const DEFAULT_HARD_DELETE_DURATION: Duration =
+        Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
     /// Construct a `Catalog` for Core. `node_id` is used as both the object-store
     /// prefix and the current node identifier.
@@ -494,6 +500,36 @@ impl Catalog {
             metric_registry,
             CatalogArgs::default(),
             limits,
+        )
+        .await?;
+        Self::spawn_shutdown_wait_task(shutdown_token, Arc::clone(&catalog), process_uuid_getter);
+        Ok(catalog)
+    }
+
+    /// Open the catalog shared by every node of a multi-node deployment, at
+    /// [`SHARED_CATALOG_PREFIX`], registering `node_id` as the current node.
+    ///
+    /// Writer, compactor and queriers all open this same catalog, so schema,
+    /// retention and tokens are consistent cluster-wide. Concurrent writers are
+    /// safe: catalog log files are created with `PutMode::Create`. A v2 catalog
+    /// at the same prefix is migrated to v3 on first open (one-way).
+    pub async fn new_shared_with_shutdown(
+        node_id: impl Into<Arc<str>>,
+        store: Arc<dyn ObjectStore>,
+        time_provider: Arc<dyn TimeProvider>,
+        metric_registry: Arc<Registry>,
+        shutdown_token: ShutdownToken,
+        process_uuid_getter: Arc<dyn ProcessUuidGetter>,
+        limits: CatalogLimits,
+    ) -> Result<Arc<Self>> {
+        let catalog = Self::load_or_create(
+            SHARED_CATALOG_PREFIX,
+            Some(node_id.into()),
+            store,
+            time_provider,
+            metric_registry,
+            Arc::new(limits),
+            CatalogArgs::default(),
         )
         .await?;
         Self::spawn_shutdown_wait_task(shutdown_token, Arc::clone(&catalog), process_uuid_getter);

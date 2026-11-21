@@ -719,6 +719,11 @@ impl InnerCatalog {
                     true
                 }
                 TokenCatalogOp::RegenerateAdminToken(_) => false,
+                // Fork scoped tokens (v2 catalog only) are added to the token
+                // repository by the base apply path; their permissions use the
+                // fork's action bits and are remapped by the v2 -> v3 migration,
+                // so they are deliberately not loaded into `token_permissions`.
+                TokenCatalogOp::CreateScopedToken(_) => false,
                 TokenCatalogOp::CreateResourceScopedToken(create_token_details) => {
                     self.handle_token_creation(create_token_details)?;
                     true

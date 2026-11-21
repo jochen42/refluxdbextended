@@ -4,7 +4,7 @@ use crate::commands::create::token::AdminTokenFile;
 use anyhow::{Context, bail};
 use cli_types::MaxConcurrentQueries;
 use futures::{FutureExt, future::FusedFuture, pin_mut};
-use influxdb3_authz::TokenAuthenticator;
+use influxdb3_authz::{TokenAuthenticator, TokenAuthenticatorAndAuthorizer};
 use influxdb3_cache::{
     distinct_cache::DistinctCacheProvider,
     last_cache::{self, LastCacheProvider},
@@ -12,6 +12,7 @@ use influxdb3_cache::{
 };
 use influxdb3_catalog::{
     CatalogError, catalog::Catalog, catalog::CatalogLimits, catalog::PluginType,
+    catalog::SHARED_CATALOG_PREFIX,
 };
 use influxdb3_clap_blocks::plugins::{PackageManager, PluginTriggerType, ProcessingEngineConfig};
 use influxdb3_clap_blocks::{
@@ -1255,33 +1256,71 @@ impl FromStr for ParquetCachePrunePercent {
     }
 }
 
-/// Helper function to set a generation duration in the catalog and update the HashMap.
-/// Handles AlreadyExists and CannotChangeGenerationDuration errors gracefully.
-async fn set_generation_duration_with_error_handling(
+/// Register the multi-level compaction ladder (`--gen1-duration` …
+/// `--gen5-duration`) in the catalog and return the ladder the compactor runs
+/// with, read back from the catalog.
+///
+/// The catalog, not the flags, is the source of truth: levels are set once
+/// per catalog in one atomic batch, a flag that disagrees with an existing
+/// level only warns, and every restart compacts with the same ladder. Each
+/// level must be an exact multiple of the one below (e.g. 1m, 1h, 1d, 7d,
+/// 28d) so coarser generations align on finer boundaries.
+async fn register_generation_durations(
     catalog: &Arc<Catalog>,
-    generation_durations: &mut std::collections::HashMap<u8, Duration>,
-    level: u8,
-    duration: Duration,
-) -> Result<()> {
-    match catalog.set_generation_duration(level, duration).await {
-        Ok(_) | Err(CatalogError::AlreadyExists) => {
-            generation_durations.insert(level, duration);
+    gen1: Duration,
+    higher: [Option<Duration>; 4],
+) -> Result<std::collections::HashMap<u8, Duration>> {
+    let mut ladder = vec![gen1];
+    for (i, duration) in higher.iter().enumerate() {
+        match duration {
+            Some(duration) => ladder.push(*duration),
+            None => {
+                if higher[i..].iter().any(Option::is_some) {
+                    warn!(
+                        level = i + 2,
+                        "generation durations must be set without gaps; ignoring the levels \
+                        above the first unset one"
+                    );
+                }
+                break;
+            }
         }
-        Err(CatalogError::CannotChangeGenerationDuration { .. }) => {
-            let existing = catalog
-                .get_generation_duration(level)
-                .unwrap_or_else(|| panic!("catalog should contain existing gen{} duration", level));
+    }
+
+    match catalog.set_all_generation_durations(&ladder).await {
+        Ok(()) | Err(CatalogError::AlreadyExists) => {}
+        Err(CatalogError::CannotChangeGenerationDuration {
+            level,
+            existing,
+            attempted,
+        }) => {
             warn!(
                 level,
-                existing_secs = existing.as_secs(),
-                provided_secs = duration.as_secs(),
-                "cannot change the existing generation duration after it has been set"
+                ?existing,
+                ?attempted,
+                "cannot change a generation duration after it has been set; compacting with \
+                the catalog's ladder"
             );
-            generation_durations.insert(level, existing);
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            error!(
+                ?ladder,
+                %e,
+                "invalid generation durations: each level must be an exact multiple of the \
+                one below"
+            );
+            return Err(e.into());
+        }
     }
-    Ok(())
+
+    let generation_config = catalog.generation_config();
+    Ok((1..=u8::MAX)
+        .map_while(|level| {
+            generation_config
+                .duration_for_level(level)
+                .map(|duration| (level, duration))
+        })
+        .collect())
 }
 
 /// Apply values given through deprecated legacy aliases of renamed size
@@ -1830,7 +1869,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
                 .and_then(|cp| cp.compactions_high_water);
             let now_ms = time_provider.now().timestamp_millis();
             if let Err(e) = inv
-                .write_consumer_heartbeat(node_id.as_str(), baseline.clone(), now_ms)
+                .write_consumer_heartbeat(node_id.as_ref(), baseline.clone(), now_ms)
                 .await
             {
                 warn!(%e, "failed to publish boot consumer heartbeat");
@@ -1849,7 +1888,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
                     }
                     let now_ms = tp.now().timestamp_millis();
                     if let Err(e) = inv
-                        .write_consumer_heartbeat(node.as_str(), baseline.clone(), now_ms)
+                        .write_consumer_heartbeat(node.as_ref(), baseline.clone(), now_ms)
                         .await
                     {
                         warn!(%e, "failed to refresh boot consumer heartbeat");
@@ -1865,7 +1904,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
     let writer_lease_ttl: Duration = config.writer_lease_ttl.into();
     if matches!(config.mode, NodeMode::Writer) && !writer_lease_ttl.is_zero() {
         info!("acquiring writer lease (ttl={:?})", writer_lease_ttl);
-        let owner = format!("{}-{}", node_id.as_str(), *PROCESS_UUID_STR);
+        let owner = format!("{}-{}", node_id.as_ref(), *PROCESS_UUID_STR);
         let writer_lease = Arc::new(influxdb3_write::leases::Lease::new(
             influxdb3_write::leases::LeaseConfig::new(
                 object_store::path::Path::from("_locks/writer.lease"),
@@ -1913,7 +1952,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
         influxdb3_write::leases::run(
             writer_lease,
             Arc::clone(&time_provider) as _,
-            shutdown_manager.register(),
+            shutdown_manager.register("writer_lease"),
             Some(influxdb3_write::leases::LeaseMetrics::new(
                 &metrics, "writer",
             )),
@@ -1973,7 +2012,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
             object_store: Arc::clone(&object_store),
             persisted_files: Arc::clone(&persisted_files),
             interval: ref_validation_interval,
-            shutdown: shutdown_manager.register(),
+            shutdown: shutdown_manager.register("ref_validator"),
             metric_registry: Arc::clone(&metrics),
             first_pass_ready,
         });
@@ -1998,11 +2037,11 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
             // whose parquet doesn't exist yet, and recent-window queries silently
             // return EMPTY (June 2026 incident). Warn loudly rather than refuse,
             // so an operator is never blocked from booting in an emergency.
-            if is_unsafe_wal_tail_sizing(config.wal_tail_max_files, config.wal_snapshot_size) {
-                let min_safe = min_safe_wal_tail_files(config.wal_snapshot_size);
+            if is_unsafe_wal_tail_sizing(config.wal_tail_max_files, config.wal_files_per_snapshot) {
+                let min_safe = min_safe_wal_tail_files(config.wal_files_per_snapshot);
                 warn!(
                     wal_tail_max_files = config.wal_tail_max_files,
-                    wal_snapshot_size = config.wal_snapshot_size,
+                    wal_snapshot_size = config.wal_files_per_snapshot,
                     min_safe_wal_tail_max_files = min_safe,
                     "UNSAFE WAL-tail sizing: --wal-tail-max-files ({}) is below 3x \
                      --wal-snapshot-size ({} -> need >= {}). The querier may evict \
@@ -2010,7 +2049,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
                      time windows. Raise --wal-tail-max-files to >= {} (3x \
                      snapshot-size + margin), or lower --wal-snapshot-size.",
                     config.wal_tail_max_files,
-                    config.wal_snapshot_size,
+                    config.wal_files_per_snapshot,
                     min_safe,
                     min_safe,
                 );
@@ -2025,7 +2064,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
             );
             Arc::clone(&t).spawn(influxdb3_write::wal_tail::WalTailBufferArgs {
                 poll_interval: wal_tail_interval,
-                shutdown: shutdown_manager.register(),
+                shutdown: shutdown_manager.register("wal_tail"),
                 metric_registry: Arc::clone(&metrics),
             });
             Some(t)
@@ -2078,14 +2117,14 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
                     initial_wal_watermarks: write_buffer_impl.initial_wal_watermarks(),
                     initial_compaction_watermark: write_buffer_impl
                         .initial_compaction_watermark(),
-                    shutdown: shutdown_manager.register(),
+                    shutdown: shutdown_manager.register("inventory_poller"),
                     wal_tail: wal_tail_buffer.clone(),
                     metric_registry: Arc::clone(&metrics),
                     first_tick_ready,
                     watermarks_out: inventory_watermarks.clone(),
                     // Only queriers heartbeat — they're the consumers that read
                     // compacted files and must converge before deletion.
-                    heartbeat_node_id: querier_gated.then(|| node_id.clone()),
+                    heartbeat_node_id: querier_gated.then(|| node_id.to_string()),
                     time_provider: Arc::clone(&time_provider),
                 },
             );
@@ -2121,49 +2160,24 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
     )
     .await;
 
-    // Set up generation durations in catalog for multi-level compaction
-    let mut generation_durations = std::collections::HashMap::new();
-    generation_durations.insert(1, config.gen1_duration.as_duration());
-    
-    if let Some(gen2_duration) = config.gen2_duration {
-        set_generation_duration_with_error_handling(
-            &catalog,
-            &mut generation_durations,
-            2,
-            gen2_duration.as_duration(),
-        ).await?;
-    }
-    if let Some(gen3_duration) = config.gen3_duration {
-        set_generation_duration_with_error_handling(
-            &catalog,
-            &mut generation_durations,
-            3,
-            gen3_duration.as_duration(),
-        ).await?;
-    }
-    if let Some(gen4_duration) = config.gen4_duration {
-        set_generation_duration_with_error_handling(
-            &catalog,
-            &mut generation_durations,
-            4,
-            gen4_duration.as_duration(),
-        ).await?;
-    }
-    if let Some(gen5_duration) = config.gen5_duration {
-        set_generation_duration_with_error_handling(
-            &catalog,
-            &mut generation_durations,
-            5,
-            gen5_duration.as_duration(),
-        ).await?;
-    }
-
     // Compaction runs in `all` and `compactor` modes. `writer` and `querier`
     // are explicitly not allowed to compact even if `--enable-compaction`
     // is left at its default `true`.
     let should_compact = config.mode.runs_compaction() && config.enable_compaction;
     if should_compact {
         info!("setting up compaction service ({:?} mode)", config.mode);
+        let generation_durations = register_generation_durations(
+            &catalog,
+            config.gen1_duration.as_duration(),
+            [
+                config.gen2_duration.map(|d| d.as_duration()),
+                config.gen3_duration.map(|d| d.as_duration()),
+                config.gen4_duration.map(|d| d.as_duration()),
+                config.gen5_duration.map(|d| d.as_duration()),
+            ],
+        )
+        .await?;
+        info!(?generation_durations, "compaction generation ladder");
         let compaction_config = influxdb3_write::compaction::CompactionConfig {
             enabled: true,
             interval: config.compaction_interval.into(),
@@ -2196,7 +2210,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
             Arc::clone(&write_path_executor),
             Arc::clone(&object_store),
             Arc::clone(&time_provider),
-            shutdown_manager.register(),
+            shutdown_manager.register("compaction"),
             Arc::clone(&metrics),
         );
         if let Some(inv) = &shared_inventory {
@@ -2211,7 +2225,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
         let lease_ttl: Duration = config.compactor_lease_ttl.into();
         if !lease_ttl.is_zero() && matches!(config.mode, NodeMode::Compactor) {
             info!("acquiring compactor lease (ttl={:?})", lease_ttl);
-            let lease_owner = format!("{}-{}", node_id.as_str(), *PROCESS_UUID_STR);
+            let lease_owner = format!("{}-{}", node_id.as_ref(), *PROCESS_UUID_STR);
             let lease = Arc::new(influxdb3_write::leases::Lease::new(
                 influxdb3_write::leases::LeaseConfig::new(
                     object_store::path::Path::from("_locks/compactor.lease"),
@@ -2223,7 +2237,7 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
             influxdb3_write::leases::run(
                 Arc::clone(&lease),
                 Arc::clone(&time_provider) as _,
-                shutdown_manager.register(),
+                shutdown_manager.register("compactor_lease"),
                 Some(influxdb3_write::leases::LeaseMetrics::new(
                     &metrics,
                     "compactor",
@@ -2362,9 +2376,17 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
     let authorizer: Arc<dyn influxdb3_authz::AuthProvider> = if config.without_auth {
         Arc::new(influxdb3_authz::NoAuthAuthenticator)
     } else {
-        Arc::new(TokenAuthenticator::new(
+        // Upstream Core wires the bare `TokenAuthenticator`, whose
+        // `authorize_action` is a no-op (every valid token acts as admin).
+        // The fork enforces token permissions with upstream's catalog-backed
+        // authorizer, so read-only and database-scoped tokens are honoured on
+        // every API, Flight and the v1 query API included.
+        Arc::new(TokenAuthenticatorAndAuthorizer::new(
+            Arc::new(TokenAuthenticator::new(
+                Arc::clone(&catalog) as _,
+                Arc::clone(&time_provider) as _,
+            )),
             Arc::clone(&catalog) as _,
-            Arc::clone(&time_provider) as _,
         ))
     };
 
