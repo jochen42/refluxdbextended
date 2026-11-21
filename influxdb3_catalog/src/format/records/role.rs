@@ -1,0 +1,422 @@
+//! Role records (record_ids 39-42).
+
+use std::sync::Arc;
+
+use influxdb3_catalog_macros::catalog_record;
+
+use crate::catalog::versions::v3::events::CatalogEvent;
+use crate::catalog::versions::v3::inner::InnerCatalog;
+use crate::format::apply::ApplyError;
+use crate::format::records::types::{
+    RoleAdminTokenAction, RoleAdminTokenPermission, RoleDatabaseAction, RoleDatabasePermission,
+    RoleDatabaseResource, RolePermissionGrant, RoleRoleAction, RoleRolePermission, RoleTokenAction,
+    RoleTokenPermission, RoleUserAction, RoleUserPermission,
+};
+use crate::format::{CatalogRecord, RecordApply, record_ids};
+use influxdb3_authz::role::role_permissions::{
+    AdminTokenPermission, DatabasePermission, RolePermission as RoleResourcePermission,
+    TokenPermission, UserPermission,
+};
+use influxdb3_authz::role::{
+    AdminTokenAction, DatabaseAction, Permission, ResourceIdentifier, Role, RoleAction,
+    RoleDescription, RoleName, TokenAction, UserAction,
+};
+use influxdb3_id::{DbId, RoleId};
+
+/// Create a new role.
+#[catalog_record(id = record_ids::CREATE_ROLE, shape = 0x106ac5f1)]
+pub struct CreateRole {
+    /// Role ID.
+    pub role_id: u64,
+    /// Role name.
+    pub name: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// Permissions in the locally-owned wire encoding.
+    pub permissions: Vec<RolePermissionGrant>,
+    /// Whether this is a required role that cannot be unassigned.
+    pub is_required_role: bool,
+    /// Creation timestamp in milliseconds.
+    pub created_at: i64,
+}
+
+impl RecordApply for CreateRole {
+    fn apply(&self, catalog: &mut InnerCatalog) -> Result<(), ApplyError> {
+        let role_id = RoleId::new(self.role_id);
+        let name = RoleName::new(&self.name).map_err(|e| {
+            ApplyError(format!(
+                "{}: invalid role name '{}': {e}",
+                Self::NAME,
+                self.name
+            ))
+        })?;
+
+        let description = match self.description {
+            Some(ref d) => RoleDescription::new(d).map_err(|e| {
+                ApplyError(format!("{}: invalid role description: {e}", Self::NAME))
+            })?,
+            None => RoleDescription::new_unchecked(String::new()),
+        };
+        let permissions: Vec<Permission> = self.permissions.iter().filter_map(Into::into).collect();
+
+        let role = Role::new(
+            role_id,
+            name,
+            description,
+            permissions,
+            self.is_required_role,
+            self.created_at,
+        );
+        catalog.roles.add_role(role).map_err(|e| {
+            ApplyError(format!(
+                "{}: add role (role_id={}, name='{}'): {e}",
+                Self::NAME,
+                self.role_id,
+                self.name
+            ))
+        })
+    }
+
+    fn event(&self) -> CatalogEvent {
+        CatalogEvent::RoleCreated {
+            role_id: RoleId::new(self.role_id),
+        }
+    }
+}
+
+/// Update the permissions for a role.
+#[catalog_record(id = record_ids::UPDATE_ROLE_PERMISSIONS, shape = 0x377b3f49)]
+pub struct UpdateRolePermissions {
+    /// Role ID.
+    pub role_id: u64,
+    /// New permissions in the locally-owned wire encoding.
+    pub permissions: Vec<RolePermissionGrant>,
+    /// Update timestamp in milliseconds.
+    pub updated_at: i64,
+}
+
+impl RecordApply for UpdateRolePermissions {
+    fn apply(&self, catalog: &mut InnerCatalog) -> Result<(), ApplyError> {
+        let role_id = RoleId::new(self.role_id);
+        let permissions: Vec<Permission> = self.permissions.iter().filter_map(Into::into).collect();
+
+        let mut role = catalog.roles.get_by_id(&role_id).ok_or_else(|| {
+            ApplyError(format!("{}: role {} not found", Self::NAME, self.role_id))
+        })?;
+        let role_mut = Arc::make_mut(&mut role);
+        role_mut.permissions = permissions;
+        role_mut.updated_at = self.updated_at;
+        catalog.roles.update_role((*role).clone()).map_err(|e| {
+            ApplyError(format!(
+                "{}: update role permissions (role_id={}): {e}",
+                Self::NAME,
+                self.role_id
+            ))
+        })
+    }
+
+    fn event(&self) -> CatalogEvent {
+        CatalogEvent::RoleUpdated {
+            role_id: RoleId::new(self.role_id),
+        }
+    }
+}
+
+/// Update role metadata (name and/or description).
+#[catalog_record(id = record_ids::UPDATE_ROLE, shape = 0xec669eef)]
+pub struct UpdateRole {
+    /// Role ID.
+    pub role_id: u64,
+    /// New name (if changing).
+    pub name: Option<String>,
+    /// New description (if changing).
+    pub description: Option<String>,
+    /// Update timestamp in milliseconds.
+    pub updated_at: i64,
+}
+
+impl RecordApply for UpdateRole {
+    fn apply(&self, catalog: &mut InnerCatalog) -> Result<(), ApplyError> {
+        let role_id = RoleId::new(self.role_id);
+        let mut role = catalog.roles.get_by_id(&role_id).ok_or_else(|| {
+            ApplyError(format!("{}: role {} not found", Self::NAME, self.role_id))
+        })?;
+        let role_mut = Arc::make_mut(&mut role);
+
+        if let Some(ref new_name) = self.name {
+            role_mut.name = RoleName::new(new_name).map_err(|e| {
+                ApplyError(format!(
+                    "{}: invalid role name '{}': {e}",
+                    Self::NAME,
+                    new_name
+                ))
+            })?;
+        }
+        if let Some(ref new_desc) = self.description {
+            role_mut.description = RoleDescription::new(new_desc).map_err(|e| {
+                ApplyError(format!("{}: invalid role description: {e}", Self::NAME))
+            })?;
+        }
+        role_mut.updated_at = self.updated_at;
+
+        catalog.roles.update_role((*role).clone()).map_err(|e| {
+            ApplyError(format!(
+                "{}: update role (role_id={}): {e}",
+                Self::NAME,
+                self.role_id
+            ))
+        })
+    }
+
+    fn event(&self) -> CatalogEvent {
+        CatalogEvent::RoleUpdated {
+            role_id: RoleId::new(self.role_id),
+        }
+    }
+}
+
+/// Delete a role and remove it from all users.
+#[catalog_record(id = record_ids::DELETE_ROLE, shape = 0x11962ce7)]
+pub struct DeleteRole {
+    /// Role ID.
+    pub role_id: u64,
+    /// User IDs that have this role (will be updated to remove it).
+    pub affected_user_ids: Vec<u64>,
+    /// Deletion timestamp in milliseconds.
+    pub deleted_at: i64,
+}
+
+impl RecordApply for DeleteRole {
+    fn apply(&self, catalog: &mut InnerCatalog) -> Result<(), ApplyError> {
+        let role_id = RoleId::new(self.role_id);
+
+        // Remove role from all affected users, collecting the first error but continuing
+        // to process remaining users for best-effort consistency.
+        let mut first_error: Option<ApplyError> = None;
+        for &uid in &self.affected_user_ids {
+            let user_id = influxdb3_id::UserId::new(uid);
+            if let Some(mut user) = catalog.users.get_by_id(&user_id) {
+                let user_mut = Arc::make_mut(&mut user);
+                user_mut.role_ids.retain(|&id| id != role_id);
+                user_mut.updated_at = self.deleted_at;
+                if let Err(e) = catalog.users.update_user((*user).clone()) {
+                    first_error.get_or_insert(ApplyError(format!(
+                        "{}: update user {}: {e}",
+                        Self::NAME,
+                        uid
+                    )));
+                }
+            }
+        }
+
+        catalog.roles.remove_role(&role_id);
+
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn event(&self) -> CatalogEvent {
+        CatalogEvent::RoleDeleted {
+            role_id: RoleId::new(self.role_id),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire <-> authz conversions
+// ---------------------------------------------------------------------------
+
+impl RolePermissionGrant {
+    /// Convert a runtime [`Permission`] into its persisted grant.
+    ///
+    /// Returns `None` for `Permission::System`, which has no persisted
+    /// representation (#4905) and so never reaches the catalog.
+    ///
+    /// Inherent function rather than a `From` impl because
+    /// `From<&Permission> for Option<Self>` is rejected by the orphan rule.
+    pub(crate) fn from_permission(p: &Permission) -> Option<Self> {
+        Some(match p {
+            Permission::AccountAdminAll => RolePermissionGrant::AccountAdminAll,
+            Permission::Database(db) => RolePermissionGrant::Database(RoleDatabasePermission {
+                action: db.action().into(),
+                resource: db.resource().into(),
+            }),
+            Permission::Token(t) => RolePermissionGrant::Token(RoleTokenPermission {
+                action: t.action().into(),
+            }),
+            Permission::User(u) => RolePermissionGrant::User(RoleUserPermission {
+                action: u.action().into(),
+            }),
+            Permission::Role(r) => RolePermissionGrant::Role(RoleRolePermission {
+                action: r.action().into(),
+            }),
+            Permission::AdminToken(a) => {
+                RolePermissionGrant::AdminToken(RoleAdminTokenPermission {
+                    action: a.action().into(),
+                })
+            }
+            Permission::System(_) => return None,
+        })
+    }
+}
+
+/// Convert a persisted grant into its runtime [`Permission`].
+///
+/// Returns `None` for grants and actions which have been deprecated.
+impl From<&RolePermissionGrant> for Option<Permission> {
+    fn from(g: &RolePermissionGrant) -> Self {
+        Some(match g {
+            RolePermissionGrant::AccountAdminAll => Permission::AccountAdminAll,
+            RolePermissionGrant::Database(db) => {
+                let action: Option<DatabaseAction> = db.action.into();
+                Permission::Database(DatabasePermission::new(action?, db.resource.into()))
+            }
+            RolePermissionGrant::Token(t) => {
+                let action: Option<TokenAction> = t.action.into();
+                Permission::Token(TokenPermission::new(action?))
+            }
+            RolePermissionGrant::User(u) => {
+                let action: Option<UserAction> = u.action.into();
+                Permission::User(UserPermission::new(action?))
+            }
+            RolePermissionGrant::Role(r) => {
+                Permission::Role(RoleResourcePermission::new(r.action.into()))
+            }
+            RolePermissionGrant::AdminToken(a) => {
+                Permission::AdminToken(AdminTokenPermission::new(a.action.into()))
+            }
+        })
+    }
+}
+
+impl From<DatabaseAction> for RoleDatabaseAction {
+    fn from(a: DatabaseAction) -> Self {
+        match a {
+            DatabaseAction::Describe => RoleDatabaseAction::Describe,
+            DatabaseAction::Read => RoleDatabaseAction::Read,
+            DatabaseAction::Write => RoleDatabaseAction::Write,
+            DatabaseAction::Create => RoleDatabaseAction::Create,
+            DatabaseAction::Delete => RoleDatabaseAction::Delete,
+        }
+    }
+}
+
+impl From<RoleDatabaseAction> for Option<DatabaseAction> {
+    fn from(a: RoleDatabaseAction) -> Self {
+        match a {
+            RoleDatabaseAction::Describe => Some(DatabaseAction::Describe),
+            RoleDatabaseAction::Read => Some(DatabaseAction::Read),
+            RoleDatabaseAction::Write => Some(DatabaseAction::Write),
+            RoleDatabaseAction::Create => Some(DatabaseAction::Create),
+            RoleDatabaseAction::Delete => Some(DatabaseAction::Delete),
+            RoleDatabaseAction::GrantUsage => None,
+        }
+    }
+}
+
+impl From<ResourceIdentifier<DbId>> for RoleDatabaseResource {
+    fn from(r: ResourceIdentifier<DbId>) -> Self {
+        match r {
+            ResourceIdentifier::All => RoleDatabaseResource::All,
+            ResourceIdentifier::Identifier(id) => RoleDatabaseResource::Identifier(id.get()),
+        }
+    }
+}
+
+impl From<RoleDatabaseResource> for ResourceIdentifier<DbId> {
+    fn from(r: RoleDatabaseResource) -> Self {
+        match r {
+            RoleDatabaseResource::All => ResourceIdentifier::All,
+            RoleDatabaseResource::Identifier(id) => ResourceIdentifier::Identifier(DbId::from(id)),
+        }
+    }
+}
+
+impl From<TokenAction> for RoleTokenAction {
+    fn from(a: TokenAction) -> Self {
+        match a {
+            TokenAction::Read => RoleTokenAction::Read,
+            TokenAction::Create => RoleTokenAction::Create,
+            TokenAction::Delete => RoleTokenAction::Delete,
+        }
+    }
+}
+
+impl From<RoleTokenAction> for Option<TokenAction> {
+    fn from(a: RoleTokenAction) -> Self {
+        match a {
+            RoleTokenAction::Read => Some(TokenAction::Read),
+            RoleTokenAction::Create => Some(TokenAction::Create),
+            RoleTokenAction::Delete => Some(TokenAction::Delete),
+            RoleTokenAction::GrantUsage => None,
+        }
+    }
+}
+
+impl From<UserAction> for RoleUserAction {
+    fn from(a: UserAction) -> Self {
+        match a {
+            UserAction::Read => RoleUserAction::Read,
+            UserAction::Create => RoleUserAction::Create,
+            UserAction::Update => RoleUserAction::Update,
+            UserAction::Delete => RoleUserAction::Delete,
+        }
+    }
+}
+
+impl From<RoleUserAction> for Option<UserAction> {
+    fn from(a: RoleUserAction) -> Self {
+        match a {
+            RoleUserAction::Read => Some(UserAction::Read),
+            RoleUserAction::Create => Some(UserAction::Create),
+            RoleUserAction::Update => Some(UserAction::Update),
+            RoleUserAction::Delete => Some(UserAction::Delete),
+            RoleUserAction::GrantUsage => None,
+        }
+    }
+}
+
+impl From<RoleAction> for RoleRoleAction {
+    fn from(a: RoleAction) -> Self {
+        match a {
+            RoleAction::Read => RoleRoleAction::Read,
+            RoleAction::Create => RoleRoleAction::Create,
+            RoleAction::Update => RoleRoleAction::Update,
+            RoleAction::Delete => RoleRoleAction::Delete,
+        }
+    }
+}
+
+impl From<RoleRoleAction> for RoleAction {
+    fn from(a: RoleRoleAction) -> Self {
+        match a {
+            RoleRoleAction::Read => RoleAction::Read,
+            RoleRoleAction::Create => RoleAction::Create,
+            RoleRoleAction::Update => RoleAction::Update,
+            RoleRoleAction::Delete => RoleAction::Delete,
+        }
+    }
+}
+
+impl From<AdminTokenAction> for RoleAdminTokenAction {
+    fn from(a: AdminTokenAction) -> Self {
+        match a {
+            AdminTokenAction::Create => RoleAdminTokenAction::Create,
+            AdminTokenAction::Delete => RoleAdminTokenAction::Delete,
+        }
+    }
+}
+
+impl From<RoleAdminTokenAction> for AdminTokenAction {
+    fn from(a: RoleAdminTokenAction) -> Self {
+        match a {
+            RoleAdminTokenAction::Create => AdminTokenAction::Create,
+            RoleAdminTokenAction::Delete => AdminTokenAction::Delete,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

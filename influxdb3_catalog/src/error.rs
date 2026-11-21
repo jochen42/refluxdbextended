@@ -1,15 +1,52 @@
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
 use anyhow::anyhow;
+use enterprise::EnterpriseCatalogError;
 use humantime::Duration;
+use influxdb3_id::QueryGroupId;
 use schema::InfluxColumnType;
+use uuid::Uuid;
 
-use crate::{channel::SubscriptionError, object_store::ObjectStoreCatalogError};
+pub(crate) mod enterprise;
+
+const MAX_TABLE_NAME_ERROR_LEN: usize = 256;
+
+/// New type to keep long table names from making catalog error messages too large.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruncatedTableName(Arc<str>);
+
+impl TruncatedTableName {
+    pub fn new(s: impl Into<Arc<str>>) -> Self {
+        let s: Arc<str> = s.into();
+        Self(s[..s.floor_char_boundary(MAX_TABLE_NAME_ERROR_LEN)].into())
+    }
+
+    pub fn inner(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl Display for TruncatedTableName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.inner())
+    }
+}
+
+use crate::{
+    channel::SubscriptionError, format::FeatureLevel, format::FormatError,
+    log::versions::v4::StorageMode, object_store::ObjectStoreCatalogError,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
+    #[error(transparent)]
+    Enterprise(#[from] EnterpriseCatalogError),
+
     #[error("object store error: {0:?}")]
     ObjectStore(#[from] ObjectStoreCatalogError),
+
+    #[error("catalog format error: {0}")]
+    Format(#[from] FormatError),
 
     #[error("attempted to create a resource that already exists")]
     AlreadyExists,
@@ -19,6 +56,22 @@ pub enum CatalogError {
 
     #[error("attempted to modify resource that was already deleted: {0}")]
     AlreadyDeleted(String),
+
+    /// Request is idempotent: no catalog state would change.
+    #[error("no catalog changes to apply: {details}")]
+    NoCatalogChange { details: String },
+
+    /// Request is invalid.
+    #[error("catalog internal error: {details}")]
+    Internal { details: String },
+
+    #[error(
+        "persisted catalog checkpoint sequence {checkpoint_sequence} is ahead of live catalog sequence {live_sequence}"
+    )]
+    BackupCheckpointAhead {
+        checkpoint_sequence: u64,
+        live_sequence: u64,
+    },
 
     #[error("invalid configuration provided: {message}")]
     InvalidConfiguration { message: Box<str> },
@@ -45,14 +98,55 @@ pub enum CatalogError {
     #[error("'{0}' is a reserved column")]
     ReservedColumn(Arc<str>),
 
+    #[error(
+        "table '{table_name}' is not defined in database '{db_name}', which uses explicit schemas; \
+         create the table with the /api/v3/configure/table API before writing to it"
+    )]
+    UndeclaredTable {
+        db_name: Arc<str>,
+        table_name: Arc<str>,
+    },
+
+    #[error(
+        "column '{column_name}' ({column_type}) is not defined in table '{table_name}' of \
+         database '{db_name}', which uses explicit schemas; add the column with the \
+         /api/v3/configure/table API before writing to it"
+    )]
+    UndeclaredColumn {
+        db_name: Arc<str>,
+        table_name: Arc<str>,
+        column_name: Arc<str>,
+        column_type: InfluxColumnType,
+    },
+
     #[error("invalid node registration")]
     InvalidNodeRegistration,
 
-    #[error("Update to schema would exceed number of columns per table limit of {0} columns")]
-    TooManyColumns(usize),
+    #[error("invalid node name ({0})")]
+    InvalidNodeName(String),
 
-    #[error("Update to schema would exceed number of tag columns per table limit of {0} columns")]
-    TooManyTagColumns(usize),
+    #[error("invalid node spec: {0}")]
+    InvalidNodeSpec(#[source] anyhow::Error),
+
+    #[error(
+        "Schema update for table '{table_name}' would exceed the column limit: \
+        proposed schema update would have {attempted} columns, but the limit is {limit}"
+    )]
+    TooManyColumns {
+        table_name: TruncatedTableName,
+        attempted: usize,
+        limit: usize,
+    },
+
+    #[error(
+        "Schema update for table '{table_name}' would exceed the tag column limit: \
+        proposed schema would have {attempted} tag columns, but the limit is {limit}"
+    )]
+    TooManyTagColumns {
+        table_name: TruncatedTableName,
+        attempted: usize,
+        limit: usize,
+    },
 
     #[error(
         "Update to schema would exceed number of tables limit: attempted to create table but already have {current} table(s) (limit: {limit})"
@@ -66,6 +160,17 @@ pub enum CatalogError {
         "Update to schema would exceed the field limit ({limit}) for field family '{field_family}'"
     )]
     TooManyFields { field_family: String, limit: usize },
+
+    #[error("Update to schema would exceed the field family limit of {0}")]
+    TooManyFieldFamilies(usize),
+
+    #[error(
+        "table '{table_name}' in storage mode {storage_mode:?} cannot allocate more legacy column IDs"
+    )]
+    LegacyColumnIdsExhausted {
+        table_name: Arc<str>,
+        storage_mode: StorageMode,
+    },
 
     #[error("Database not found {}", db_name)]
     DatabaseNotFound { db_name: Arc<str> },
@@ -172,8 +277,14 @@ pub enum CatalogError {
     #[error("invalid error behavior {0}")]
     InvalidErrorBehavior(String),
 
+    #[error("cannot parse token permission, {0}")]
+    CannotParsePermissionForToken(String),
+
     #[error("token name already exists, {0}")]
     TokenNameAlreadyExists(String),
+
+    #[error("token hash already exists")]
+    TokenHashAlreadyExists,
 
     #[error("missing admin token, cannot update")]
     MissingAdminTokenToUpdate,
@@ -181,8 +292,46 @@ pub enum CatalogError {
     #[error("cannot delete internal db")]
     CannotDeleteInternalDatabase,
 
+    #[error("cannot modify internal db")]
+    CannotModifyInternalDatabase,
+
     #[error("tried to stop a node ({node_id}) that is already stopped")]
     NodeAlreadyStopped { node_id: Arc<str> },
+
+    #[error(
+        "node '{node_id}' is registered by process {registrant}; process {stopping} may not mark it stopped"
+    )]
+    NodeStopNotFromRegistrant {
+        node_id: Arc<str>,
+        registrant: Uuid,
+        stopping: Uuid,
+    },
+
+    #[error(
+        "node '{node_id}' is not fully stopped (current state: {current_state}); run \"stop node\" first"
+    )]
+    NodeNotFullyStopped {
+        node_id: Arc<str>,
+        current_state: &'static str,
+    },
+
+    #[error("node '{node_id}' has compact mode and cannot be removed")]
+    NodeModeNotRemovable { node_id: Arc<str> },
+
+    #[error("invalid stop ack for node '{node_id}' (current state: {current_state})")]
+    InvalidStopAck {
+        node_id: Arc<str>,
+        current_state: &'static str,
+    },
+
+    #[error("invalid unregister for node '{node_id}' (current state: {current_state})")]
+    InvalidUnregister {
+        node_id: Arc<str>,
+        current_state: &'static str,
+    },
+
+    #[error("idempotent no-op")]
+    IdempotentNoOp,
 
     #[error("cannot delete operator token")]
     CannotDeleteOperatorToken,
@@ -202,6 +351,64 @@ pub enum CatalogError {
         name: Arc<str>,
         existing: InfluxColumnType,
     },
+
+    #[error(
+        "record id {record_id} exceeds the cluster's committed feature level (core={}, enterprise={}); \
+        the cluster must finish upgrading before this operation is available",
+        committed.core,
+        committed.enterprise,
+    )]
+    RecordExceedsCommittedFeatureLevel {
+        record_id: u16,
+        committed: FeatureLevel,
+    },
+
+    #[error(
+        "this node's feature level (core={}, enterprise={}) is below the cluster's committed level (core={}, enterprise={}); upgrade required",
+        local.core,
+        local.enterprise,
+        committed.core,
+        committed.enterprise,
+    )]
+    NodeBelowCommittedFeatureLevel {
+        committed: FeatureLevel,
+        local: FeatureLevel,
+    },
+
+    #[error("missing object store for restore operation")]
+    MissingObjectStoreForRestore,
+
+    #[error(
+        "cannot remove node '{node_id}' because it is a member of query group '{query_group_name}' (id {query_group_id})"
+    )]
+    NodeInQueryGroup {
+        node_id: Arc<str>,
+        query_group_name: Arc<str>,
+        query_group_id: QueryGroupId,
+    },
+
+    #[error(
+        "cannot place node '{node_id}' in this query group because it already belongs to query group '{query_group_name}' (id {query_group_id})"
+    )]
+    NodeAlreadyInQueryGroup {
+        node_id: Arc<str>,
+        query_group_name: Arc<str>,
+        query_group_id: QueryGroupId,
+    },
+
+    #[error(
+        "node '{node_id}' advertises no connection address (conn info e.g. 8181), so other query group members cannot reach it"
+    )]
+    QueryGroupMemberNotConnectable { node_id: Arc<str> },
+
+    #[error(
+        "node '{node_id}' cannot clear its connection address (conn info e.g. 8181) while it is a member of query group '{query_group_name}' (id {query_group_id})"
+    )]
+    NodeConnInfoRequiredInQueryGroup {
+        node_id: Arc<str>,
+        query_group_name: Arc<str>,
+        query_group_id: QueryGroupId,
+    },
 }
 
 impl CatalogError {
@@ -213,5 +420,43 @@ impl CatalogError {
 
     pub fn unexpected(message: impl Into<String>) -> Self {
         Self::Other(anyhow!(message.into()))
+    }
+
+    pub(crate) fn too_many_columns(
+        table_name: impl Into<Arc<str>>,
+        attempted: usize,
+        limit: usize,
+    ) -> Self {
+        Self::TooManyColumns {
+            table_name: TruncatedTableName::new(table_name),
+            attempted,
+            limit,
+        }
+    }
+
+    pub(crate) fn too_many_tag_columns(
+        table_name: impl Into<Arc<str>>,
+        attempted: usize,
+        limit: usize,
+    ) -> Self {
+        Self::TooManyTagColumns {
+            table_name: TruncatedTableName::new(table_name),
+            attempted,
+            limit,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CatalogError, MAX_TABLE_NAME_ERROR_LEN};
+
+    #[test]
+    fn column_limit_error_truncates_table_name() {
+        let table_name = format!("{}suffix", "a".repeat(MAX_TABLE_NAME_ERROR_LEN));
+        let err = CatalogError::too_many_columns(table_name, 11, 10).to_string();
+
+        assert!(err.contains(&"a".repeat(MAX_TABLE_NAME_ERROR_LEN)));
+        assert!(!err.contains("suffix"));
     }
 }

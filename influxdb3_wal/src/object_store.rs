@@ -9,7 +9,7 @@ use data_types::Timestamp;
 use futures_util::stream::StreamExt;
 use hashbrown::HashMap;
 use influxdb3_shutdown::{CancellationToken, ShutdownToken};
-use iox_time::TimeProvider;
+use iox_time::{Time, TimeProvider};
 use metric::{Registry, U64Gauge};
 use object_store::path::{Path, PathPart};
 use object_store::{ObjectStore, PutPayload};
@@ -47,6 +47,12 @@ pub struct WalObjectStore {
     snapshotted_wal_files_to_keep: u64,
     wal_remover: WalFileRemover,
     shutdown_token: CancellationToken,
+    /// Held for the whole of the `flush_buffer` method, so flushes run one at a
+    /// time. WAL files are then sent to the notifiers in WAL file order, and a
+    /// snapshot is planned only after every earlier WAL file has been sent to
+    /// the notifiers. Take this lock before the flush-buffer lock. Do not wait
+    /// for it while holding the flush-buffer lock or a snapshot permit.
+    flush_in_progress: Mutex<()>,
 }
 
 impl WalObjectStore {
@@ -103,8 +109,6 @@ impl WalObjectStore {
 
         Ok(wal)
     }
-
-    #[allow(clippy::too_many_arguments)]
     fn new_without_replay(
         time_provider: Arc<dyn TimeProvider>,
         object_store: Arc<dyn ObjectStore>,
@@ -151,6 +155,7 @@ impl WalObjectStore {
                 }),
             },
             shutdown_token,
+            flush_in_progress: Mutex::new(()),
         }
     }
 
@@ -187,10 +192,13 @@ impl WalObjectStore {
         async fn get_contents(
             object_store: Arc<dyn ObjectStore>,
             path: Path,
-        ) -> (Path, Result<WalContents, crate::Error>) {
+        ) -> (Path, Result<(WalContents, u64), crate::Error>) {
             let result = async {
                 let file_bytes = object_store.get(&path).await?.bytes().await?;
-                verify_file_type_and_deserialize(file_bytes).map_err(Into::into)
+                let size_bytes = file_bytes.len() as u64;
+                verify_file_type_and_deserialize(file_bytes)
+                    .map(|contents| (contents, size_bytes))
+                    .map_err(Into::into)
             }
             .await;
             (path, result)
@@ -216,8 +224,8 @@ impl WalObjectStore {
                 set_files_pending(remaining);
                 remaining -= 1;
 
-                let wal_contents = match result.await? {
-                    (_, Ok(wal_contents)) => wal_contents,
+                let (wal_contents, size_bytes) = match result.await? {
+                    (_, Ok(contents_and_size)) => contents_and_size,
                     (
                         path,
                         Err(Error::Serialize(
@@ -236,6 +244,7 @@ impl WalObjectStore {
                 };
                 info!(
                     n_ops = %wal_contents.ops.len(),
+                    size_bytes,
                     min_timestamp_ns = %wal_contents.min_timestamp_ns,
                     max_timestamp_ns = %wal_contents.max_timestamp_ns,
                     wal_file_number = %wal_contents.wal_file_number,
@@ -338,6 +347,15 @@ impl WalObjectStore {
         SnapshotDetails,
         OwnedSemaphorePermit,
     )> {
+        // Timed flushes (the flush loop) and forced flushes (the memory and
+        // max-age check) run in different tasks. This lock makes them run one
+        // at a time. Without it, a forced flush could take a snapshot while an
+        // earlier timed flush is still writing its WAL file. The snapshot would
+        // mark that file as covered without its rows, so a restart would skip
+        // the file and lose acknowledged writes.
+        let lock_wait_start = Instant::now();
+        let _flushing = self.flush_in_progress.lock().await;
+        let lock_wait = lock_wait_start.elapsed();
         let (wal_contents, responses, snapshot) = {
             let mut flush_buffer = self.flush_buffer.lock().await;
             if flush_buffer.wal_buffer.is_empty() && !force_snapshot {
@@ -347,19 +365,21 @@ impl WalObjectStore {
                 .flush_buffer_into_contents_and_responses(force_snapshot)
                 .await
         };
-        info!(
-            host = self.node_identifier_prefix,
-            n_ops = %wal_contents.ops.len(),
-            min_timestamp_ns = %wal_contents.min_timestamp_ns,
-            max_timestamp_ns = %wal_contents.max_timestamp_ns,
-            wal_file_number = %wal_contents.wal_file_number,
-            "flushing WAL buffer to object store"
-        );
-
         let wal_path = wal_path(&self.node_identifier_prefix, wal_contents.wal_file_number);
         let data = crate::serialize::serialize_to_file_bytes(&wal_contents)
             .expect("unable to serialize wal contents into bytes for file");
         let data = Bytes::from(data);
+        info!(
+            host = self.node_identifier_prefix,
+            n_ops = %wal_contents.ops.len(),
+            size_bytes = data.len(),
+            min_timestamp_ns = %wal_contents.min_timestamp_ns,
+            max_timestamp_ns = %wal_contents.max_timestamp_ns,
+            wal_file_number = %wal_contents.wal_file_number,
+            ?lock_wait,
+            "flushing WAL buffer to object store"
+        );
+
         // One nonce per WAL file, minted outside the retry loop below so that
         // every attempt at this file carries the same one.
         let nonce = PutNonce::generate();
@@ -394,6 +414,9 @@ impl WalObjectStore {
                         object metadata or a WAL file left by an older build can produce the \
                         same result"
                     );
+                    // This flush's snapshot never runs; release its permit
+                    // before the lock — never lock while owning a permit.
+                    drop(snapshot);
                     // update the state on the wal buffer so that new writes are not
                     // accepted:
                     let error = WalBufferErrorState::WalAlreadyWrittenTo;
@@ -423,6 +446,9 @@ impl WalObjectStore {
                             let _ = response.send(WriteResult::Error(e.to_string()));
                         }
 
+                        // This flush's snapshot never runs; release its permit
+                        // before the lock — never lock while owning a permit.
+                        drop(snapshot);
                         self.flush_buffer
                             .lock()
                             .await
@@ -677,6 +703,14 @@ impl Wal for WalObjectStore {
             .last_wal_sequence_number()
     }
 
+    async fn unsnapshotted_since(&self) -> Option<Time> {
+        self.flush_buffer
+            .lock()
+            .await
+            .snapshot_tracker
+            .oldest_period_added_at()
+    }
+
     async fn last_snapshot_sequence_number(&self) -> SnapshotSequenceNumber {
         self.flush_buffer
             .lock()
@@ -733,7 +767,11 @@ impl FlushBuffer {
 
     fn replay_wal_period(&mut self, wal_period: WalPeriod) {
         self.wal_buffer.wal_file_sequence_number = wal_period.wal_file_number.next();
-        self.snapshot_tracker.add_wal_period(wal_period);
+        // Replayed periods age from the replay, not from their original
+        // write: the age trigger then bounds how long a replayed backlog
+        // waits after a restart.
+        self.snapshot_tracker
+            .add_wal_period(wal_period.added_at(self.time_provider.now()));
     }
 
     /// Converts the wal_buffer into contents and resets it. Returns the channels waiting for
@@ -768,6 +806,7 @@ impl FlushBuffer {
             wal_file_number: wal_contents.wal_file_number,
             min_time: Timestamp::new(wal_contents.min_timestamp_ns),
             max_time: Timestamp::new(wal_contents.max_timestamp_ns),
+            added_at: Some(self.time_provider.now()),
         });
         let snapshot_details = self.snapshot_tracker.snapshot(force_snapshot);
         let snapshot = match snapshot_details {
@@ -878,6 +917,7 @@ impl WalBuffer {
         if self.op_count >= self.op_limit {
             return Err(crate::Error::BufferFull(self.op_count));
         }
+        self.op_count += ops.len();
 
         for op in ops {
             match op {
@@ -917,8 +957,10 @@ impl WalBuffer {
         if !self.is_accepting_writes() {
             return Err(crate::Error::Shutdown);
         }
-        self.write_op_responses.push(response);
         self.write_ops_unconfirmed(ops)?;
+        // Register the response only for accepted ops; a rejected write's
+        // sender must not be signalled success by the next flush.
+        self.write_op_responses.push(response);
 
         Ok(())
     }

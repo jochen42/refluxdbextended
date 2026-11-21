@@ -504,7 +504,7 @@ fn test_get_files_with_filters() {
             let chunk_time = i;
             ParquetFile {
                 id: ParquetFileId::new(),
-                path: format!("/path/{i:03}.parquet"),
+                path: format!("/path/{i:03}.parquet").into(),
                 size_bytes: 1,
                 row_count: 1,
                 chunk_time,
@@ -592,6 +592,7 @@ fn test_get_files_with_filters() {
             vec![ColumnDefinition::timestamp(0)],
             vec![],
             vec![],
+            None,
             FieldFamilyMode::Aware,
         )
         .unwrap(),
@@ -645,7 +646,7 @@ fn build_parquet_files(prefix: &str, num_files: u32) -> Vec<ParquetFile> {
     let parquet_files: Vec<ParquetFile> = (0..num_files)
         .map(|i| ParquetFile {
             id: ParquetFileId::new(),
-            path: format!("/random/path/{prefix}_{i}.parquet"),
+            path: format!("/random/path/{prefix}_{i}.parquet").into(),
             size_bytes: 50_000,
             row_count: 10,
             chunk_time: 10,
@@ -679,7 +680,7 @@ async fn test_remove_files_for_deletion_deleted_database() {
         .unwrap();
 
     // Create a mock catalog that returns no retention periods
-    let catalog = Arc::new(Catalog::new_in_memory("test").await.unwrap());
+    let catalog = Catalog::new_in_memory("test").await.unwrap();
 
     let removed = persisted_files.remove_files_for_deletion(catalog);
 
@@ -735,7 +736,7 @@ async fn test_remove_files_for_deletion_deleted_tables() {
         .await
         .unwrap();
 
-    let catalog = Arc::new(Catalog::new_in_memory("test").await.unwrap());
+    let catalog = Catalog::new_in_memory("test").await.unwrap();
 
     let removed = persisted_files.remove_files_for_deletion(catalog);
 
@@ -780,7 +781,7 @@ async fn test_remove_files_for_deletion_clears_deleted_data() {
         assert_eq!(inner.deleted_data.len(), 1);
     }
 
-    let catalog = Arc::new(Catalog::new_in_memory("test").await.unwrap());
+    let catalog = Catalog::new_in_memory("test").await.unwrap();
 
     persisted_files.remove_files_for_deletion(catalog);
 
@@ -853,7 +854,7 @@ fn test_new_from_checkpoints_with_pending_removed() {
     // Create a file that exists in January
     let jan_file = ParquetFile {
         id: ParquetFileId::new(),
-        path: "/jan/file.parquet".to_string(),
+        path: "/jan/file.parquet".into(),
         size_bytes: 50_000,
         row_count: 10,
         chunk_time: 10,
@@ -916,7 +917,7 @@ fn test_new_from_checkpoints_pending_removed_missing_db() {
     // Create a pending_removed that references a non-existent database
     let missing_file = ParquetFile {
         id: ParquetFileId::new(),
-        path: "/missing/file.parquet".to_string(),
+        path: "/missing/file.parquet".into(),
         size_bytes: 50_000,
         row_count: 10,
         chunk_time: 10,
@@ -964,4 +965,105 @@ fn parse_gen1_path_accepts_split_chunk_ordinal_suffix() {
         parse_gen1_path("/dbs/1/2/2026-09-05/14-00/0000001337.parquet"),
         None
     );
+}
+
+fn build_snapshot_removing(db_id: DbId, table_id: TableId, snapshot_id: u64) -> PersistedSnapshot {
+    let mut snapshot = build_snapshot(vec![], snapshot_id, snapshot_id, snapshot_id);
+    let file = build_parquet_files("removed_", 1).pop().unwrap();
+    snapshot
+        .removed_files
+        .entry(db_id)
+        .or_default()
+        .tables
+        .entry(table_id)
+        .or_default()
+        .push(file);
+    snapshot
+}
+
+#[test]
+fn test_remove_files_by_id_non_contiguous() {
+    let mut files = build_parquet_files("file_", 6);
+    let all_ids: Vec<ParquetFileId> = files.iter().map(|f| f.id).collect();
+    // Removing every other file leaves gaps that `swap_remove` fills from the back, so an
+    // element that lands in a gap must already have been tested.
+    let ids: HashSet<ParquetFileId> = all_ids.iter().copied().step_by(2).collect();
+
+    let removed = remove_files_by_id(&mut files, &ids);
+
+    assert_eq!(
+        RemovedFiles {
+            count: 3,
+            size_bytes: 150_000,
+            row_count: 30,
+        },
+        removed
+    );
+    let mut remaining: Vec<ParquetFileId> = files.iter().map(|f| f.id).collect();
+    remaining.sort_unstable();
+    let mut expected: Vec<ParquetFileId> = all_ids.iter().copied().skip(1).step_by(2).collect();
+    expected.sort_unstable();
+    assert_eq!(expected, remaining);
+
+    // Ids that are not present remove nothing.
+    let absent: HashSet<ParquetFileId> = ids;
+    assert_eq!(
+        RemovedFiles::default(),
+        remove_files_by_id(&mut files, &absent)
+    );
+    assert_eq!(3, files.len());
+}
+
+#[test]
+fn test_removed_files_drop_previously_merged_files() {
+    let parquet_files = build_parquet_files("file_", 5);
+    let adding = build_snapshot(parquet_files.clone(), 1, 1, 1);
+    let mut removing = build_snapshot(vec![], 2, 2, 2);
+    removing
+        .removed_files
+        .entry(DbId::from(0))
+        .or_default()
+        .tables
+        .entry(TableId::from(0))
+        .or_default()
+        .extend(parquet_files.iter().step_by(2).cloned());
+    let mut files: DatabaseToTables = HashMap::new();
+
+    let added = update_persisted_files_with_snapshot(true, &adding, &mut files);
+    let removed = update_persisted_files_with_snapshot(true, &removing, &mut files);
+
+    assert_eq!((5, 0, 0), added);
+    // The file count is left out: it does not count these removals yet (#6088).
+    let (_, removed_size, removed_row_count) = removed;
+    assert_eq!((150_000, 30), (removed_size, removed_row_count));
+    let mut remaining: Vec<ParquetFileId> = files[&DbId::from(0)][&TableId::from(0)]
+        .iter()
+        .map(|f| f.id)
+        .collect();
+    remaining.sort_unstable();
+    let mut expected: Vec<ParquetFileId> = parquet_files
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .map(|f| f.id)
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(expected, remaining);
+}
+
+#[test]
+fn test_removed_files_for_unmerged_ids_change_nothing() {
+    // A removal for an id the table does not hold must leave the table untouched, including
+    // when the removal is merged before the snapshot that added the file.
+    let parquet_files = build_parquet_files("file_", 3);
+    let adding = build_snapshot(parquet_files, 1, 1, 1);
+    let removing = build_snapshot_removing(DbId::from(0), TableId::from(0), 2);
+    let mut files: DatabaseToTables = HashMap::new();
+
+    let added = update_persisted_files_with_snapshot(true, &adding, &mut files);
+    let removed = update_persisted_files_with_snapshot(true, &removing, &mut files);
+
+    assert_eq!((3, 0, 0), added);
+    assert_eq!((0, 0, 0), removed);
+    assert_eq!(3, files[&DbId::from(0)][&TableId::from(0)].len());
 }

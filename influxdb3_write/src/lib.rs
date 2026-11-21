@@ -23,7 +23,7 @@ pub mod write_buffer;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use data_types::{NamespaceName, TimestampMinMax};
+use data_types::TimestampMinMax;
 use datafusion::{
     catalog::Session,
     common::{Column, DFSchema},
@@ -34,18 +34,23 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
+use hashbrown::HashSet;
 use influxdb3_cache::{distinct_cache::DistinctCacheProvider, last_cache::LastCacheProvider};
-use influxdb3_catalog::catalog::{Catalog, CatalogSequenceNumber, DatabaseSchema, TableDefinition};
+use influxdb3_catalog::catalog::{
+    Catalog, CatalogSequenceNumber, DatabaseSchema, INTERNAL_DB_NAME, TableDefinition,
+};
 use influxdb3_id::{DbId, ParquetFileId, SerdeVecMap, TableId};
+use influxdb3_types::DatabaseName;
 pub use influxdb3_types::write::Precision;
 use influxdb3_wal::{SnapshotSequenceNumber, Wal, WalFileSequenceNumber};
 use iox_query::QueryChunk;
 use iox_time::Time;
 use observability_deps::tracing::debug;
 use schema::TIME_COLUMN_NAME;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, sync::Arc};
 use thiserror::Error;
+use write_buffer::persisted_files::remove_files_by_id;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -79,7 +84,7 @@ pub trait Bufferer: Debug + Send + Sync + 'static {
     /// and returns the result with any lines that had errors and summary statistics.
     async fn write_lp(
         &self,
-        database: NamespaceName<'static>,
+        database: DatabaseName,
         lp: &str,
         ingest_time: Time,
         accept_partial: bool,
@@ -87,10 +92,30 @@ pub trait Bufferer: Debug + Send + Sync + 'static {
         no_sync: bool,
     ) -> write_buffer::Result<BufferedWriteRequest>;
 
+    /// Validates and writes system-owned line protocol into an internal database.
+    async fn write_internal_lp(
+        &self,
+        lp: &str,
+        ingest_time: Time,
+        accept_partial: bool,
+        precision: Precision,
+        no_sync: bool,
+    ) -> write_buffer::Result<BufferedWriteRequest> {
+        self.write_lp(
+            DatabaseName::new(INTERNAL_DB_NAME).expect("internal database name is valid"),
+            lp,
+            ingest_time,
+            accept_partial,
+            precision,
+            no_sync,
+        )
+        .await
+    }
+
     /// Returns the database schema provider
     fn catalog(&self) -> Arc<Catalog>;
 
-    /// Reutrns the WAL this bufferer is using
+    /// Returns the WAL this bufferer is using
     fn wal(&self) -> Arc<dyn Wal>;
 
     /// Returns the parquet files for a given database and table
@@ -139,37 +164,13 @@ pub trait LastCacheManager: Debug + Send + Sync + 'static {
     fn last_cache_provider(&self) -> Arc<LastCacheProvider>;
 }
 
-/// A single write request can have many lines in it. A writer can request to accept all lines that are valid, while
-/// returning an error for any invalid lines. This is the error information for a single invalid line.
-#[derive(Debug)]
-pub struct WriteLineError {
-    pub original_line: String,
-    pub line_number: usize,
-    pub error_message: String,
-}
-
-impl Serialize for WriteLineError {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("WriteLineError", 3)?;
-        const TRUNCATE_LIMIT: usize = 20;
-        let truncated_line =
-            &self.original_line[..self.original_line.floor_char_boundary(TRUNCATE_LIMIT)];
-        state.serialize_field("error_message", &self.error_message)?;
-        state.serialize_field("line_number", &self.line_number)?;
-        state.serialize_field("original_line", truncated_line)?;
-        state.end()
-    }
-}
+pub use influxdb3_types::write::WriteLineError;
 
 /// A write that has been validated against the catalog schema, written to the WAL (if configured), and buffered in
 /// memory. This is the summary information for the write along with any errors that were encountered.
 #[derive(Debug)]
 pub struct BufferedWriteRequest {
-    pub db_name: NamespaceName<'static>,
+    pub db_name: DatabaseName,
     pub invalid_lines: Vec<WriteLineError>,
     pub line_count: usize,
     pub field_count: usize,
@@ -198,7 +199,7 @@ pub struct PersistedSnapshot {
     /// The node identifier that persisted this snapshot
     // TODO: deprecate this alias
     #[serde(alias = "writer_id")]
-    pub node_id: String,
+    pub node_id: Arc<str>,
     /// The next file id to be used with `ParquetFile`s when the snapshot is loaded
     pub next_file_id: ParquetFileId,
     /// The snapshot sequence number associated with this snapshot
@@ -231,11 +232,13 @@ pub struct PersistedSnapshot {
 
 impl PersistedSnapshot {
     pub fn new(
-        node_id: String,
+        node_id: impl Into<Arc<str>>,
         snapshot_sequence_number: SnapshotSequenceNumber,
         wal_file_sequence_number: WalFileSequenceNumber,
         catalog_sequence_number: CatalogSequenceNumber,
     ) -> Self {
+        let node_id = node_id.into();
+
         Self {
             node_id,
             next_file_id: ParquetFileId::next_id(),
@@ -359,7 +362,7 @@ pub struct DatabaseTables {
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct ParquetFile {
     pub id: ParquetFileId,
-    pub path: String,
+    pub path: Arc<str>,
     pub size_bytes: u64,
     pub row_count: u64,
     /// chunk time nanos
@@ -406,7 +409,7 @@ impl AsRef<ParquetFile> for ParquetFile {
 
 #[cfg(test)]
 impl ParquetFile {
-    pub(crate) fn create_for_test(path: impl Into<String>) -> Self {
+    pub(crate) fn create_for_test(path: impl Into<Arc<str>>) -> Self {
         Self {
             id: ParquetFileId::new(),
             path: path.into(),
@@ -548,7 +551,7 @@ impl PersistedSnapshotCheckpointVersion {
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct PersistedSnapshotCheckpoint {
     /// The node identifier that created this checkpoint
-    pub node_id: String,
+    pub node_id: Arc<str>,
     /// The year-month this checkpoint covers (e.g., "2025-01")
     pub year_month: YearMonth,
     /// The latest snapshot sequence number merged into this checkpoint
@@ -580,7 +583,9 @@ pub struct PersistedSnapshotCheckpoint {
 
 impl PersistedSnapshotCheckpoint {
     /// Create a new empty checkpoint for the given node and month
-    pub fn new(node_id: String, year_month: YearMonth) -> Self {
+    pub fn new(node_id: impl Into<Arc<str>>, year_month: YearMonth) -> Self {
+        let node_id = node_id.into();
+
         Self {
             node_id,
             year_month,
@@ -613,20 +618,26 @@ impl PersistedSnapshotCheckpoint {
             .push(file);
     }
 
-    /// Remove a file from the checkpoint and adjust metrics.
-    /// Returns true if the file was found and removed.
-    pub fn remove_file(&mut self, db_id: DbId, table_id: TableId, file_id: ParquetFileId) -> bool {
-        let Some(db_tables) = self.databases.get_mut(&db_id) else {
-            return false;
-        };
-        let Some(table_files) = db_tables.tables.get_mut(&table_id) else {
-            return false;
-        };
-        let Some(pos) = table_files.iter().position(|f| f.id == file_id) else {
-            return false;
+    /// Remove every file in the given table whose id is in `file_ids`, and adjust metrics.
+    /// Returns the number of files removed; 0 if the database or table is not present.
+    ///
+    /// One pass over the table's files regardless of how many ids are given. The order of the
+    /// remaining files is not kept.
+    pub fn remove_files(
+        &mut self,
+        db_id: DbId,
+        table_id: TableId,
+        file_ids: &HashSet<ParquetFileId>,
+    ) -> u64 {
+        let Some(table_files) = self
+            .databases
+            .get_mut(&db_id)
+            .and_then(|db_tables| db_tables.tables.get_mut(&table_id))
+        else {
+            return 0;
         };
 
-        let removed = table_files.remove(pos);
+        let removed = remove_files_by_id(table_files, file_ids);
         self.parquet_size_bytes = self.parquet_size_bytes.saturating_sub(removed.size_bytes);
         self.row_count = self.row_count.saturating_sub(removed.row_count);
 
@@ -634,7 +645,7 @@ impl PersistedSnapshotCheckpoint {
         // removal without iterating over all remaining files; that iteration is expected to be
         // handled by the calling context using `recalculate_time_range` once all removals have
         // been handled
-        true
+        removed.count
     }
 
     /// Add a file to the pending_removed_files collection.
@@ -695,24 +706,10 @@ impl PersistedSnapshotCheckpoint {
         // These reference files from previous months (i.e., files in self)
         let mut any_removed = false;
         for (db_id, db_tables) in other.pending_removed_files {
-            let Some(self_db_tables) = self.databases.get_mut(&db_id) else {
-                continue;
-            };
-
             for (table_id, files_to_remove) in db_tables.tables {
-                let Some(self_table_files) = self_db_tables.tables.get_mut(&table_id) else {
-                    continue;
-                };
-
-                for file in files_to_remove {
-                    if let Some(idx) = self_table_files.iter().position(|f| f.id == file.id) {
-                        let removed = self_table_files.remove(idx);
-                        self.parquet_size_bytes =
-                            self.parquet_size_bytes.saturating_sub(removed.size_bytes);
-                        self.row_count = self.row_count.saturating_sub(removed.row_count);
-                        any_removed = true;
-                    }
-                }
+                let file_ids: HashSet<ParquetFileId> =
+                    files_to_remove.iter().map(|f| f.id).collect();
+                any_removed |= self.remove_files(db_id, table_id, &file_ids) > 0;
             }
         }
 
@@ -864,9 +861,9 @@ pub mod test_helpers {
     use crate::WriteBuffer;
     use crate::write_buffer::validator::WriteValidator;
     use arrow::array::RecordBatch;
-    use data_types::NamespaceName;
     use datafusion::prelude::Expr;
     use influxdb3_catalog::catalog::{Catalog, DatabaseSchema};
+    use influxdb3_types::DatabaseName;
     use influxdb3_wal::{Gen1Duration, WriteBatch};
     use iox_query::exec::IOxSessionContext;
     use iox_time::Time;
@@ -941,7 +938,7 @@ pub mod test_helpers {
     }
 
     pub async fn do_write(wb: &dyn WriteBuffer, db: &str, lp: &str, time: Time) {
-        let db_name = NamespaceName::new(db.to_owned()).expect("valid namespace name for database");
+        let db_name = DatabaseName::new(db.to_owned()).expect("valid database name");
         wb.write_lp(
             db_name,
             lp,

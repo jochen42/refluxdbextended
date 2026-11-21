@@ -13,8 +13,6 @@ observability_deps = { path = "../core/observability_deps" }
 tracker = { path = "../core/tracker" }
 iox_time = { path = "../core/iox_time" }
 metric = { path = "../core/metric" }
-trace_exporters = { path = "../core/trace_exporters" }
-trogging = { path = "../core/trogging", features = ["clap"] }
 
 # crates.io dependencies
 async-trait.workspace = true
@@ -30,6 +28,7 @@ itertools.workspace = true
 libc.workspace = true
 non-empty-string.workspace = true
 object_store.workspace = true
+parking_lot.workspace = true
 paste.workspace = true
 serde.workspace = true
 serde_json.workspace = true

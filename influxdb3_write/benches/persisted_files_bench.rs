@@ -31,7 +31,7 @@ fn create_parquet_file(idx: usize, prefix: &str) -> ParquetFile {
     let min_time = idx as i64 * 1000;
     ParquetFile {
         id: ParquetFileId::new(),
-        path: format!("/db/table/{prefix}_{idx:08}.parquet"),
+        path: format!("/db/table/{prefix}_{idx:08}.parquet").into(),
         size_bytes: 1024,
         row_count: 100,
         chunk_time: min_time,
@@ -75,7 +75,7 @@ fn create_snapshot_with_files(
     }
 
     PersistedSnapshot {
-        node_id: "bench-host".to_owned(),
+        node_id: Arc::from("bench-host"),
         next_file_id: ParquetFileId::next_id(),
         snapshot_sequence_number: SnapshotSequenceNumber::new(1),
         wal_file_sequence_number: influxdb3_wal::WalFileSequenceNumber::new(1),
@@ -116,7 +116,7 @@ fn create_persisted_files(file_count: usize) -> (PersistedFiles, DbId, TableId) 
     let max_time = parquet_files.iter().map(|f| f.max_time).max().unwrap_or(0);
 
     let snapshot = PersistedSnapshot {
-        node_id: "bench-host".to_owned(),
+        node_id: Arc::from("bench-host"),
         next_file_id: ParquetFileId::next_id(),
         snapshot_sequence_number: SnapshotSequenceNumber::new(1),
         wal_file_sequence_number: influxdb3_wal::WalFileSequenceNumber::new(1),

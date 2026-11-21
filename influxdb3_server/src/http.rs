@@ -9,11 +9,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use bytes::{Bytes, BytesMut};
 use chrono::DateTime;
-use data_types::NamespaceName;
 use datafusion::error::DataFusionError;
 use datafusion::execution::RecordBatchStream;
 use datafusion::execution::memory_pool::UnboundedMemoryPool;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion_util::first_error::check_for_first_error;
 use futures::FutureExt;
 use futures::{StreamExt, TryStreamExt};
 use http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_LENGTH};
@@ -28,13 +28,16 @@ use influxdb_influxql_parser::select::GroupByClause;
 use influxdb_influxql_parser::statement::Statement;
 use influxdb3_authz::{
     AccessRequest, AuthProvider, AuthenticatorError, DatabaseActions, NoAuthAuthenticator,
-    ResourceAuthorizationError,
+    ResourceAuthorizationError, Subject,
 };
 use influxdb3_cache::distinct_cache;
 use influxdb3_cache::last_cache;
 use influxdb3_catalog::CatalogError;
-use influxdb3_catalog::catalog::HardDeletionTime;
-use influxdb3_catalog::log::FieldDataType;
+use influxdb3_catalog::catalog::{
+    ApiNodeSpec, CatalogSequenceNumber, DeletionScope, FieldDataType, HardDeletionTime, PluginType,
+    SchemaMode, TriggerSpecificationDefinition,
+};
+use influxdb3_catalog::log::{CatalogBatch, DatabaseBatch, DatabaseCatalogOp, OrderedCatalogBatch};
 use influxdb3_id::TokenId;
 use influxdb3_internal_api::query_executor::{
     QueryExecutor, QueryExecutorError, ShowDatabases, ShowRetentionPolicies,
@@ -43,6 +46,7 @@ use influxdb3_process::{INFLUXDB3_GIT_HASH_SHORT, INFLUXDB3_VERSION, ProcessUuid
 use influxdb3_processing_engine::ProcessingEngineManagerImpl;
 use influxdb3_processing_engine::manager::ProcessingEngineError;
 use influxdb3_types::http::*;
+use influxdb3_types::{DatabaseName, DatabaseNameError};
 use influxdb3_write::BufferedWriteRequest;
 use influxdb3_write::Precision;
 use influxdb3_write::WriteBuffer;
@@ -140,11 +144,7 @@ impl IntoResponse for RoutingError {
                 };
                 let serialized = serde_json::to_string(&err).unwrap();
                 let body = bytes_to_response_body(serialized);
-                let status = match e {
-                    WriteParseError::NotImplemented => StatusCode::NOT_FOUND,
-                    WriteParseError::SingleTenantError(e) => StatusCode::from(&e),
-                    WriteParseError::MultiTenantError(e) => StatusCode::from(&e),
-                };
+                let status = StatusCode::from(&e);
                 ResponseBuilder::new().status(status).body(body).unwrap()
             }
             Self::Authentication(e) => e.into_response(),
@@ -232,9 +232,9 @@ pub enum Error {
     #[error("invalid mime type ({0})")]
     InvalidMimeType(String),
 
-    /// NamespaceName validation error.
-    #[error("error validating namespace name: {0}")]
-    InvalidNamespaceName(#[from] data_types::NamespaceNameError),
+    /// DatabaseName validation error.
+    #[error("error validating database name: {0}")]
+    InvalidDatabaseName(#[from] DatabaseNameError),
 
     /// Failure to decode the provided line protocol.
     #[error("failed to parse line protocol: {0}")]
@@ -347,6 +347,9 @@ pub enum Error {
     #[error("Operation with object store failed: {0}")]
     ObjectStore(#[from] object_store::Error),
 
+    #[error("heap dump failed: {0}")]
+    HeapPprof(#[from] jemalloc_pprof_http::Error),
+
     #[error(transparent)]
     Catalog(#[from] CatalogError),
 
@@ -385,6 +388,12 @@ pub enum Error {
 
     #[error("Current node mode does not use the processing engine")]
     NoProcessingEngine,
+
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
+    #[error("{0} is only available in InfluxDB 3 Enterprise")]
+    EnterpriseOnly(&'static str),
 
     #[error(transparent)]
     LegacyWriteParse(#[from] WriteParseError),
@@ -445,6 +454,7 @@ impl IntoResponse for ResourceAuthorizationError {
 /// `code` can be one of:
 /// * `invalid`
 /// * `unauthorized`
+/// * `forbidden`
 /// * `not found`
 /// * `request too large`
 /// * `internal error`
@@ -459,6 +469,15 @@ struct V2WriteApiError(Error);
 impl V2WriteApiError {
     fn to_code(&self) -> V2WriteErrorCode {
         match &self.0 {
+            // A full WAL buffer (--wal-max-buffered-writes) is saturation,
+            // not a client fault: 429 tells clients to back off and retry
+            // once the buffer flushes, matching iox's ingest memory
+            // pressure. This must stay ahead of the `Error::WriteBuffer(_)`
+            // arm below — v2 clients (Telegraf, client libraries) treat
+            // other 4xx responses as fatal and drop the batch.
+            Error::WriteBuffer(influxdb3_write::write_buffer::Error::WalError(
+                influxdb3_wal::Error::BufferFull(_),
+            )) => V2WriteErrorCode::TooManyRequests,
             Error::NonUtf8Body(_)
             | Error::NonUtf8ContentEncodingHeader(_)
             | Error::NonUtf8ContentTypeHeader(_)
@@ -466,10 +485,9 @@ impl V2WriteApiError {
             | Error::InvalidContentType { .. }
             | Error::InvalidGzip(_)
             | Error::InvalidMimeType(_)
-            | Error::InvalidNamespaceName(_)
+            | Error::InvalidDatabaseName(_)
             | Error::ParseLineProtocol(_)
             | Error::RequestLimit
-            | Error::Forbidden
             | Error::UnsupportedMethod
             | Error::NonUtf8MimeType(_)
             | Error::SerdeUrlDecoding(_)
@@ -481,9 +499,11 @@ impl V2WriteApiError {
                 CatalogError::AlreadyExists
                 | CatalogError::InvalidConfiguration { .. }
                 | CatalogError::InvalidColumnType { .. }
+                | CatalogError::UndeclaredTable { .. }
+                | CatalogError::UndeclaredColumn { .. }
                 | CatalogError::ReservedColumn(_)
-                | CatalogError::TooManyColumns(_)
-                | CatalogError::TooManyTagColumns(_)
+                | CatalogError::TooManyColumns { .. }
+                | CatalogError::TooManyTagColumns { .. }
                 | CatalogError::TooManyTables { .. }
                 | CatalogError::TooManyDbs(_)
                 | CatalogError::TooManyFields { .. }
@@ -496,9 +516,8 @@ impl V2WriteApiError {
                 _ => V2WriteErrorCode::InternalError,
             },
             Error::Unauthenticated => V2WriteErrorCode::Unauthorized,
-            Error::ResourceAuthorization(ResourceAuthorizationError::Unauthorized) => {
-                V2WriteErrorCode::Unauthorized
-            }
+            Error::ResourceAuthorization(ResourceAuthorizationError::Unauthorized)
+            | Error::Forbidden => V2WriteErrorCode::Forbidden,
             Error::RequestSizeExceeded(_) => V2WriteErrorCode::RequestTooLarge,
             _ => V2WriteErrorCode::InternalError,
         }
@@ -509,9 +528,11 @@ impl V2WriteApiError {
 enum V2WriteErrorCode {
     Invalid,
     Unauthorized,
+    Forbidden,
     NotFound,
     RequestTooLarge,
     InternalError,
+    TooManyRequests,
 }
 
 impl V2WriteErrorCode {
@@ -519,9 +540,11 @@ impl V2WriteErrorCode {
         match self {
             Self::Invalid => "invalid",
             Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
             Self::NotFound => "not found",
             Self::RequestTooLarge => "request too large",
             Self::InternalError => "internal error",
+            Self::TooManyRequests => "too many requests",
         }
     }
 
@@ -529,9 +552,11 @@ impl V2WriteErrorCode {
         match self {
             Self::Invalid => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 }
@@ -615,9 +640,8 @@ enum Either<L, R> {
 /// added in one place.
 fn datafusion_error_status_code(err: &DataFusionError) -> StatusCode {
     match err {
-        DataFusionError::Plan(_)
-        | DataFusionError::NotImplemented(_)
-        | DataFusionError::SQL(_, _) => StatusCode::BAD_REQUEST,
+        DataFusionError::Plan(_) | DataFusionError::SQL(_, _) => StatusCode::BAD_REQUEST,
+        DataFusionError::NotImplemented(_) => StatusCode::METHOD_NOT_ALLOWED,
         DataFusionError::Context(_, source) | DataFusionError::Diagnostic(_, source) => {
             datafusion_error_status_code(source.as_ref())
         }
@@ -632,6 +656,10 @@ fn datafusion_error_status_code(err: &DataFusionError) -> StatusCode {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         }
+        // A request exceeding a resource budget (e.g. memory, io, files) is
+        // the server operating properly, not a server failure. Some
+        // over-budget requests might succeed on retry.
+        DataFusionError::ResourcesExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
         DataFusionError::ArrowError(_, _)
         | DataFusionError::ParquetError(_)
         | DataFusionError::ObjectStore(_)
@@ -641,8 +669,8 @@ fn datafusion_error_status_code(err: &DataFusionError) -> StatusCode {
         | DataFusionError::SchemaError(_, _)
         | DataFusionError::Execution(_)
         | DataFusionError::ExecutionJoin(_)
-        | DataFusionError::ResourcesExhausted(_)
         | DataFusionError::External(_)
+        | DataFusionError::Ffi(_)
         | DataFusionError::Substrait(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -650,19 +678,31 @@ fn datafusion_error_status_code(err: &DataFusionError) -> StatusCode {
 impl IntoResponse for CatalogError {
     fn into_response(self) -> Response {
         let resp_or_code: Either<Response, StatusCode> = match self {
-            Self::NotFound(_) => Either::Right(StatusCode::NOT_FOUND),
-            Self::AlreadyExists | Self::AlreadyDeleted(_) => Either::Right(StatusCode::CONFLICT),
-            Self::InvalidConfiguration { .. }
+            Self::NotFound(_) | Self::DatabaseNotFound { .. } | Self::TableNotFound { .. } => {
+                Either::Right(StatusCode::NOT_FOUND)
+            }
+            Self::AlreadyExists
+            | Self::AlreadyDeleted(_)
+            | Self::TokenHashAlreadyExists
+            | Self::NodeNotFullyStopped { .. }
+            | Self::NodeModeNotRemovable { .. }
+            | Self::NodeInQueryGroup { .. }
+            | Self::NodeAlreadyInQueryGroup { .. }
+            | Self::NodeConnInfoRequiredInQueryGroup { .. } => Either::Right(StatusCode::CONFLICT),
+            Self::QueryGroupMemberNotConnectable { .. }
+            | Self::InvalidConfiguration { .. }
             | Self::InvalidDistinctCacheColumnType
             | Self::InvalidLastCacheKeyColumnType
             | Self::ReservedColumn(_)
             | Self::DuplicateColumn { .. }
             | Self::InvalidColumnType { .. }
+            | Self::UndeclaredTable { .. }
+            | Self::UndeclaredColumn { .. }
             | Self::NodeAlreadyStopped { .. } => Either::Right(StatusCode::BAD_REQUEST),
-            Self::TooManyColumns(_)
+            Self::TooManyColumns { .. }
             | Self::TooManyTables { .. }
             | Self::TooManyDbs(_)
-            | Self::TooManyTagColumns(_)
+            | Self::TooManyTagColumns { .. }
             | Self::TooManyFields { .. } => {
                 let err: ErrorMessage<()> = ErrorMessage {
                     error: self.to_string(),
@@ -705,9 +745,13 @@ impl IntoResponse for Error {
                     .body(bytes_to_response_body(err.to_string()))
                     .unwrap()
             }
-            Self::Catalog(err) | Self::WriteBuffer(WriteBufferError::CatalogUpdateError(err)) => {
-                err.into_response()
-            }
+            Self::Catalog(err)
+            | Self::WriteBuffer(WriteBufferError::CatalogUpdateError(err))
+            | Self::ProcessingEngine(
+                influxdb3_processing_engine::manager::ProcessingEngineError::CatalogUpdateError(
+                    err,
+                ),
+            ) => err.into_response(),
             Self::Query(err @ QueryExecutorError::MethodNotImplemented(_)) => {
                 ResponseBuilder::new()
                     .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -741,7 +785,7 @@ impl IntoResponse for Error {
                 .unwrap(),
             Self::WriteBuffer(WriteBufferError::ParseError(err)) => {
                 let err = ErrorMessage {
-                    error: "parsing failed for write_lp endpoint".into(),
+                    error: "line protocol parsing error".into(),
                     data: Some(err),
                 };
                 let serialized = serde_json::to_string(&err).unwrap();
@@ -765,6 +809,17 @@ impl IntoResponse for Error {
                 ResponseBuilder::new()
                     .status(StatusCode::BAD_REQUEST)
                     .body(body)
+                    .unwrap()
+            }
+            // A full WAL buffer (--wal-max-buffered-writes) is saturation:
+            // 429 tells clients to back off and retry once the buffer
+            // flushes, matching iox's ingest memory pressure.
+            Self::WriteBuffer(WriteBufferError::WalError(influxdb3_wal::Error::BufferFull(_))) => {
+                ResponseBuilder::new()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .body(bytes_to_response_body(
+                        "wal buffer is full; writes are temporarily rejected, retry shortly",
+                    ))
                     .unwrap()
             }
             Self::WriteBuffer(err @ WriteBufferError::DatabaseDeleted(_)) => {
@@ -839,6 +894,10 @@ impl IntoResponse for Error {
                         || err
                             .error_message
                             .starts_with("Adding a new database would exceed limit of")
+                        || err.error_message.contains("would exceed the column limit")
+                        || err
+                            .error_message
+                            .contains("would exceed the tag column limit")
                 });
                 let err = ErrorMessage {
                     error: "partial write of line protocol occurred".into(),
@@ -913,11 +972,11 @@ impl IntoResponse for Error {
                 .status(StatusCode::BAD_REQUEST)
                 .body(bytes_to_response_body(self.to_string()))
                 .unwrap(),
-            Self::Authentication(_) => ResponseBuilder::new()
+            Self::Authentication(_) | Self::Unauthenticated => ResponseBuilder::new()
                 .status(StatusCode::UNAUTHORIZED)
                 .body(bytes_to_response_body("".to_string()))
                 .unwrap(),
-            Self::ResourceAuthorization(_) => ResponseBuilder::new()
+            Self::ResourceAuthorization(_) | Self::Forbidden => ResponseBuilder::new()
                 .status(StatusCode::FORBIDDEN)
                 .body(bytes_to_response_body("".to_string()))
                 .unwrap(),
@@ -929,25 +988,43 @@ impl IntoResponse for Error {
                 .status(StatusCode::METHOD_NOT_ALLOWED)
                 .body(bytes_to_response_body(self.to_string()))
                 .unwrap(),
-            Self::MissingDb(_) | Self::MissingTable(_) => ResponseBuilder::new()
+            Self::InvalidRequest(_) | Self::EnterpriseOnly(_) => ResponseBuilder::new()
+                .status(StatusCode::BAD_REQUEST)
+                .body(bytes_to_response_body(self.to_string()))
+                .unwrap(),
+            Self::MissingDb(_) | Self::MissingTable(_) | Self::NoHandler => ResponseBuilder::new()
                 .status(StatusCode::NOT_FOUND)
                 .body(bytes_to_response_body(self.to_string()))
                 .unwrap(),
-            Self::NoHandler
-            | Self::NonUtf8Body(_)
+            Self::NonUtf8Body(_)
             | Self::NonUtf8ContentEncodingHeader(_)
             | Self::NonUtf8ContentTypeHeader(_)
-            | Self::ClientHangup(_)
-            | Self::RequestSizeExceeded(_)
             | Self::InvalidGzip(_)
             | Self::InvalidMimeType(_)
-            | Self::InvalidNamespaceName(_)
+            | Self::InvalidDatabaseName(_)
             | Self::ParseLineProtocol(_)
-            | Self::RequestLimit
-            | Self::Unauthenticated
-            | Self::Forbidden
+            | Self::NonUtf8MimeType(_) => ResponseBuilder::new()
+                .status(StatusCode::BAD_REQUEST)
+                .body(bytes_to_response_body(self.to_string()))
+                .unwrap(),
+            Self::RequestSizeExceeded(_) => ResponseBuilder::new()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(bytes_to_response_body(self.to_string()))
+                .unwrap(),
+            Self::RequestLimit => ResponseBuilder::new()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(bytes_to_response_body(self.to_string()))
+                .unwrap(),
+            Self::Influxdb3TypesHttp(err) => ResponseBuilder::new()
+                .status(StatusCode::from(&err))
+                .body(bytes_to_response_body(err.to_string()))
+                .unwrap(),
+            Self::LegacyWriteParse(err) => ResponseBuilder::new()
+                .status(StatusCode::from(&err))
+                .body(bytes_to_response_body(err.to_string()))
+                .unwrap(),
+            Self::ClientHangup(_)
             | Self::ServingHttp(_)
-            | Self::NonUtf8MimeType(_)
             | Self::Arrow(_)
             | Self::Hyper(_)
             | Self::WriteBuffer(_)
@@ -957,11 +1034,10 @@ impl IntoResponse for Error {
             | Self::Io(_)
             | Self::Query(_)
             | Self::ObjectStore(_)
+            | Self::HeapPprof(_)
             | Self::PythonPluginsNotEnabled
             | Self::Plugin(_)
-            | Self::ProcessingEngine(_)
-            | Self::Influxdb3TypesHttp(_)
-            | Self::LegacyWriteParse(_) => ResponseBuilder::new()
+            | Self::ProcessingEngine(_) => ResponseBuilder::new()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(bytes_to_response_body(self.to_string()))
                 .unwrap(),
@@ -1054,11 +1130,13 @@ pub struct HttpApi {
     common_state: CommonServerState,
     write_buffer: Arc<dyn WriteBuffer>,
     processing_engine: Arc<ProcessingEngineManagerImpl>,
+    allowed_plugin_trigger_types: Vec<PluginType>,
     time_provider: Arc<dyn TimeProvider>,
     pub(crate) query_executor: Arc<dyn QueryExecutor>,
     max_request_bytes: usize,
     authorizer: Arc<dyn AuthProvider>,
     legacy_write_param_unifier: SingleTenantRequestUnifier,
+    test_mode_enabled: bool,
     pub(crate) endpoint_policy: EndpointPolicy,
     readiness: ReadinessProbe,
 }
@@ -1079,8 +1157,32 @@ impl HttpApi {
         write_buffer: Arc<dyn WriteBuffer>,
         query_executor: Arc<dyn QueryExecutor>,
         processing_engine: Arc<ProcessingEngineManagerImpl>,
+        allowed_plugin_trigger_types: Vec<PluginType>,
         max_request_bytes: usize,
         authorizer: Arc<dyn AuthProvider>,
+    ) -> Self {
+        Self::with_test_mode(
+            common_state,
+            time_provider,
+            write_buffer,
+            query_executor,
+            processing_engine,
+            allowed_plugin_trigger_types,
+            max_request_bytes,
+            authorizer,
+            false,
+        )
+    }
+    pub fn with_test_mode(
+        common_state: CommonServerState,
+        time_provider: Arc<dyn TimeProvider>,
+        write_buffer: Arc<dyn WriteBuffer>,
+        query_executor: Arc<dyn QueryExecutor>,
+        processing_engine: Arc<ProcessingEngineManagerImpl>,
+        allowed_plugin_trigger_types: Vec<PluginType>,
+        max_request_bytes: usize,
+        authorizer: Arc<dyn AuthProvider>,
+        test_mode_enabled: bool,
     ) -> Self {
         // there is a global authentication setup, passing in auth provider just does the same
         // check twice. So, instead we pass in a NoAuthAuthenticator to avoid authenticating twice.
@@ -1095,6 +1197,8 @@ impl HttpApi {
             authorizer,
             legacy_write_param_unifier,
             processing_engine,
+            allowed_plugin_trigger_types,
+            test_mode_enabled,
             endpoint_policy: EndpointPolicy::allow_all(),
             readiness: ReadinessProbe::default(),
         }
@@ -1127,8 +1231,8 @@ impl HttpApi {
         validate_db_name(&params.db)?;
         self.authorize_database(request_token_id(&req), &params.db, DatabaseActions::WRITE)
             .await?;
-        // NamespaceName contains additional validation; do it early
-        let database = NamespaceName::new(params.db)?;
+        // DatabaseName contains additional validation; do it early
+        let database = DatabaseName::new(params.db)?;
         let body = self.read_body(req).await?;
         let body = std::str::from_utf8(&body).map_err(Error::NonUtf8Body)?;
 
@@ -1181,10 +1285,7 @@ impl HttpApi {
         let token_request: CreateNamedAdminTokenRequest = self.read_body_json(req).await?;
         let catalog = self.write_buffer.catalog();
         let (token_info, token) = catalog
-            .create_named_admin_token_with_permission(
-                token_request.token_name,
-                token_request.expiry_secs,
-            )
+            .create_named_admin_token(token_request.token_name, token_request.expiry_secs)
             .await?;
 
         let response = CreateTokenWithPermissionsResponse::from_token_info(token_info, token);
@@ -1321,6 +1422,7 @@ impl HttpApi {
 
     async fn query_sql(&self, req: Request) -> Result<Response> {
         let token_id = request_token_id(&req);
+        let span_ctx = req.extensions().get::<SpanContext>().cloned();
         let QueryRequest {
             database,
             query_str,
@@ -1331,10 +1433,6 @@ impl HttpApi {
             .await?;
 
         info!(%database, %query_str, ?format, "handling query_sql");
-
-        let span_ctx = Some(SpanContext::new_with_optional_collector(
-            self.common_state.trace_collector(),
-        ));
 
         let stream = self
             .query_executor
@@ -1350,6 +1448,7 @@ impl HttpApi {
 
     async fn query_influxql(&self, req: Request) -> Result<Response> {
         let token_id = request_token_id(&req);
+        let span_ctx = req.extensions().get::<SpanContext>().cloned();
         let QueryRequest {
             database,
             query_str,
@@ -1359,7 +1458,7 @@ impl HttpApi {
 
         info!(?database, %query_str, ?format, "handling query_influxql");
         let (stream, _) = self
-            .query_influxql_inner(token_id, database, &query_str, params)
+            .query_influxql_inner(token_id, database, &query_str, params, span_ctx)
             .await?;
 
         ResponseBuilder::new()
@@ -1425,6 +1524,10 @@ impl HttpApi {
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
             .body(bytes_to_response_body(body))?)
+    }
+
+    async fn handle_pprof_heap(&self, _req: Request) -> Result<Response> {
+        Ok(jemalloc_pprof_http::pprof_heap_response().await?)
     }
 
     /// Parse the request's body into raw bytes, applying the configured size
@@ -1574,16 +1677,16 @@ impl HttpApi {
         })
     }
 
-    /// Inner function for performing InfluxQL queries
-    ///
-    /// This is used by both the `/api/v3/query_influxql` and `/api/v1/query`
-    /// APIs.
+    /// Inner function for performing InfluxQL queries via the
+    /// `/api/v3/query_influxql` endpoint. The `/api/v1/query` endpoint goes
+    /// through `iox_v1_query_api::V1HttpHandler`.
     async fn query_influxql_inner(
         &self,
         token_id: Option<TokenId>,
         database: Option<String>,
         query_str: &str,
         params: Option<StatementParams>,
+        span_ctx: Option<SpanContext>,
     ) -> Result<(SendableRecordBatchStream, Option<GroupByClause>)> {
         let mut statements = rewrite::parse_statements(query_str)?;
 
@@ -1630,10 +1733,6 @@ impl HttpApi {
             _ => None,
         };
 
-        let span_ctx = Some(SpanContext::new_with_optional_collector(
-            self.common_state.trace_collector(),
-        ));
-
         let stream = if statement.is_show_databases() {
             self.query_executor.show_databases(true)?
         } else if statement.is_show_retention_policies() {
@@ -1673,23 +1772,62 @@ impl HttpApi {
         match self
             .write_buffer
             .catalog()
-            .create_distinct_cache(
+            .create_distinct_cache_committed(
                 &db,
                 &table,
+                ApiNodeSpec::All,
                 name.as_deref(),
-                &columns,
-                max_cardinality,
-                max_age,
+                &columns.iter().map(String::as_str).collect::<Vec<_>>(),
+                max_cardinality.into(),
+                max_age.into(),
             )
             .await
         {
-            Ok(batch) => ResponseBuilder::new()
-                .status(StatusCode::CREATED)
-                .header(CONTENT_TYPE, "application/json")
-                .body(bytes_to_response_body(serde_json::to_vec(&batch)?))
-                .map_err(Into::into),
+            Ok(committed) => {
+                let op = DatabaseCatalogOp::CreateDistinctCache(
+                    influxdb3_catalog::log::DistinctCacheDefinition::from(
+                        committed.output.as_ref(),
+                    ),
+                );
+                let body = self.legacy_cache_create_response(
+                    &db,
+                    op,
+                    committed.sequence,
+                    committed.time_ns,
+                )?;
+                ResponseBuilder::new()
+                    .status(StatusCode::CREATED)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(bytes_to_response_body(body))
+                    .map_err(Into::into)
+            }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Build a v2-shaped (`OrderedCatalogBatch`) JSON response for a cache-create
+    /// operation, preserving the wire contract clients deserialize.
+    fn legacy_cache_create_response(
+        &self,
+        db_name: &str,
+        op: DatabaseCatalogOp,
+        sequence: CatalogSequenceNumber,
+        time_ns: i64,
+    ) -> Result<Vec<u8>> {
+        let catalog = self.write_buffer.catalog();
+        let db = catalog
+            .db_schema(db_name)
+            .ok_or_else(|| CatalogError::NotFound(db_name.to_string()))?;
+        let batch = OrderedCatalogBatch::new(
+            CatalogBatch::Database(DatabaseBatch {
+                time_ns,
+                database_id: db.id,
+                database_name: Arc::clone(&db.name),
+                ops: vec![op],
+            }),
+            sequence,
+        );
+        Ok(serde_json::to_vec(&batch)?)
     }
 
     /// Delete a distinct value cache entry with the given [`DistinctCacheDeleteRequest`] parameters
@@ -1728,22 +1866,34 @@ impl HttpApi {
         match self
             .write_buffer
             .catalog()
-            .create_last_cache(
+            .create_last_cache_committed(
                 &db,
                 &table,
+                ApiNodeSpec::All,
                 name.as_deref(),
                 key_columns.as_deref(),
                 value_columns.as_deref(),
-                count,
-                ttl,
+                count.into(),
+                ttl.into(),
             )
             .await
         {
-            Ok(batch) => ResponseBuilder::new()
-                .status(StatusCode::CREATED)
-                .header(CONTENT_TYPE, "application/json")
-                .body(bytes_to_response_body(serde_json::to_vec(&batch)?))
-                .map_err(Into::into),
+            Ok(committed) => {
+                let op = DatabaseCatalogOp::CreateLastCache(
+                    influxdb3_catalog::log::LastCacheDefinition::from(committed.output.as_ref()),
+                );
+                let body = self.legacy_cache_create_response(
+                    &db,
+                    op,
+                    committed.sequence,
+                    committed.time_ns,
+                )?;
+                ResponseBuilder::new()
+                    .status(StatusCode::CREATED)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(bytes_to_response_body(body))
+                    .map_err(Into::into)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -1785,6 +1935,10 @@ impl HttpApi {
             self.read_body_json(req).await?
         };
         debug!(%db, %plugin_filename, %trigger_name, %trigger_specification, %disabled, "configure_processing_engine_trigger");
+        validate_restricted_plugin_trigger_specification(
+            &trigger_specification,
+            &self.allowed_plugin_trigger_types,
+        )?;
         let plugin_filename = self
             .processing_engine
             .validate_plugin_filename(&plugin_filename)
@@ -1794,10 +1948,10 @@ impl HttpApi {
             .create_processing_engine_trigger(
                 &db,
                 &trigger_name,
-                self.processing_engine.node_id(),
                 plugin_filename,
+                ApiNodeSpec::All,
                 &trigger_specification,
-                trigger_settings,
+                trigger_settings.into(),
                 &trigger_arguments,
                 disabled,
             )
@@ -1933,13 +2087,20 @@ impl HttpApi {
         let CreateDatabaseRequest {
             db,
             retention_period,
+            schema_mode,
         } = self.read_body_json(req).await?;
         validate_db_name(&db)?;
+        if matches!(schema_mode, SchemaMode::Explicit) {
+            return Err(Error::EnterpriseOnly("explicit schema mode"));
+        }
         self.write_buffer
             .catalog()
             .create_database_opts(
                 &db,
-                influxdb3_catalog::catalog::CreateDatabaseOptions { retention_period },
+                influxdb3_catalog::catalog::CreateDatabaseOptions {
+                    retention_period,
+                    schema_mode,
+                },
             )
             .await?;
         Ok(Response::new(empty_response_body()))
@@ -1949,10 +2110,7 @@ impl HttpApi {
     async fn test_processing_engine_wal_plugin(&self, req: Request) -> Result<Response> {
         let request: influxdb3_types::http::WalPluginTestRequest = self.read_body_json(req).await?;
 
-        let output = self
-            .processing_engine
-            .dry_run_wal_plugin(request, Arc::clone(&self.query_executor))
-            .await?;
+        let output = self.processing_engine.dry_run_wal_plugin(request).await?;
         let body = serde_json::to_string(&output)?;
 
         Ok(ResponseBuilder::new()
@@ -1965,16 +2123,29 @@ impl HttpApi {
         let request: influxdb3_types::http::SchedulePluginTestRequest =
             self.read_body_json(req).await?;
 
-        let output = self
-            .processing_engine
-            .test_schedule_plugin(request, Arc::clone(&self.query_executor))
-            .await?;
+        let output = self.processing_engine.test_schedule_plugin(request).await?;
         let body = serde_json::to_string(&output)?;
 
         Ok(ResponseBuilder::new()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/json")
             .body(bytes_to_response_body(body))?)
+    }
+
+    async fn test_telemetry_snapshot(&self, _req: Request) -> Result<Response> {
+        if !self.test_mode_enabled {
+            return Ok(ResponseBuilder::new()
+                .status(StatusCode::NOT_FOUND)
+                .body(bytes_to_response_body(Bytes::from("Not found")))?);
+        }
+
+        let payload = self.common_state.telemetry_store.snapshot();
+        let body = serde_json::to_vec(&payload)?;
+
+        Ok(ResponseBuilder::new()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(bytes_to_response_body(Bytes::from(body)))?)
     }
 
     async fn processing_engine_request_plugin(
@@ -2076,7 +2247,7 @@ impl HttpApi {
 
         self.write_buffer
             .catalog()
-            .soft_delete_database(&delete_req.db, hard_delete_time)
+            .soft_delete_database(&delete_req.db, hard_delete_time, DeletionScope::default())
             .await?;
         Ok(Response::new(empty_response_body()))
     }
@@ -2092,6 +2263,36 @@ impl HttpApi {
         self.write_buffer
             .catalog()
             .create_table(
+                &db,
+                &table,
+                &tags,
+                &fields
+                    .into_iter()
+                    .map(|field| (field.name, field.r#type.into()))
+                    .collect::<Vec<(String, FieldDataType)>>(),
+            )
+            .await?;
+        Ok(Response::new(empty_response_body()))
+    }
+
+    async fn patch_table(&self, req: Request) -> Result<Response> {
+        let PatchTableRequest {
+            db,
+            table,
+            tags,
+            fields,
+        } = self.read_body_json(req).await?;
+        validate_db_name(&db)?;
+        // A request that names no columns would commit nothing; report that
+        // rather than returning 200 for a no-op.
+        if tags.is_empty() && fields.is_empty() {
+            return Err(Error::InvalidRequest(
+                "at least one of tags or fields is required".to_string(),
+            ));
+        }
+        self.write_buffer
+            .catalog()
+            .add_table_columns(
                 &db,
                 &table,
                 &tags,
@@ -2124,7 +2325,12 @@ impl HttpApi {
 
         self.write_buffer
             .catalog()
-            .soft_delete_table(&delete_req.db, &delete_req.table, hard_delete_time)
+            .soft_delete_table(
+                &delete_req.db,
+                &delete_req.table,
+                hard_delete_time,
+                DeletionScope::default(),
+            )
             .await?;
         Ok(ResponseBuilder::new()
             .status(StatusCode::OK)
@@ -2254,7 +2460,7 @@ impl HttpApi {
             .ok_or(Error::Unauthenticated)?;
 
         self.authorizer
-            .authorize_action(&token_id, AccessRequest::Admin)
+            .authorize_action(Some(&Subject::Token(token_id)), AccessRequest::Admin)
             .await
             .map_err(|_| Error::ResourceAuthorization(ResourceAuthorizationError::Unauthorized))?;
 
@@ -2326,6 +2532,30 @@ impl HttpApi {
         info!(
             "Plugin directory atomically replaced for trigger '{}' in database '{}' by token {:?}",
             plugin_name, db_name, token_id
+        );
+
+        Ok(ResponseBuilder::new()
+            .status(StatusCode::OK)
+            .body(empty_response_body())?)
+    }
+
+    async fn refresh_plugin(&self, req: Request) -> Result<Response> {
+        let token_id = self.authorize_admin(&req).await?;
+
+        let ProcessingEngineTriggerRefreshRequest {
+            db,
+            trigger_name,
+            plugin_filename,
+        } = serde_urlencoded::from_str(req.uri().query().unwrap_or(""))?;
+
+        self.processing_engine
+            .refresh_plugin(&db, &trigger_name, &plugin_filename)
+            .await
+            .map_err(Error::ProcessingEngine)?;
+
+        info!(
+            "Plugin '{}' re-fetched for trigger '{}' in database '{}' by token {:?}",
+            plugin_filename, trigger_name, db, token_id
         );
 
         Ok(ResponseBuilder::new()
@@ -2504,8 +2734,8 @@ fn validate_db_name(name: &str) -> Result<(), ValidateDbNameError> {
 
 // v1 supports 255 chars for the database name and 255 chars for the
 // retention policy name; we support those combined with a forward slash so
-// 255*2+1, but iox name spaces are limited to a max of 64
-const MAXIMUM_DATABASE_NAME_LENGTH: usize = 64;
+// 255*2+1.
+const MAXIMUM_DATABASE_NAME_LENGTH: usize = 511;
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 pub enum ValidateDbNameError {
@@ -2531,6 +2761,9 @@ async fn record_batch_stream_to_body(
     mut stream: Pin<Box<dyn RecordBatchStream + Send>>,
     format: QueryFormat,
 ) -> Result<ResponseBody, Error> {
+    // Check for an early error before building the body, so a streaming format
+    // does not commit a 200 first. The materialized formats see the same batches.
+    stream = check_for_first_error(stream).await?;
     match format {
         QueryFormat::Pretty => {
             let batches = stream.try_collect::<Vec<RecordBatch>>().await?;
@@ -2762,7 +2995,7 @@ pub(crate) async fn route_request(
     http_server: Arc<HttpApi>,
     req: Request,
     started_without_auth: bool,
-    paths_without_authz: &'static Vec<&'static str>,
+    paths_without_authz: &'static [&'static str],
 ) -> Result<Response, Infallible> {
     // extract from the request for logging before we pass it to perform_routing, which consumes it
     let method = req.method().clone();
@@ -2856,7 +3089,7 @@ async fn perform_routing(
     http_server: Arc<HttpApi>,
     mut req: Request,
     started_without_auth: bool,
-    paths_without_authz: &'static Vec<&'static str>,
+    paths_without_authz: &'static [&'static str],
 ) -> Result<Response, RoutingError> {
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -2988,7 +3221,6 @@ async fn perform_routing(
             let handler = V1HttpHandler::new(
                 Arc::clone(&http_server.query_executor) as _,
                 Some(http_server.authorizer.upcast()),
-                http_server.common_state.trace_collector(),
                 INFLUXDB3_VERSION.to_string(),
             )
             .with_show_databases(ShowDatabases::new(Arc::clone(
@@ -3005,6 +3237,9 @@ async fn perform_routing(
         (Method::GET, all_paths::API_V3_HEALTH | all_paths::API_V1_HEALTH) => http_server.health(),
         (Method::GET | Method::POST, all_paths::API_PING) => http_server.ping(),
         (Method::GET, all_paths::API_METRICS) => http_server.handle_metrics(),
+        (Method::GET | Method::POST, all_paths::API_DEBUG_PPROF_HEAP) => {
+            http_server.handle_pprof_heap(req).await
+        }
         (Method::GET | Method::POST, path) if path.starts_with(all_paths::API_V3_ENGINE) => {
             let path = path.strip_prefix(all_paths::API_V3_ENGINE).unwrap();
             http_server
@@ -3056,6 +3291,7 @@ async fn perform_routing(
             http_server.delete_database(req).await
         }
         (Method::POST, all_paths::API_V3_CONFIGURE_TABLE) => http_server.create_table(req).await,
+        (Method::PATCH, all_paths::API_V3_CONFIGURE_TABLE) => http_server.patch_table(req).await,
         (Method::DELETE, all_paths::API_V3_CONFIGURE_TABLE) => http_server.delete_table(req).await,
         (Method::POST, all_paths::API_V3_TEST_WAL_ROUTE) => {
             http_server.test_processing_engine_wal_plugin(req).await
@@ -3064,6 +3300,9 @@ async fn perform_routing(
             http_server
                 .test_processing_engine_schedule_plugin(req)
                 .await
+        }
+        (Method::GET, all_paths::API_V3_TEST_TELEMETRY_SNAPSHOT) => {
+            http_server.test_telemetry_snapshot(req).await
         }
         (Method::POST, all_paths::API_V3_CONFIGURE_DATABASE_RETENTION_PERIOD) => {
             http_server.set_retention_period_for_database(req).await
@@ -3078,6 +3317,9 @@ async fn perform_routing(
         (Method::PUT, all_paths::API_V3_PLUGINS_FILES) => http_server.update_plugin_file(req).await,
         (Method::PUT, all_paths::API_V3_PLUGINS_DIRECTORY) => {
             http_server.replace_plugin_directory(req).await
+        }
+        (Method::POST, all_paths::API_V3_CONFIGURE_PROCESSING_ENGINE_REFRESH) => {
+            http_server.refresh_plugin(req).await
         }
         _ => return Err(RoutingError::NotFound),
     }
@@ -3204,6 +3446,30 @@ pub(crate) async fn route_admin_token_recovery_request(
 
     Ok(response)
 }
+
+fn validate_restricted_plugin_trigger_specification(
+    trigger_specification: &str,
+    allowed_plugin_trigger_types: &[PluginType],
+) -> Result<()> {
+    if allowed_plugin_trigger_types.is_empty() {
+        return Ok(());
+    }
+
+    let trigger = TriggerSpecificationDefinition::from_string_rep(trigger_specification)?;
+    let plugin_type = trigger.plugin_type();
+    if allowed_plugin_trigger_types.contains(&plugin_type) {
+        Ok(())
+    } else {
+        Err(Error::InvalidRequest(format!(
+            "server is configured to reject {plugin_type} plugin triggers"
+        )))
+    }
+}
+
+#[cfg(all(unix, feature = "operator_socket"))]
+mod operator;
+#[cfg(all(unix, feature = "operator_socket"))]
+pub use operator::route_operator_request;
 
 #[cfg(test)]
 mod tests;

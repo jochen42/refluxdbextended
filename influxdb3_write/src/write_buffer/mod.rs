@@ -4,7 +4,7 @@ pub mod checkpoint;
 mod metrics;
 pub mod persisted_files;
 pub mod queryable_buffer;
-mod table_buffer;
+pub mod table_buffer;
 use influxdb3_shutdown::ShutdownToken;
 use tokio::sync::{oneshot, watch::Receiver};
 use trace::span::{MetaValue, SpanRecorder};
@@ -22,9 +22,7 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use data_types::{
-    ChunkId, ChunkOrder, ColumnType, NamespaceName, NamespaceNameError, PartitionHashId,
-};
+use data_types::{ChunkId, ChunkOrder, ColumnType, PartitionHashId};
 use datafusion::{
     catalog::Session, common::DataFusionError, datasource::object_store::ObjectStoreUrl,
 };
@@ -38,9 +36,10 @@ use influxdb3_cache::{
 };
 use influxdb3_catalog::{
     CatalogError,
-    catalog::{Catalog, DatabaseSchema, Prompt, TableDefinition},
+    catalog::{Catalog, DatabaseSchema, INTERNAL_DB_NAME, Prompt, TableDefinition},
 };
 use influxdb3_id::{DbId, TableId};
+use influxdb3_types::{DatabaseName, DatabaseNameError};
 use influxdb3_wal::{
     SnapshotSequenceNumber, Wal, WalConfig, WalFileNotifier, WalOp,
     object_store::{CreateWalObjectStoreArgs, WalObjectStore},
@@ -91,7 +90,7 @@ pub enum Error {
     CorruptLoadState(String),
 
     #[error("database name error: {0}")]
-    DatabaseNameError(#[from] NamespaceNameError),
+    DatabaseNameError(#[from] DatabaseNameError),
 
     #[error("error from table buffer: {0}")]
     TableBufferError(#[from] table_buffer::Error),
@@ -143,15 +142,28 @@ pub enum Error {
 
     #[error("error: {0}")]
     AnyhowError(#[from] anyhow::Error),
+
+    #[error("write not allowed on internal database")]
+    InternalDbWriteNotAllowed,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 pub struct WriteRequest<'a> {
-    pub db_name: NamespaceName<'static>,
+    pub db_name: DatabaseName,
     pub line_protocol: &'a str,
     pub default_time: u64,
+}
+
+struct WriteLpInner<'a> {
+    db_name: DatabaseName,
+    lp: &'a str,
+    ingest_time: Time,
+    accept_partial: bool,
+    precision: Precision,
+    no_sync: bool,
+    allow_internal_db: bool,
 }
 
 #[derive(Debug)]
@@ -160,12 +172,12 @@ pub struct WriteBufferImpl {
     persister: Arc<Persister>,
     // NOTE(trevor): the parquet cache interface may be used to register other cache
     // requests from the write buffer, e.g., during query...
-    #[allow(dead_code)]
     parquet_cache: Option<Arc<dyn ParquetCacheOracle>>,
     persisted_files: Arc<PersistedFiles>,
     buffer: Arc<QueryableBuffer>,
     wal_config: WalConfig,
     wal: Arc<dyn Wal>,
+    time_provider: Arc<dyn TimeProvider>,
     metrics: WriteMetrics,
     distinct_cache: Arc<DistinctCacheProvider>,
     last_cache: Arc<LastCacheProvider>,
@@ -331,9 +343,9 @@ impl WriteBufferImpl {
                         (None, None, None)
                     };
 
-                // Set the next file ID if available
+                // Advance the next file ID if available
                 if let Some(file_id) = next_file_id {
-                    file_id.set_next_id();
+                    file_id.advance_next_id();
                 }
 
                 let persisted_files = Arc::new(PersistedFiles::new_from_checkpoints_and_snapshots(
@@ -389,9 +401,9 @@ impl WriteBufferImpl {
                     .first()
                     .map(|s| s.snapshot_sequence_number);
 
-                // If we have any snapshots, set sequential IDs from the newest one.
+                // If we have any snapshots, advance sequential IDs from the newest one.
                 if let Some(first_snapshot) = persisted_snapshots.first() {
-                    first_snapshot.next_file_id.set_next_id();
+                    first_snapshot.next_file_id.advance_next_id();
                 }
 
                 let persisted_files = Arc::new(PersistedFiles::new_from_persisted_snapshots(
@@ -440,6 +452,11 @@ impl WriteBufferImpl {
             }
         }
 
+        // A checkpoint written before `next_file_id` existed carries none, so the loaded files
+        // also bound the counter: a reused id would lose deduplication to an older file.
+        if let Some(next_file_id) = persisted_files.next_file_id() {
+            next_file_id.advance_next_id();
+        }
         let queryable_buffer = Arc::new(QueryableBuffer::new(QueryableBufferArgs {
             executor,
             catalog: Arc::clone(&catalog),
@@ -480,6 +497,7 @@ impl WriteBufferImpl {
             persister,
             wal_config,
             wal,
+            time_provider,
             distinct_cache,
             last_cache,
             persisted_files,
@@ -513,17 +531,64 @@ impl WriteBufferImpl {
 
     async fn write_lp(
         &self,
-        db_name: NamespaceName<'static>,
+        db_name: DatabaseName,
         lp: &str,
         ingest_time: Time,
         accept_partial: bool,
         precision: Precision,
         no_sync: bool,
     ) -> Result<BufferedWriteRequest> {
+        self.write_lp_inner(WriteLpInner {
+            db_name,
+            lp,
+            ingest_time,
+            accept_partial,
+            precision,
+            no_sync,
+            allow_internal_db: false,
+        })
+        .await
+    }
+
+    async fn write_internal_lp(
+        &self,
+        lp: &str,
+        ingest_time: Time,
+        accept_partial: bool,
+        precision: Precision,
+        no_sync: bool,
+    ) -> Result<BufferedWriteRequest> {
+        self.write_lp_inner(WriteLpInner {
+            db_name: DatabaseName::new(INTERNAL_DB_NAME).expect("internal database name is valid"),
+            lp,
+            ingest_time,
+            accept_partial,
+            precision,
+            no_sync,
+            allow_internal_db: true,
+        })
+        .await
+    }
+
+    async fn write_lp_inner(&self, request: WriteLpInner<'_>) -> Result<BufferedWriteRequest> {
+        let WriteLpInner {
+            db_name,
+            lp,
+            ingest_time,
+            accept_partial,
+            precision,
+            no_sync,
+            allow_internal_db,
+        } = request;
+
         debug!("write_lp to {} in writebuffer", db_name);
 
         // NOTE(trevor/catalog-refactor): should there be some retry limit or timeout?
         loop {
+            if !allow_internal_db && db_name.as_str() == INTERNAL_DB_NAME {
+                return Err(Error::InternalDbWriteNotAllowed);
+            }
+
             // validated lines will update the in-memory catalog, ensuring that all write operations
             // past this point will be infallible
             let result = match WriteValidator::initialize(db_name.clone(), self.catalog())?
@@ -560,12 +625,10 @@ impl WriteBufferImpl {
             }
 
             // record metrics for lines written, rejected, and bytes written
+            self.metrics.record_lines(result.line_count as u64);
             self.metrics
-                .record_lines(&db_name, result.line_count as u64);
-            self.metrics
-                .record_lines_rejected(&db_name, result.errors.len() as u64);
-            self.metrics
-                .record_bytes(&db_name, result.valid_bytes_count);
+                .record_lines_rejected(result.errors.len() as u64);
+            self.metrics.record_bytes(result.valid_bytes_count);
 
             break Ok(BufferedWriteRequest {
                 db_name,
@@ -588,7 +651,7 @@ impl WriteBufferImpl {
         let span_ctx = ctx.span_ctx().map(|span| span.child("table_chunks"));
         let mut recorder = SpanRecorder::new(span_ctx);
 
-        let mut chunks = self.buffer.get_table_chunks(
+        let (mut chunks, parquet_files) = self.buffer.get_table_chunks_and_parquet_files(
             Arc::clone(&db_schema),
             Arc::clone(&table_def),
             filter,
@@ -601,9 +664,6 @@ impl WriteBufferImpl {
             MetaValue::Int(num_chunks_from_buffer as i64),
         );
 
-        let parquet_files =
-            self.persisted_files
-                .get_files_filtered(db_schema.id, table_def.table_id, filter);
         let num_parquet_files_needed = parquet_files.len();
         recorder.set_metadata(
             "parquet_files",
@@ -705,7 +765,7 @@ pub fn cache_parquet_files<T: AsRef<ParquetFile>>(
                 // cache might be handy for this case.
                 let f: &ParquetFile = file.borrow().as_ref();
                 let (cache_req, receiver) = CacheRequest::create_eventual_mode_cache_request(
-                    ObjPath::from(f.path.as_str()),
+                    ObjPath::from(f.path.as_ref()),
                     Some(f.timestamp_min_max()),
                 );
                 parquet_cache.register(cache_req);
@@ -772,7 +832,7 @@ pub fn parquet_chunk_from_file(
 impl Bufferer for WriteBufferImpl {
     async fn write_lp(
         &self,
-        database: NamespaceName<'static>,
+        database: DatabaseName,
         lp: &str,
         ingest_time: Time,
         accept_partial: bool,
@@ -781,6 +841,25 @@ impl Bufferer for WriteBufferImpl {
     ) -> Result<BufferedWriteRequest> {
         self.write_lp(
             database,
+            lp,
+            ingest_time,
+            accept_partial,
+            precision,
+            no_sync,
+        )
+        .await
+    }
+
+    async fn write_internal_lp(
+        &self,
+        lp: &str,
+        ingest_time: Time,
+        accept_partial: bool,
+        precision: Precision,
+        no_sync: bool,
+    ) -> Result<BufferedWriteRequest> {
+        WriteBufferImpl::write_internal_lp(
+            self,
             lp,
             ingest_time,
             accept_partial,
@@ -845,9 +924,19 @@ impl WriteBuffer for WriteBufferImpl {
     }
 }
 
+/// Periodically force a snapshot when the buffer is over
+/// `memory_threshold_bytes`, or when the oldest un-snapshotted WAL data is
+/// older than `max_unsnapshotted_age`.
+///
+/// Snapshots otherwise trigger only on the number of WAL periods, checked
+/// only when a flush has something to write, so a node receiving a trickle
+/// of writes — or none — can hold hours of data in RAM and WAL before its
+/// period count is reached. The age bound caps that wait, independent of
+/// write arrival (influxdb_pro#4078).
 pub async fn check_mem_and_force_snapshot_loop(
     write_buffer: Arc<WriteBufferImpl>,
     memory_threshold_bytes: usize,
+    max_unsnapshotted_age: Duration,
     check_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -855,7 +944,12 @@ pub async fn check_mem_and_force_snapshot_loop(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            check_mem_and_force_snapshot(&write_buffer, memory_threshold_bytes).await;
+            check_mem_and_force_snapshot(
+                &write_buffer,
+                memory_threshold_bytes,
+                max_unsnapshotted_age,
+            )
+            .await;
         }
     })
 }
@@ -863,6 +957,7 @@ pub async fn check_mem_and_force_snapshot_loop(
 async fn check_mem_and_force_snapshot(
     write_buffer: &Arc<WriteBufferImpl>,
     memory_threshold_bytes: usize,
+    max_unsnapshotted_age: Duration,
 ) {
     let current_buffer_size_bytes = write_buffer.buffer.get_total_size_bytes();
     write_buffer
@@ -878,26 +973,43 @@ async fn check_mem_and_force_snapshot(
             current_buffer_size_bytes,
             memory_threshold_bytes, "forcing snapshot as buffer size > mem threshold"
         );
+        force_snapshot(&write_buffer.wal).await;
+        return;
+    }
 
-        let wal = Arc::clone(&write_buffer.wal);
+    if let Some(since) = write_buffer.wal.unsnapshotted_since().await
+        && let Some(age) = write_buffer
+            .time_provider
+            .now()
+            .checked_duration_since(since)
+        && age >= max_unsnapshotted_age
+    {
+        info!(
+            unsnapshotted_age_secs = age.as_secs(),
+            max_unsnapshotted_age_secs = max_unsnapshotted_age.as_secs(),
+            "forcing snapshot as un-snapshotted WAL data is older than the maximum age"
+        );
+        force_snapshot(&write_buffer.wal).await;
+    }
+}
 
-        let cleanup_after_snapshot = wal.force_flush_buffer().await;
+/// Force a snapshot and clean up its WAL files in the background.
+async fn force_snapshot(wal: &Arc<dyn Wal>) {
+    let cleanup_after_snapshot = wal.force_flush_buffer().await;
 
-        // handle snapshot cleanup outside of the flush loop
-        if let Some((snapshot_complete, snapshot_info, snapshot_permit)) = cleanup_after_snapshot {
-            let snapshot_wal = Arc::clone(&wal);
-            tokio::spawn(async move {
-                let snapshot_details = snapshot_complete.await.expect("snapshot failed");
-                assert_eq!(snapshot_info, snapshot_details);
+    // handle snapshot cleanup outside of the flush loop
+    if let Some((snapshot_complete, snapshot_info, snapshot_permit)) = cleanup_after_snapshot {
+        let snapshot_wal = Arc::clone(wal);
+        tokio::spawn(async move {
+            let snapshot_details = snapshot_complete.await.expect("snapshot failed");
+            assert_eq!(snapshot_info, snapshot_details);
 
-                snapshot_wal
-                    .cleanup_snapshot(snapshot_info, snapshot_permit)
-                    .await;
-            });
-        }
+            snapshot_wal
+                .cleanup_snapshot(snapshot_info, snapshot_permit)
+                .await;
+        });
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::await_holding_lock)]
 mod tests;

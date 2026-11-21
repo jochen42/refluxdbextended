@@ -12,7 +12,7 @@ struct CreateTestParquetFileArgs {
     /// Optional file ID; if None, a new ID will be generated
     file_id: Option<ParquetFileId>,
     /// The path for the parquet file
-    path: Option<String>,
+    path: Option<Arc<str>>,
     /// Size in bytes (default: 100)
     size_bytes: Option<u64>,
     /// Number of rows (default: 10,000)
@@ -27,7 +27,7 @@ fn create_test_parquet_file(args: CreateTestParquetFileArgs) -> ParquetFile {
     let time_offset = args.time_offset_minutes;
     ParquetFile {
         id: args.file_id.unwrap_or_default(),
-        path: args.path.unwrap_or_else(|| "whatever".to_string()),
+        path: args.path.unwrap_or_else(|| "whatever".into()),
         size_bytes: args.size_bytes.unwrap_or(100),
         row_count: args.row_count.unwrap_or(10_000),
         chunk_time: time_offset * MINUTE_NS,
@@ -106,7 +106,9 @@ fn create_persisted_snapshot(args: CreateTestPersistedSnapshotArgs) -> Persisted
     }
 
     PersistedSnapshot {
-        node_id: args.node_id.unwrap_or_else(|| "test_host".to_string()),
+        node_id: args
+            .node_id
+            .map_or_else(|| Arc::from("test_host"), Arc::from),
         next_file_id: ParquetFileId::from(args.sequence_number),
         snapshot_sequence_number: SnapshotSequenceNumber::new(args.sequence_number),
         wal_file_sequence_number: WalFileSequenceNumber::new(args.sequence_number),
@@ -140,7 +142,7 @@ struct ExpectedMetadata {
 
 #[derive(Debug)]
 enum TimeCheck {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     Exact(i64),
     MatchSnapshot,
     Max, // i64::MAX
@@ -636,7 +638,7 @@ fn validate(#[case] tc: TestCase) {
         // Verify common fields
         assert_eq!(
             table_snapshot.id.node_id(),
-            snapshot.node_id,
+            &snapshot.node_id,
             "node_id mismatch",
         );
         assert_eq!(

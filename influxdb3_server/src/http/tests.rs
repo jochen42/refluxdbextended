@@ -1,14 +1,16 @@
-use http::{HeaderMap, HeaderValue, header::ACCEPT};
+use http::{HeaderMap, HeaderValue, StatusCode, header::ACCEPT};
 use http::{Request, Uri};
 
 use super::{
-    MAXIMUM_DATABASE_NAME_LENGTH, extract_client_ip, extract_db_from_query_param,
-    truncate_for_logging,
+    MAXIMUM_DATABASE_NAME_LENGTH, PluginType, extract_client_ip, extract_db_from_query_param,
+    truncate_for_logging, validate_restricted_plugin_trigger_specification,
 };
 use crate::http::{AuthenticationError, Error};
 
+use super::IntoResponse;
 use super::QueryFormat;
 use super::ValidateDbNameError;
+use super::datafusion_error_status_code;
 use super::record_batch_stream_to_body;
 use super::token_part_as_bytes;
 use super::validate_db_name;
@@ -16,8 +18,11 @@ use arrow_array::{Int32Array, RecordBatch, record_batch};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::StreamExt;
+use http_body_util::BodyExt;
 use iox_http_util::read_body_bytes_for_tests;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str;
 use std::sync::Arc;
@@ -68,6 +73,43 @@ fn test_validate_db_name() {
     assert_validate_db_name!("-foo", Err(ValidateDbNameError::InvalidStartChar));
     assert_validate_db_name!("/", Err(ValidateDbNameError::InvalidStartChar));
     assert_validate_db_name!("", Err(ValidateDbNameError::Empty));
+}
+
+#[test]
+fn test_validate_restricted_plugin_trigger_specification() {
+    assert!(validate_restricted_plugin_trigger_specification("all_tables", &[]).is_ok());
+
+    let schedule_only = [PluginType::Schedule];
+    assert!(
+        validate_restricted_plugin_trigger_specification("cron:* * * * * *", &schedule_only)
+            .is_ok()
+    );
+    assert!(validate_restricted_plugin_trigger_specification("every:10s", &schedule_only).is_ok());
+
+    assert!(matches!(
+        validate_restricted_plugin_trigger_specification("all_tables", &schedule_only),
+        Err(Error::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        validate_restricted_plugin_trigger_specification("table:cpu", &schedule_only),
+        Err(Error::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        validate_restricted_plugin_trigger_specification("request:foo", &schedule_only),
+        Err(Error::InvalidRequest(_))
+    ));
+
+    let wal_and_request = [PluginType::WalRows, PluginType::Request];
+    assert!(
+        validate_restricted_plugin_trigger_specification("table:cpu", &wal_and_request).is_ok()
+    );
+    assert!(
+        validate_restricted_plugin_trigger_specification("request:foo", &wal_and_request).is_ok()
+    );
+    assert!(matches!(
+        validate_restricted_plugin_trigger_specification("every:10s", &wal_and_request),
+        Err(Error::InvalidRequest(_))
+    ));
 }
 
 #[tokio::test]
@@ -340,6 +382,60 @@ fn make_record_stream_with_sizes(batch_sizes: Vec<usize>) -> SendableRecordBatch
     Box::pin(adapter)
 }
 
+/// The CSV header comes from the first batch written, even an empty one, so
+/// leading empty batches must still produce it.
+#[tokio::test]
+async fn test_csv_output_leading_empties() {
+    for (sizes, expected) in [(vec![0, 0], "a\n"), (vec![0, 0, 1], "a\n1\n")] {
+        let resp =
+            record_batch_stream_to_body(make_record_stream_with_sizes(sizes), QueryFormat::Csv)
+                .await
+                .unwrap();
+        let bytes = read_body_bytes_for_tests(resp).await;
+        assert_eq!(str::from_utf8(bytes.as_ref()).unwrap(), expected);
+    }
+}
+
+/// Stream of `batch_sizes` batches followed by a `ResourcesExhausted` error.
+fn failing_record_stream(batch_sizes: Vec<usize>) -> SendableRecordBatchStream {
+    let stream = make_record_stream_with_sizes(batch_sizes);
+    let schema = stream.schema();
+    let err = DataFusionError::ResourcesExhausted("test".into());
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        stream.chain(futures::stream::iter([Err(err)])),
+    ))
+}
+
+/// A streaming body commits a 200, so an error that comes before the first rows
+/// must be returned before the body exists, where it can still set the status.
+#[tokio::test]
+async fn test_streaming_error_before_first_rows_sets_status() {
+    for format in [QueryFormat::Csv, QueryFormat::Json, QueryFormat::JsonLines] {
+        for sizes in [vec![], vec![0, 0]] {
+            let Err(err) =
+                record_batch_stream_to_body(failing_record_stream(sizes.clone()), format).await
+            else {
+                panic!("{format:?} {sizes:?}: expected an error before the body");
+            };
+            assert_eq!(err.into_response().status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+}
+
+/// After the first rows the status is committed; the error must still abort
+/// the body rather than end it cleanly.
+#[tokio::test]
+async fn test_streaming_error_after_first_rows_aborts_body() {
+    for format in [QueryFormat::Csv, QueryFormat::Json, QueryFormat::JsonLines] {
+        let Ok(resp) = record_batch_stream_to_body(failing_record_stream(vec![0, 1]), format).await
+        else {
+            panic!("{format:?}: rows came first, so the error belongs in the body");
+        };
+        assert!(resp.collect().await.is_err(), "{format:?}");
+    }
+}
+
 #[test]
 fn test_client_ip_extraction_from_socket_address() {
     use hyper::Request;
@@ -542,6 +638,32 @@ fn test_truncate_for_logging_utf8() {
     assert_eq!(truncate_for_logging(s, 1), "");
 }
 
+#[test]
+fn catalog_error_status_codes_for_an_unreachable_query_group_member() {
+    use influxdb3_catalog::CatalogError;
+    use influxdb3_id::QueryGroupId;
+
+    // A member that advertises no address is bad input on the request.
+    assert_eq!(
+        super::IntoResponse::into_response(CatalogError::QueryGroupMemberNotConnectable {
+            node_id: "query-node-0".into(),
+        })
+        .status(),
+        StatusCode::BAD_REQUEST,
+    );
+    // Clearing the address conflicts with the node's current membership, so it
+    // answers 409 beside the other node-state conflicts.
+    assert_eq!(
+        super::IntoResponse::into_response(CatalogError::NodeConnInfoRequiredInQueryGroup {
+            node_id: "query-node-0".into(),
+            query_group_name: "analytics".into(),
+            query_group_id: QueryGroupId::new(1),
+        })
+        .status(),
+        StatusCode::CONFLICT,
+    );
+}
+
 #[tokio::test]
 async fn test_datafusion_plan_error_maps_to_bad_request() {
     let err = Error::Query(super::QueryExecutorError::QueryPlanning(
@@ -573,5 +695,80 @@ async fn test_influxql_rewrite_error_maps_to_client_error() {
         "error in InfluxQL statement: parsing error: invalid SHOW statement, \
         expected DATABASES, FIELD KEYS, MEASUREMENTS, TAG KEYS, TAG VALUES, or \
         RETENTION POLICIES following SHOW at pos 5"
+    );
+}
+
+#[tokio::test]
+async fn test_v2_write_api_error_unauthenticated_maps_to_401() {
+    let err = super::V2WriteApiError(Error::Unauthenticated);
+    let response = super::IntoResponse::into_response(err);
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let body = read_body_bytes_for_tests(response.into_body()).await;
+    let json: Value = serde_json::from_slice(&body).expect("response body should be valid JSON");
+    assert_eq!(json["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn test_v2_write_api_error_resource_auth_unauthorized_maps_to_403() {
+    let err = super::V2WriteApiError(Error::ResourceAuthorization(
+        influxdb3_authz::ResourceAuthorizationError::Unauthorized,
+    ));
+    let response = super::IntoResponse::into_response(err);
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let body = read_body_bytes_for_tests(response.into_body()).await;
+    let json: Value = serde_json::from_slice(&body).expect("response body should be valid JSON");
+    assert_eq!(json["code"], "forbidden");
+}
+
+// A full WAL buffer (--wal-max-buffered-writes) is saturation, so it
+// surfaces as 429 (the code clients back off and retry on, and the one
+// iox uses for ingest memory pressure), not the write-buffer catch-all
+// 400, which v2 clients treat as fatal and drop the batch on.
+#[tokio::test]
+async fn test_v2_write_api_error_wal_buffer_full_maps_to_429() {
+    let err = super::V2WriteApiError(Error::WriteBuffer(
+        influxdb3_write::write_buffer::Error::WalError(influxdb3_wal::Error::BufferFull(100_000)),
+    ));
+    let response = super::IntoResponse::into_response(err);
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let body = read_body_bytes_for_tests(response.into_body()).await;
+    let json: Value = serde_json::from_slice(&body).expect("response body should be valid JSON");
+    assert_eq!(json["code"], "too many requests");
+}
+
+// Guards the v1/v3 write paths, which surface `Error` directly rather than
+// through `V2WriteApiError`.
+#[tokio::test]
+async fn test_write_api_error_wal_buffer_full_maps_to_429() {
+    let err = Error::WriteBuffer(influxdb3_write::write_buffer::Error::WalError(
+        influxdb3_wal::Error::BufferFull(100_000),
+    ));
+    let response = super::IntoResponse::into_response(err);
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[test]
+fn resources_exhausted_is_too_many_requests() {
+    let exhausted = || DataFusionError::ResourcesExhausted("no budget".into());
+    assert_eq!(
+        datafusion_error_status_code(&exhausted()),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // Errors raised inside a scan reach the handler wrapped in context.
+    let wrapped = DataFusionError::Context("scan".into(), Box::new(exhausted()));
+    assert_eq!(
+        datafusion_error_status_code(&wrapped),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        Error::Datafusion(exhausted()).into_response().status(),
+        StatusCode::TOO_MANY_REQUESTS
     );
 }

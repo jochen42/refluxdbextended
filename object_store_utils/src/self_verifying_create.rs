@@ -195,7 +195,7 @@ impl SelfVerifyingCreateStore {
             .get_opts_with_retries(
                 location,
                 opts,
-                format!("verifying conditional create for {location}"),
+                &format!("verifying conditional create for {location}"),
                 read_back_retry_params(),
             )
             .await

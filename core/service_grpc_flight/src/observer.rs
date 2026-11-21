@@ -23,6 +23,29 @@ pub struct FlightQueryInfo {
     pub database: String,
     /// Query variant: `"sql"`, `"influxql"`, or `"flightsql"`.
     pub query_variant: &'static str,
+    /// The sanitized query text. For SQL / InfluxQL it is the raw query
+    /// string; for a FlightSQL `CommandStatementQuery` it is the embedded
+    /// SQL only; for every other FlightSQL command variant it is the fixed
+    /// string `<flightsql:unknown>` so that client-supplied catalog /
+    /// schema / table identifiers never reach downstream consumers.
+    ///
+    pub query_text: String,
+}
+
+/// Planning-time signals delivered to the observer after the physical
+/// plan has been built (and before stream consumption begins).
+///
+/// Caller contract: `on_planned` must only fire if the
+/// `QueryLogEntry` has reached the `PhysicallyPlanned` state — i.e.
+/// `state.physical_plan_duration.is_some()`. Observers may rely on
+/// this and treat the absence of the callback as "planning never
+/// completed."
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FlightPlannedInfo {
+    /// Number of parquet-backed partitions reported by upstream
+    /// `QueryLogEntryState::partitions`. `None` on PachaTree paths or
+    /// when the plan didn't surface a parquet partition count.
+    pub partitions_scanned: Option<u64>,
 }
 
 /// Handle for a single in-flight query observation.
@@ -32,6 +55,13 @@ pub struct FlightQueryInfo {
 /// `success()` or `error()` being called, the `Drop` impl should treat it
 /// as a cancellation.
 pub trait FlightQueryObservation: Send + 'static {
+    /// Physical planning completed (the underlying `QueryLogEntry`
+    /// reached the `PhysicallyPlanned` state). Will not fire on
+    /// queries that fail during logical / physical planning. Default
+    /// implementation is a no-op so adding fields to
+    /// [`FlightPlannedInfo`] stays non-breaking for downstream
+    /// observers.
+    fn on_planned(&mut self, _info: FlightPlannedInfo) {}
     /// The query stream completed successfully.
     fn success(self: Box<Self>);
     /// The query failed with an error.
@@ -52,7 +82,7 @@ pub trait FlightQueryObserver: Send + Sync + Debug + 'static {
 /// When the stream ends normally, calls `observation.success()`.
 /// When the stream yields an error, calls `observation.error()`.
 /// When dropped without completing (client disconnect), the observation's
-/// `Drop` impl fires — the enterprise impl logs a cancel entry.
+/// `Drop` impl fires - the enterprise impl logs a cancel entry.
 pub(crate) struct ObservedStream {
     inner: TonicStream<FlightData>,
     observation: Option<Box<dyn FlightQueryObservation>>,
@@ -97,5 +127,104 @@ impl Stream for ObservedStream {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use futures::{StreamExt, stream};
+    use generated_types::tonic::Code;
+
+    use super::*;
+
+    /// Captures which callback was observed
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    struct ObservationState {
+        success: bool,
+        error: Option<GrpcCode>,
+    }
+
+    /// Shared observer that records which callback was called.
+    ///
+    /// Clones of this observer share the same inner state (and thus
+    /// observations)
+    #[derive(Debug, Clone)]
+    struct SharedObserver {
+        state: Arc<Mutex<ObservationState>>,
+    }
+
+    impl SharedObserver {
+        /// Construct a new observer with empty state.
+        fn new() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(ObservationState::default())),
+            }
+        }
+
+        /// Return a snapshot of the currently recorded state.
+        fn state(&self) -> ObservationState {
+            self.state.lock().expect("lock poisoned").clone()
+        }
+    }
+
+    impl FlightQueryObservation for SharedObserver {
+        fn success(self: Box<Self>) {
+            self.state.lock().expect("lock poisoned").success = true;
+        }
+
+        fn error(self: Box<Self>, code: GrpcCode) {
+            self.state.lock().expect("lock poisoned").error = Some(code);
+        }
+    }
+
+    /// Build an observed stream plus shared state
+    fn test_stream<I>(items: I) -> (ObservedStream, SharedObserver)
+    where
+        I: IntoIterator<Item = Result<FlightData, Status>>,
+        I::IntoIter: Send + 'static,
+    {
+        let observer = SharedObserver::new();
+        let inner: TonicStream<FlightData> = Box::pin(stream::iter(items));
+        let observed = ObservedStream::new(inner, Box::new(observer.clone()));
+
+        (observed, observer)
+    }
+
+    #[tokio::test]
+    async fn test_observed_stream_success() {
+        let (mut observed, observer) = test_stream([Ok(FlightData::default())]);
+
+        assert!(observed.next().await.unwrap().is_ok());
+        assert!(observed.next().await.is_none());
+
+        assert_eq!(
+            observer.state(),
+            ObservationState {
+                success: true,
+                error: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_observed_stream_error() {
+        let (mut observed, observer) = test_stream([Err(Status::new(Code::Internal, "boom"))]);
+
+        let err = observed
+            .next()
+            .await
+            .expect("stream should yield an item")
+            .expect_err("stream should yield an error");
+        assert_eq!(err.code(), Code::Internal);
+
+        assert_eq!(
+            observer.state(),
+            ObservationState {
+                success: false,
+                error: Some(Code::Internal),
+            }
+        );
     }
 }

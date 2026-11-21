@@ -10,7 +10,7 @@ build = "Core"
 
 [dependencies]
 chrono.workspace = true
-observability_deps = { path = "../core/observability_deps" }
+observability_deps.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

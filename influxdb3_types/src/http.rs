@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use influxdb3_authz::TokenInfo;
+use influxdb3_catalog::catalog::SchemaMode;
 use influxdb3_catalog::log::TriggerSettings;
 use uuid::Uuid;
 
@@ -64,6 +65,15 @@ pub enum Error {
 
     #[error(transparent)]
     Unexpected(#[from] anyhow::Error),
+}
+
+impl From<&Error> for hyper::StatusCode {
+    fn from(value: &Error) -> Self {
+        match value {
+            Error::InvalidMimeType(_) | Error::NonUtf8MimeType(_) => Self::BAD_REQUEST,
+            Error::Unexpected(_) => Self::INTERNAL_SERVER_ERROR,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -188,9 +198,11 @@ pub struct ProcessingEngineTriggerCreateRequest {
     pub db: String,
     pub plugin_filename: String,
     pub trigger_name: String,
+    #[serde(default)]
     pub trigger_settings: TriggerSettings,
     pub trigger_specification: String,
     pub trigger_arguments: Option<HashMap<String, String>>,
+    #[serde(default)]
     pub disabled: bool,
 }
 
@@ -208,6 +220,15 @@ pub struct ProcessingEngineTriggerDeleteRequest {
 pub struct UpdatePluginFileRequest {
     pub plugin_name: String,
     pub content: String,
+}
+
+/// Request definition for the `POST /api/v3/configure/processing_engine_trigger/refresh` API
+/// Re-fetches a trigger's `gh:` plugin, which the trigger runs from its next run on
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ProcessingEngineTriggerRefreshRequest {
+    pub db: String,
+    pub trigger_name: String,
+    pub plugin_filename: String,
 }
 
 /// Request definition for the `PUT /api/v3/plugins/directory` API
@@ -294,6 +315,11 @@ pub struct CreateDatabaseRequest {
     pub db: String,
     #[serde(with = "humantime_serde", default)]
     pub retention_period: Option<Duration>,
+    /// Whether tables in this database take their schemas from writes
+    /// (`implicit`, the default) or from explicit declarations (`explicit`).
+    /// Fixed at creation.
+    #[serde(default)]
+    pub schema_mode: SchemaMode,
 }
 
 /// Request definition for the `PUT /api/v3/configure/database` API
@@ -321,6 +347,21 @@ pub struct CreateTableRequest {
     pub fields: Vec<CreateTableField>,
 }
 
+/// Request definition for the `PATCH /api/v3/configure/table` API.
+///
+/// Additive: the named tags and fields are added to the table. A column that
+/// already exists at the requested type is left alone. Nothing else about the
+/// table is touched.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PatchTableRequest {
+    pub db: String,
+    pub table: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub fields: Vec<CreateTableField>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CreateTableField {
     pub name: String,
@@ -338,6 +379,18 @@ pub enum FieldType {
 }
 
 impl From<FieldType> for FieldDataType {
+    fn from(f: FieldType) -> Self {
+        match f {
+            FieldType::Utf8 => Self::String,
+            FieldType::Int64 => Self::Integer,
+            FieldType::UInt64 => Self::UInteger,
+            FieldType::Float64 => Self::Float,
+            FieldType::Bool => Self::Boolean,
+        }
+    }
+}
+
+impl From<FieldType> for influxdb3_catalog::catalog::FieldDataType {
     fn from(f: FieldType) -> Self {
         match f {
             FieldType::Utf8 => Self::String,

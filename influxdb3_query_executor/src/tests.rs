@@ -1,7 +1,6 @@
 use super::CreateQueryExecutorArgs;
 use crate::QueryExecutorImpl;
 use arrow::array::RecordBatch;
-use data_types::NamespaceName;
 use datafusion::assert_batches_sorted_eq;
 use futures::TryStreamExt;
 use influxdb3_cache::{
@@ -13,6 +12,7 @@ use influxdb3_internal_api::query_executor::QueryExecutor;
 use influxdb3_shutdown::ShutdownManager;
 use influxdb3_sys_events::SysEventStore;
 use influxdb3_telemetry::store::TelemetryStore;
+use influxdb3_types::DatabaseName;
 use influxdb3_wal::{Gen1Duration, WalConfig};
 use influxdb3_write::{
     Bufferer, WriteBuffer,
@@ -125,7 +125,7 @@ pub(crate) async fn setup(
         snapshotted_wal_files_to_keep: 1,
         query_file_limit,
         n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
-        shutdown: shutdown.register(),
+        shutdown: shutdown.register("test"),
         wal_replay_concurrency_limit: 1,
         parquet_snapshot_concurrency_limit: NonZeroUsize::new(10).unwrap(),
         shared_inventory: None,
@@ -164,7 +164,7 @@ pub(crate) async fn setup(
         sys_events_store: Arc::clone(&sys_events_store),
         started_with_auth,
         time_provider: Arc::clone(&time_provider) as _,
-        processing_engine: None,
+        max_concurrent_queries: cli_types::QUERY_CONCURRENCY_LIMIT_MAX,
     });
 
     (
@@ -186,7 +186,7 @@ async fn system_parquet_files_success() {
         let time = i * 10;
         let _ = write_buffer
             .write_lp(
-                NamespaceName::new(db_name).unwrap(),
+                DatabaseName::new(db_name).unwrap(),
                 "\
             cpu,host=a,region=us-east usage=250\n\
             mem,host=a,region=us-east usage=150000\n\
@@ -298,7 +298,7 @@ async fn query_file_limits_default() {
         let time = i * 10;
         let _ = write_buffer
             .write_lp(
-                NamespaceName::new(db_name).unwrap(),
+                DatabaseName::new(db_name).unwrap(),
                 "\
             cpu,host=a,region=us-east usage=250\n\
             mem,host=a,region=us-east usage=150000\n\
@@ -364,7 +364,7 @@ async fn query_file_limits_default() {
     let time = 12990;
     let _ = write_buffer
         .write_lp(
-            NamespaceName::new(db_name).unwrap(),
+            DatabaseName::new(db_name).unwrap(),
             "\
             cpu,host=a,region=us-east usage=250\n\
             mem,host=a,region=us-east usage=150000\n\
@@ -414,7 +414,7 @@ async fn query_file_limits_configured() {
         let time = i * 10;
         let _ = write_buffer
             .write_lp(
-                NamespaceName::new(db_name).unwrap(),
+                DatabaseName::new(db_name).unwrap(),
                 "\
             cpu,host=a,region=us-east usage=250\n\
             mem,host=a,region=us-east usage=150000\n\
@@ -480,7 +480,7 @@ async fn query_file_limits_configured() {
     let time = 120;
     let _ = write_buffer
         .write_lp(
-            NamespaceName::new(db_name).unwrap(),
+            DatabaseName::new(db_name).unwrap(),
             "\
             cpu,host=a,region=us-east usage=250\n\
             mem,host=a,region=us-east usage=150000\n\
@@ -524,7 +524,7 @@ async fn test_token_permissions_sys_table_query_wrong_db_name() {
     let (write_buffer, query_exec, _, _) = setup(None, true).await;
     write_buffer
         .write_lp(
-            NamespaceName::new("foo").unwrap(),
+            DatabaseName::new("foo").unwrap(),
             "\
         cpu,host=a,region=us-east usage=250\n\
         mem,host=a,region=us-east usage=150000\n\
@@ -708,4 +708,76 @@ async fn test_influxql_time_filter_double_group_by() {
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
         assert_batches_sorted_eq!(expected, &batches);
     }
+}
+
+/// A gen1 window persisted across two snapshots leaves two files with the same chunk time. An
+/// overwrite in the later file must win deduplication over the value in the earlier one.
+#[test_log::test(tokio::test)]
+async fn overwrite_in_a_later_gen1_file_wins() {
+    let (write_buffer, query_executor, _, _) = setup(None, true).await;
+    let db_name = "test_db";
+    // Each write is its own WAL file, and every third file snapshots, so the first three and
+    // last three writes persist as two files in the same 1m gen1 window.
+    for (usage, seconds) in [(1, 5), (1, 10), (1, 15), (2, 10), (1, 20), (1, 25)] {
+        write_buffer
+            .write_lp(
+                DatabaseName::new(db_name).unwrap(),
+                &format!("cpu,host=a usage={usage} {seconds}"),
+                Time::from_timestamp_nanos(0),
+                false,
+                influxdb3_write::Precision::Second,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    let files_persisted = || async {
+        let batches: Vec<RecordBatch> = query_executor
+            .query_sql(
+                db_name,
+                "SELECT COUNT(*) AS n FROM system.parquet_files WHERE table_name = 'cpu'",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        arrow::util::pretty::pretty_format_batches(&batches)
+            .unwrap()
+            .to_string()
+            .contains("| 2 |")
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !files_persisted().await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both snapshots should persist a file");
+
+    let batches: Vec<RecordBatch> = query_executor
+        .query_sql(db_name, "SELECT time, usage FROM cpu", None, None, None)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_batches_sorted_eq!(
+        [
+            "+---------------------+-------+",
+            "| time                | usage |",
+            "+---------------------+-------+",
+            "| 1970-01-01T00:00:05 | 1.0   |",
+            "| 1970-01-01T00:00:10 | 2.0   |",
+            "| 1970-01-01T00:00:15 | 1.0   |",
+            "| 1970-01-01T00:00:20 | 1.0   |",
+            "| 1970-01-01T00:00:25 | 1.0   |",
+            "+---------------------+-------+",
+        ],
+        &batches
+    );
 }

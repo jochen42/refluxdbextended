@@ -17,8 +17,8 @@ Examples
 
 {}
   --node-id <NODE_ID>              Node identifier used as prefix in object store file paths
-                                    [env: INFLUXDB3_NODE_IDENTIFIER_PREFIX=]
-  --object-store <OBJECT_STORE>    Which object storage to use.
+                                    [env: INFLUXDB3_NODE_ID=]
+  --object-store <OBJECT_STORE>    Which object storage to use. If not specified, defaults to file.
                                     [env: INFLUXDB3_OBJECT_STORE=]
                                     [possible values: memory, memory-throttled, file, s3, google, azure]
 
@@ -30,7 +30,11 @@ Examples
                                    timeout expires. Set to 0s to close connections immediately.
                                     [default: 30s]
                                     [env: INFLUXDB3_SHUTDOWN_TIMEOUT=]
-  --log-filter <FILTER>            Logs: filter directive
+  --log-filter <FILTER>            Logs: filter directive.
+                                   When the filter starts with "debug" or "trace", noise-reduction
+                                   directives are automatically appended (e.g. reqwest=info,
+                                   datafusion=info, object_store=off). Use --disable-log-filter-noise-reduction
+                                   to suppress this.
                                     [default: info,iox_query::query_log=warn,influxdb3_query_executor::query_planner=warn]
                                     [env: INFLUXDB3_LOG_FILTER=]
   --tls-key <KEY_FILE>             The path to the key file for TLS to be enabled
@@ -42,14 +46,14 @@ Examples
                                     [env: INFLUXDB3_TLS_MINIMUM_VERSION=]
   --without-auth                   Run InfluxDB 3 server without authorization
   --disable-authz <RESOURCES>      Optionally disable authz by passing in a comma separated
-                                   list of resources. Valid values are health, ping, and metrics.
-                                   To disable auth for multiple resources pass in a list, eg.
-                                   `--disable-authz health,ping`
+                                   list of resources. Valid values are health, ping, metrics,
+                                   ready, and pprof. To disable auth for multiple resources pass
+                                   in a list, eg. `--disable-authz health,ping`
   --admin-token-file <FILE>        File containing offline admin tokens
                                     [env: INFLUXDB3_ADMIN_TOKEN_FILE=]
 
 {}
-  --data-dir <DIR>                 Location to store files locally [env: INFLUXDB3_DB_DIR=]
+  --data-dir <DIR>                 Location to store files locally [env: INFLUXDB3_DATA_DIR=]
   --bucket <BUCKET>                Bucket name for cloud object storage [env: INFLUXDB3_BUCKET=]
 
 {}
@@ -71,9 +75,25 @@ Examples
   --plugin-dir <DIR>               Location of plugins [env: INFLUXDB3_PLUGIN_DIR=]
   --virtual-env-location <PATH>    Location of your virtual environment
                                     [env: VIRTUAL_ENV=]
-  --package-manager <MANAGER>      Python package manager  
+  --package-manager <MANAGER>      Deprecated. Python and pip are bundled with InfluxDB; this option does not need to be set
                                     [possible values: discover, pip, uv, disabled] [default: discover]
                                     [env: INFLUXDB3_PACKAGE_MANAGER=]
+  --disable-package-management     Disable all Processing Engine package management. The server never
+                                    creates or modifies a virtual environment, never invokes pip, and the
+                                    plugin package-install API endpoints are rejected. Takes precedence over
+                                    --package-manager. Manage the virtual environment yourself and point the
+                                    server at it via VIRTUAL_ENV.
+                                    [env: INFLUXDB3_DISABLE_PACKAGE_MANAGEMENT=]
+  --restrict-plugin-triggers-to <TYPE>...
+                                    Restrict plugin triggers to the provided trigger type(s)
+                                    [possible values: wal, schedule, request]
+                                    [env: INFLUXDB3_RESTRICT_PLUGIN_TRIGGERS_TO=]
+  --async-trigger-concurrency-limit <N>
+                                    Maximum number of concurrent invocations per asynchronous trigger
+                                    (run_asynchronous). Synchronous triggers always run one invocation
+                                    at a time. Must be greater than zero. [default: unlimited]
+                                    The default will change from unlimited to 8 in a future release.
+                                    [env: INFLUXDB3_ASYNC_TRIGGER_CONCURRENCY_LIMIT=]
 
 {}
   -h, --help                       Print help information

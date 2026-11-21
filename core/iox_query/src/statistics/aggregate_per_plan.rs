@@ -265,11 +265,8 @@ fn statistics_min_max(
             // as `Inexact` is not guaranteed to cover the actual min and max values
             // https://github.com/apache/arrow-datafusion/issues/8078
             (Precision::Inexact(min), Precision::Inexact(max)) => {
-                if let Some(_deduplicate_exec) = input.as_any().downcast_ref::<DeduplicateExec>() {
-                    min_max_ranges.push((min, max));
-                } else {
-                    return None;
-                };
+                let _deduplicate_exec = input.as_any().downcast_ref::<DeduplicateExec>()?;
+                min_max_ranges.push((min, max));
             }
             // the statistics  values are absent
             _ => return None,
@@ -339,7 +336,7 @@ mod test {
         let plan_rb = chunks_to_physical_nodes(&schema, None, vec![record_batch_chunk], 1);
         insta::assert_yaml_snapshot!(
             format_execution_plan(&plan_rb),
-            @r#"- " RecordBatchesExec: chunks=1, projection=[tag, float_field, int_field, string_field, tag_no_val, field_no_val, time]""#
+            @r#"- " RecordBatchesExec: chunks=1 [Test=1], projection=[tag, float_field, int_field, string_field, tag_no_val, field_no_val, time]""#
         );
 
         // Stats for time

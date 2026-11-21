@@ -3,7 +3,7 @@ use std::{
     future::Future,
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex, Once},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use arrow::record_batch::RecordBatch;
@@ -30,6 +30,7 @@ fn init_rustls() {
     });
 }
 
+mod async_concurrency;
 mod auth;
 mod client;
 mod configure;
@@ -39,8 +40,12 @@ mod limits;
 mod logs;
 mod packages;
 mod ping;
+mod plugin_restriction;
 mod query;
+mod schema_enforcement;
+mod shutdown;
 mod system_tables;
+mod telemetry;
 mod write;
 
 pub trait ConfigProvider: Send + Sync + 'static {
@@ -64,6 +69,9 @@ pub trait ConfigProvider: Send + Sync + 'static {
 
     /// Get if logs should be captured
     fn capture_logs(&self) -> bool;
+
+    /// Get extra environment variables to set on the spawned process
+    fn env_vars(&self) -> Vec<(String, String)>;
 
     /// Get if recovery endpoint should be enabled
     fn recovery_endpoint_enabled(&self) -> bool;
@@ -90,8 +98,12 @@ pub struct TestConfig {
     without_admin_token: bool,
     node_id: Option<String>,
     plugin_dir: Option<String>,
+    plugin_repo: Option<String>,
     virtual_env_dir: Option<String>,
     package_manager: Option<String>,
+    disable_package_management: bool,
+    restrict_plugin_triggers_to: Vec<String>,
+    async_trigger_concurrency_limit: Option<std::num::NonZeroUsize>,
     // If None, use memory object store.
     object_store_dir: Option<String>,
     disable_authz: Vec<String>,
@@ -99,11 +111,16 @@ pub struct TestConfig {
     gen1_lookback_duration: Option<String>,
     snapshotted_wal_files_to_keep: Option<String>,
     capture_logs: bool,
+    log_filter: Option<String>,
+    disable_log_filter_noise_reduction: bool,
+    process_env_vars: Vec<(String, String)>,
     enable_recovery_endpoint: bool,
+    test_mode: bool,
     admin_token_file: Option<String>,
     permission_tokens_file: Option<String>,
     object_store_tls_allow_insecure: bool,
     object_store_tls_ca_path: Option<String>,
+    operator_socket_path: Option<String>,
 }
 
 impl TestConfig {
@@ -135,6 +152,17 @@ impl TestConfig {
         self
     }
 
+    /// Serve the operator control socket at `path` (requires the `operator_socket` feature)
+    pub fn with_operator_socket_path<S: Into<String>>(mut self, path: S) -> Self {
+        self.operator_socket_path = Some(path.into());
+        self
+    }
+
+    pub fn with_test_mode(mut self) -> Self {
+        self.test_mode = true;
+        self
+    }
+
     /// Set a host identifier prefix on the spawned [`TestServer`]
     pub fn with_node_id<S: Into<String>>(mut self, node_id: S) -> Self {
         self.node_id = Some(node_id.into());
@@ -147,6 +175,12 @@ impl TestConfig {
         self
     }
 
+    /// Set the repository that this [`TestServer`] fetches `gh:` plugins from
+    pub fn with_plugin_repo<S: Into<String>>(mut self, plugin_repo: S) -> Self {
+        self.plugin_repo = Some(plugin_repo.into());
+        self
+    }
+
     /// Set the virtual env dir for this [`TestServer`]
     pub fn with_virtual_env<S: Into<String>>(mut self, virtual_env_dir: S) -> Self {
         self.virtual_env_dir = Some(virtual_env_dir.into());
@@ -155,6 +189,27 @@ impl TestConfig {
 
     pub fn with_package_manager<S: Into<String>>(mut self, package_manager: S) -> Self {
         self.package_manager = Some(package_manager.into());
+        self
+    }
+
+    /// Start this [`TestServer`] with `--disable-package-management`.
+    pub fn with_disable_package_management(mut self) -> Self {
+        self.disable_package_management = true;
+        self
+    }
+
+    /// Set `--async-trigger-concurrency-limit` for this [`TestServer`]
+    pub fn with_async_trigger_concurrency_limit(mut self, limit: std::num::NonZeroUsize) -> Self {
+        self.async_trigger_concurrency_limit = Some(limit);
+        self
+    }
+
+    pub fn with_restrict_plugin_triggers_to<I, S>(mut self, types: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.restrict_plugin_triggers_to = types.into_iter().map(Into::into).collect();
         self
     }
 
@@ -202,6 +257,24 @@ impl TestConfig {
         self
     }
 
+    /// Set the log filter for this [`TestServer`]
+    pub fn with_log_filter(mut self, filter: impl Into<String>) -> Self {
+        self.log_filter = Some(filter.into());
+        self
+    }
+
+    /// Disable log filter noise reduction for this [`TestServer`]
+    pub fn with_disable_log_filter_noise_reduction(mut self) -> Self {
+        self.disable_log_filter_noise_reduction = true;
+        self
+    }
+
+    /// Set an environment variable on the spawned server process
+    pub fn with_env_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.process_env_vars.push((key.into(), value.into()));
+        self
+    }
+
     /// Set the admin token file path for this [`TestServer`]
     pub fn with_admin_token_file<S: Into<String>>(mut self, path: S) -> Self {
         self.admin_token_file = Some(path.into());
@@ -233,9 +306,18 @@ impl ConfigProvider for TestConfig {
         if !self.auth {
             args.append(&mut vec!["--without-auth".to_string()]);
         }
+        if self.test_mode {
+            args.push("--test-mode".to_string());
+        }
 
         if let Some(plugin_dir) = &self.plugin_dir {
             args.append(&mut vec!["--plugin-dir".to_string(), plugin_dir.to_owned()]);
+        }
+        if let Some(plugin_repo) = &self.plugin_repo {
+            args.append(&mut vec![
+                "--plugin-repo".to_string(),
+                plugin_repo.to_owned(),
+            ]);
         }
         if let Some(virtual_env_dir) = &self.virtual_env_dir {
             args.append(&mut vec![
@@ -248,6 +330,24 @@ impl ConfigProvider for TestConfig {
                 "--package-manager".to_string(),
                 package_manager.to_owned(),
             ]);
+        }
+        if self.disable_package_management {
+            args.push("--disable-package-management".to_string());
+        }
+        if !self.restrict_plugin_triggers_to.is_empty() {
+            args.push("--restrict-plugin-triggers-to".to_string());
+            for t in &self.restrict_plugin_triggers_to {
+                args.push(t.to_owned());
+            }
+        }
+        if let Some(limit) = self.async_trigger_concurrency_limit {
+            args.extend([
+                "--async-trigger-concurrency-limit".to_string(),
+                limit.to_string(),
+            ]);
+        }
+        if let Some(socket_path) = &self.operator_socket_path {
+            args.extend(["--operator-socket-path".to_string(), socket_path.to_owned()]);
         }
         args.push("--node-id".to_string());
         if let Some(host) = &self.node_id {
@@ -302,7 +402,7 @@ impl ConfigProvider for TestConfig {
         }
 
         args.append(&mut vec![
-            "--wal-snapshot-size".to_string(),
+            "--wal-files-per-snapshot".to_string(),
             "1".to_string(),
         ]);
 
@@ -325,6 +425,13 @@ impl ConfigProvider for TestConfig {
                 "--permission-tokens-file".to_string(),
                 permission_tokens_file.to_owned(),
             ])
+        }
+
+        if let Some(filter) = &self.log_filter {
+            args.extend(["--log-filter".to_string(), filter.clone()]);
+        }
+        if self.disable_log_filter_noise_reduction {
+            args.push("--disable-log-filter-noise-reduction".to_string());
         }
 
         args
@@ -354,6 +461,10 @@ impl ConfigProvider for TestConfig {
         self.capture_logs
     }
 
+    fn env_vars(&self) -> Vec<(String, String)> {
+        self.process_env_vars.clone()
+    }
+
     fn recovery_endpoint_enabled(&self) -> bool {
         self.enable_recovery_endpoint
     }
@@ -381,6 +492,12 @@ pub struct TestServer {
     http_client: reqwest::Client,
     stdout: Option<Arc<Mutex<String>>>,
     stderr: Option<Arc<Mutex<String>>>,
+    /// Byte offset into `stdout` already consumed by `wait_for_log_message`. Tracked
+    /// per-stream so two streams growing in parallel don't shift each other's
+    /// indices, while still letting successive waits match only *new* content
+    /// rather than re-matching a historical occurrence of the same message.
+    stdout_seen: Arc<Mutex<usize>>,
+    stderr_seen: Arc<Mutex<usize>>,
 }
 
 impl std::fmt::Debug for TestServer {
@@ -528,6 +645,10 @@ impl TestServer {
             (None, None)
         };
 
+        for (k, v) in config.env_vars() {
+            command.env(k, v);
+        }
+
         let mut server_process = command.spawn().expect("spawn the influxdb3 server process");
 
         // If log capture is enabled, spawn tasks to read from stdout/stderr
@@ -594,6 +715,8 @@ impl TestServer {
             http_client,
             stdout: stdout_handle,
             stderr: stderr_handle,
+            stdout_seen: Arc::new(Mutex::new(0)),
+            stderr_seen: Arc::new(Mutex::new(0)),
         };
 
         server.wait_until_ready().await;
@@ -686,12 +809,57 @@ impl TestServer {
         self.server_process.kill().expect("kill the server process");
     }
 
+    /// Ask the server to stop the way an orchestrator does.
+    #[cfg(unix)]
+    pub fn send_sigterm(&mut self) {
+        let pid = self.server_process.id() as libc::pid_t;
+        // SAFETY: kill(2) on a pid this harness spawned and has not reaped.
+        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+        assert_eq!(
+            rc,
+            0,
+            "send SIGTERM to {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
     pub fn is_stopped(&mut self) -> bool {
         self.server_process
             .try_wait()
             .inspect_err(|error| println!("error when checking for stopped: {error:?}"))
             .expect("check process status")
             .is_some()
+    }
+
+    /// Wait for the server process to exit and return its status. Panics with
+    /// the last log lines if it is still running after 30 seconds.
+    pub async fn wait_until_stopped(&mut self) -> std::process::ExitStatus {
+        const TIMEOUT: Duration = Duration::from_secs(30);
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(status) = self
+                .server_process
+                .try_wait()
+                .inspect_err(|error| println!("error when checking for stopped: {error:?}"))
+                .expect("check process status")
+            {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "server did not stop within {TIMEOUT:?}; last log lines:\n{}",
+                self.get_logs(Some(80)).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Kill the server process (`SIGKILL`) and wait for it to exit, so a test
+    /// can start another server on the same store or node id without racing
+    /// the old one.
+    pub async fn kill_and_wait(&mut self) {
+        self.kill();
+        self.wait_until_stopped().await;
     }
 
     /// Get captured stdout as a string, if log capture was enabled
@@ -755,6 +923,70 @@ impl TestServer {
             );
         } else {
             panic!("Log capture was not enabled for this TestServer");
+        }
+    }
+
+    /// Waits until the captured logs contain `msg`, or panics after 2 seconds.
+    ///
+    /// The function requires log capture through [`TestConfig::with_capture_logs`].
+    /// Each call searches only the log content that arrived after the previous call.
+    pub async fn wait_for_log_message(&self, msg: &str) {
+        let max_retries = 200; // up to 2 secs wait
+        let mut found_msg = false;
+
+        // Search only content written to either stream since the last successful
+        // call (or since this server was spawned). Two requirements:
+        //   - Per-stream offsets — synthesizing a single concat-string cursor
+        //     across stdout+stderr is not stable when both streams grow in
+        //     parallel; lines fall through the cracks as positions shift.
+        //   - Advance on every iteration — successive waits for the same
+        //     message must not match a historical occurrence (e.g. the second
+        //     "Successfully warmed distinct cache" must wait for the second
+        //     cache's warming, not return on the first cache's line).
+        for _ in 0..max_retries {
+            // Scan under the lock guards inside this block. The guards drop at
+            // the end of the block, before the .await, which keeps the future
+            // Send and avoids a clone of the full buffers on every retry.
+            let hit = {
+                let stdout_str = match &self.stdout {
+                    Some(s) => s.lock().unwrap(),
+                    None => panic!("wait_for_log_message requires capture_logs"),
+                };
+                let stderr_str = match &self.stderr {
+                    Some(e) => e.lock().unwrap(),
+                    None => panic!("wait_for_log_message requires capture_logs"),
+                };
+                let mut stdout_seen = self.stdout_seen.lock().unwrap();
+                let mut stderr_seen = self.stderr_seen.lock().unwrap();
+                let new_stdout = &stdout_str[(*stdout_seen).min(stdout_str.len())..];
+                let new_stderr = &stderr_str[(*stderr_seen).min(stderr_str.len())..];
+                let hit = new_stdout.contains(msg) || new_stderr.contains(msg);
+                *stdout_seen = stdout_str.len();
+                *stderr_seen = stderr_str.len();
+                hit
+            };
+            if hit {
+                found_msg = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        if !found_msg {
+            println!(
+                "====== cannot find log msg {:?}, below are the server logs =======",
+                msg
+            );
+            for line in self
+                .get_logs(Some(100))
+                .expect("logs to be present")
+                .lines()
+            {
+                println!("{line}");
+            }
+            panic!(
+                "Exhausted number of retries waiting for log message.\n\n╔═══════════════════════════════════╗\n║POSSIBLE REMEDY: add TEST_LOG=debug║\n╚═══════════════════════════════════╝\n"
+            );
         }
     }
 
@@ -843,9 +1075,23 @@ impl TestServer {
         database: &str,
         retention_period: Option<Duration>,
     ) -> Result<(), influxdb3_client::Error> {
+        self.api_v3_create_database_with_schema_mode(
+            database,
+            retention_period,
+            influxdb3_catalog::catalog::SchemaMode::Implicit,
+        )
+        .await
+    }
+
+    pub async fn api_v3_create_database_with_schema_mode(
+        &self,
+        database: &str,
+        retention_period: Option<Duration>,
+        schema_mode: influxdb3_catalog::catalog::SchemaMode,
+    ) -> Result<(), influxdb3_client::Error> {
         let client = self.maybe_authorized_client();
         client
-            .api_v3_configure_db_create(database, retention_period)
+            .api_v3_configure_db_create(database, retention_period, schema_mode)
             .await
     }
 
@@ -1000,6 +1246,25 @@ impl TestServer {
             .await
             .expect("failed to send request to delete distinct cache")
     }
+
+    pub async fn telemetry_snapshot_response(&self) -> Response {
+        self.http_client
+            .get(format!(
+                "{base}/api/v3/test/telemetry_snapshot",
+                base = self.client_addr()
+            ))
+            .send()
+            .await
+            .expect("failed to send request for telemetry snapshot")
+    }
+
+    pub async fn telemetry_snapshot(&self) -> serde_json::Value {
+        self.telemetry_snapshot_response()
+            .await
+            .json()
+            .await
+            .expect("telemetry snapshot response must be json")
+    }
 }
 
 /// Generate certs for tests if they do not already exist. For the most part this
@@ -1114,7 +1379,6 @@ pub fn parse_token(result: String) -> String {
     raw_token.to_string()
 }
 
-#[allow(dead_code)]
 pub async fn collect_stream(stream: FlightRecordBatchStream) -> Vec<RecordBatch> {
     stream
         .try_collect()

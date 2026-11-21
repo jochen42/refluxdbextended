@@ -73,6 +73,9 @@ pub enum PersisterError {
     #[error("table snapshot persistence task panicked: {0}")]
     TableSnapshotPersistenceTaskFailed(#[source] tokio::task::JoinError),
 
+    #[error("snapshot manifest parse task panicked: {0}")]
+    SnapshotParseTaskFailed(#[source] tokio::task::JoinError),
+
     #[error("table index error: {0}")]
     TableIndexPathError(#[source] crate::paths::PathError),
 
@@ -111,8 +114,11 @@ const CHECKPOINTS_TO_RETAIN_PER_MONTH: usize = 2;
 /// restore. Matches the default object-store connection limit so small
 /// manifests keep loading at full concurrency (no startup regression); large
 /// manifests fan out into ranged GETs that share that same connection-limit
-/// semaphore, so peak in-flight requests are bounded regardless. The effective
-/// limit is capped by the object-store connection limit at startup.
+/// semaphore, so peak in-flight requests are bounded regardless. Clusters with
+/// large manifests can dial this down via
+/// [`Persister::with_snapshot_load_concurrency`] to cap reassembly-buffer
+/// memory (enterprise exposes it as
+/// `--replica-snapshot-manifest-load-concurrency`).
 pub const DEFAULT_MAX_CONCURRENT_SNAPSHOT_LOADS: usize = 64;
 
 /// Compaction manifest loads at least this large are logged at `warn` (start and completion) so a
@@ -140,7 +146,7 @@ pub struct Persister {
     /// The interface to the object store being used
     object_store: Arc<dyn ObjectStore>,
     /// Prefix used for all paths in the object store for this persister
-    node_identifier_prefix: String,
+    node_identifier_prefix: Arc<str>,
     /// time provider
     time_provider: Arc<dyn TimeProvider>,
     pub(crate) mem_pool: Arc<dyn MemoryPool>,
@@ -154,6 +160,10 @@ pub struct Persister {
     snapshot_load_concurrency: usize,
     /// Compaction manifests not yet loaded by the running startup load.
     compaction_manifests_pending: Option<U64Gauge>,
+    /// Max snapshot manifests parsed concurrently. Each parse holds its raw
+    /// buffer plus the decoded snapshot, none of it memory-accounted, so the
+    /// default is serial and `serve` raises it from the resolved core count.
+    snapshot_parse_concurrency: usize,
 }
 
 impl Persister {
@@ -166,21 +176,23 @@ impl Persister {
     /// * `checkpoint_interval` - Optional interval between checkpoint creation. None disables checkpointing.
     pub fn new(
         object_store: Arc<dyn ObjectStore>,
-        node_identifier_prefix: impl Into<String>,
+        node_identifier_prefix: impl Into<Arc<str>>,
         time_provider: Arc<dyn TimeProvider>,
         checkpoint_interval: Option<Duration>,
     ) -> Self {
-        let nip = node_identifier_prefix.into();
+        let node_identifier_prefix = node_identifier_prefix.into();
+
         Self {
             object_store_url: ObjectStoreUrl::parse(DEFAULT_OBJECT_STORE_URL).unwrap(),
             object_store: Arc::clone(&object_store),
-            node_identifier_prefix: nip.clone(),
+            node_identifier_prefix,
             time_provider,
             mem_pool: Arc::new(UnboundedMemoryPool::default()),
             checkpoint_interval,
             last_checkpoint_time: RwLock::new(None),
             cached_checkpoint: RwLock::new(None),
             snapshot_load_concurrency: DEFAULT_MAX_CONCURRENT_SNAPSHOT_LOADS,
+            snapshot_parse_concurrency: 1,
             compaction_manifests_pending: None,
         }
     }
@@ -211,6 +223,12 @@ impl Persister {
         self
     }
 
+    /// Override the number of snapshot manifests parsed concurrently. Defaults to 1.
+    pub fn with_snapshot_parse_concurrency(mut self, concurrency: usize) -> Self {
+        self.snapshot_parse_concurrency = concurrency.max(1);
+        self
+    }
+
     /// Get the Object Store URL
     pub fn object_store_url(&self) -> &ObjectStoreUrl {
         &self.object_store_url
@@ -224,7 +242,7 @@ impl Persister {
     }
 
     /// Get the host identifier prefix
-    pub fn node_identifier_prefix(&self) -> &str {
+    pub fn node_identifier_prefix(&self) -> &Arc<str> {
         &self.node_identifier_prefix
     }
 
@@ -253,6 +271,7 @@ impl Persister {
         );
         let mut fetches = Vec::new();
         let mut offset: Option<ObjPath> = None;
+        let parse_permits = Arc::new(Semaphore::new(self.snapshot_parse_concurrency));
 
         while most_recent_n > 0 {
             let count = if most_recent_n > 1000 {
@@ -298,6 +317,7 @@ impl Persister {
                 last_modified: DateTime<Utc>,
                 object_size: u64,
                 object_store: Arc<dyn ObjectStore>,
+                parse_permits: Arc<Semaphore>,
             ) -> Result<(usize, PersistedSnapshotVersion)> {
                 // Manifests can be multi-GiB; get_adaptive chunks large
                 // reads. Size is known from list(), so pass it to skip a
@@ -306,7 +326,13 @@ impl Persister {
                     .get_adaptive(&location, Some(object_size))
                     .await?;
                 let size = bytes.len();
-                let mut snapshot: PersistedSnapshotVersion = serde_json::from_slice(&bytes)?;
+                // serde_json can hold the polling task for seconds on a large
+                // manifest, so parse on the blocking pool.
+                let _permit = parse_permits.acquire().await.expect("semaphore not closed");
+                let mut snapshot: PersistedSnapshotVersion =
+                    tokio::task::spawn_blocking(move || serde_json::from_slice(&bytes))
+                        .await
+                        .map_err(PersisterError::SnapshotParseTaskFailed)??;
                 match &mut snapshot {
                     PersistedSnapshotVersion::V1(ps) => {
                         ps.persisted_at = Some(last_modified.timestamp_millis());
@@ -323,6 +349,7 @@ impl Persister {
                     item.last_modified,
                     item.size,
                     Arc::clone(&self.object_store),
+                    Arc::clone(&parse_permits),
                 ));
             }
 
@@ -464,8 +491,7 @@ impl Persister {
     ) -> Result<()> {
         let PersistedSnapshotVersion::V1(snapshot) = persisted_snapshot;
         let seq = snapshot.snapshot_sequence_number;
-        let snapshot_file_path =
-            SnapshotInfoFilePath::new(self.node_identifier_prefix.as_str(), seq);
+        let snapshot_file_path = SnapshotInfoFilePath::new(&self.node_identifier_prefix, seq);
         let json = serde_json::to_vec_pretty(persisted_snapshot)?;
         let manifest_bytes = json.len();
 
@@ -569,7 +595,7 @@ impl Persister {
         previous_checkpoint: PersistedSnapshotCheckpoint,
     ) {
         let object_store = Arc::clone(&self.object_store);
-        let node_id = self.node_identifier_prefix.clone();
+        let node_id = Arc::clone(&self.node_identifier_prefix);
 
         tokio::spawn(async move {
             let year_month = previous_checkpoint.year_month;
@@ -662,7 +688,7 @@ impl Persister {
                     "update_cached_checkpoint: creating new checkpoint for month"
                 );
                 let new_checkpoint = PersistedSnapshotCheckpoint::new(
-                    self.node_identifier_prefix.clone(),
+                    Arc::clone(&self.node_identifier_prefix),
                     current_month,
                 );
                 if let Some(old_checkpoint) = cache.replace(CachedCheckpoint {
@@ -869,14 +895,13 @@ impl Persister {
         );
 
         // Clean up old checkpoints for this month, keeping only the most recent ones
-        let node_id_prefix = self.node_identifier_prefix.clone();
+        let node_id_prefix = Arc::clone(&self.node_identifier_prefix);
         let object_store = Arc::clone(&self.object_store);
         let year_month = *year_month;
-        tokio::spawn(Self::cleanup_old_checkpoints_for_month(
-            node_id_prefix,
-            object_store,
-            year_month,
-        ));
+        tokio::spawn(async move {
+            Self::cleanup_old_checkpoints_for_month(&node_id_prefix, object_store, year_month)
+                .await;
+        });
 
         Ok(())
     }
@@ -932,7 +957,7 @@ impl Persister {
             let month_snapshots = snapshots_by_month.remove(&month).unwrap();
 
             let mut checkpoint =
-                PersistedSnapshotCheckpoint::new(self.node_identifier_prefix.clone(), month);
+                PersistedSnapshotCheckpoint::new(Arc::clone(&self.node_identifier_prefix), month);
             let mut file_index: FileIndex = HashMap::new();
             for snapshot in month_snapshots.into_iter().rev() {
                 checkpoint.update_from_snapshot(snapshot);
@@ -975,11 +1000,11 @@ impl Persister {
     /// unbounded accumulation of checkpoint files. We keep 2 checkpoints (latest +
     /// previous) as a safety buffer in case the latest is corrupted.
     async fn cleanup_old_checkpoints_for_month(
-        node_identifier_prefix: String,
+        node_identifier_prefix: &str,
         object_store: Arc<dyn ObjectStore>,
         year_month: YearMonth,
     ) {
-        let month_dir = SnapshotCheckpointPath::month_dir(&node_identifier_prefix, &year_month);
+        let month_dir = SnapshotCheckpointPath::month_dir(node_identifier_prefix, &year_month);
 
         // List all checkpoints for this month
         let mut checkpoints: Vec<_> = match object_store

@@ -3,26 +3,191 @@ use std::sync::Arc;
 use super::WriteValidator;
 use crate::{Precision, write_buffer::Error};
 
-use data_types::NamespaceName;
 use influxdb3_catalog::catalog::Catalog;
 use influxdb3_id::TableId;
+use influxdb3_types::DatabaseName;
 use influxdb3_wal::Gen1Duration;
 use iox_time::{MockProvider, Time};
 use object_store::memory::InMemory;
+
+#[tokio::test]
+async fn rejected_over_limit_line_creates_no_schema() {
+    let catalog = Catalog::new_in_memory_with_limits(
+        "test",
+        influxdb3_catalog::catalog::CatalogLimits::new(10, 100, 5),
+    )
+    .await
+    .unwrap();
+    let database_name = DatabaseName::new("test").unwrap();
+    // 1 tag + 8 fields projects to 9 columns against a limit of 5.
+    let lp = "cpu,host=a f1=1,f2=1,f3=1,f4=1,f5=1,f6=1,f7=1,f8=1 1000";
+    let result = WriteValidator::initialize(database_name.clone(), Arc::clone(&catalog))
+        .unwrap()
+        .v1_parse_lines_and_catalog_updates(
+            lp,
+            true,
+            Time::from_timestamp_nanos(0),
+            Precision::Auto,
+        )
+        .unwrap()
+        .commit_catalog_changes()
+        .await
+        .unwrap()
+        .unwrap_success()
+        .convert_lines_to_buffer(Gen1Duration::new_5m());
+    assert_eq!(result.errors.len(), 1);
+    assert!(
+        result.errors[0].error_message.contains("9 columns"),
+        "error should report the projected column count, got: {}",
+        result.errors[0].error_message
+    );
+    // The rejected line must not have created the table or any columns.
+    assert!(
+        catalog
+            .db_schema("test")
+            .unwrap()
+            .table_definition("cpu")
+            .is_none()
+    );
+
+    // An existing table's schema stays unchanged when an over-limit line is
+    // rejected.
+    let result = WriteValidator::initialize(database_name.clone(), Arc::clone(&catalog))
+        .unwrap()
+        .v1_parse_lines_and_catalog_updates(
+            "cpu,host=a f1=1 1000",
+            true,
+            Time::from_timestamp_nanos(0),
+            Precision::Auto,
+        )
+        .unwrap()
+        .commit_catalog_changes()
+        .await
+        .unwrap()
+        .unwrap_success()
+        .convert_lines_to_buffer(Gen1Duration::new_5m());
+    assert!(result.errors.is_empty());
+    let columns_before = catalog
+        .db_schema("test")
+        .unwrap()
+        .table_definition("cpu")
+        .unwrap()
+        .num_columns();
+    let result = WriteValidator::initialize(database_name, Arc::clone(&catalog))
+        .unwrap()
+        .v1_parse_lines_and_catalog_updates(
+            lp,
+            true,
+            Time::from_timestamp_nanos(0),
+            Precision::Auto,
+        )
+        .unwrap()
+        .commit_catalog_changes()
+        .await
+        .unwrap()
+        .unwrap_success()
+        .convert_lines_to_buffer(Gen1Duration::new_5m());
+    assert_eq!(result.errors.len(), 1);
+    let columns_after = catalog
+        .db_schema("test")
+        .unwrap()
+        .table_definition("cpu")
+        .unwrap()
+        .num_columns();
+    assert_eq!(columns_before, columns_after);
+}
+
+#[tokio::test]
+async fn rejected_type_conflict_line_creates_no_schema() {
+    let catalog = Catalog::new_in_memory("test").await.unwrap();
+    let database_name = DatabaseName::new("test").unwrap();
+    let result = WriteValidator::initialize(database_name.clone(), Arc::clone(&catalog))
+        .unwrap()
+        .v1_parse_lines_and_catalog_updates(
+            "cpu f1=1.0 1000",
+            true,
+            Time::from_timestamp_nanos(0),
+            Precision::Second,
+        )
+        .unwrap()
+        .commit_catalog_changes()
+        .await
+        .unwrap()
+        .unwrap_success()
+        .convert_lines_to_buffer(Gen1Duration::new_5m());
+    assert!(result.errors.is_empty());
+
+    // f1 exists as a float; the string value rejects the line, and the line's
+    // other new columns must not be created.
+    let result = WriteValidator::initialize(database_name, Arc::clone(&catalog))
+        .unwrap()
+        .v1_parse_lines_and_catalog_updates(
+            "cpu,newtag=x f9=9,f1=\"s\" 1000",
+            true,
+            Time::from_timestamp_nanos(0),
+            Precision::Second,
+        )
+        .unwrap()
+        .commit_catalog_changes()
+        .await
+        .unwrap()
+        .unwrap_success()
+        .convert_lines_to_buffer(Gen1Duration::new_5m());
+    assert_eq!(result.errors.len(), 1);
+    let table = catalog
+        .db_schema("test")
+        .unwrap()
+        .table_definition("cpu")
+        .unwrap();
+    assert!(
+        !table.column_exists("newtag") && !table.column_exists("f9"),
+        "rejected line must not create columns"
+    );
+}
+
+#[tokio::test]
+async fn rejected_bad_timestamp_line_creates_no_schema() {
+    let catalog = Catalog::new_in_memory("test").await.unwrap();
+    let database_name = DatabaseName::new("test").unwrap();
+    // Seconds precision overflows to_nanos for this timestamp.
+    let result = WriteValidator::initialize(database_name, Arc::clone(&catalog))
+        .unwrap()
+        .v1_parse_lines_and_catalog_updates(
+            "cpu,t1=a f1=1 100000000000000",
+            true,
+            Time::from_timestamp_nanos(0),
+            Precision::Second,
+        )
+        .unwrap()
+        .commit_catalog_changes()
+        .await
+        .unwrap()
+        .unwrap_success()
+        .convert_lines_to_buffer(Gen1Duration::new_5m());
+    assert_eq!(result.errors.len(), 1);
+    assert!(
+        catalog
+            .db_schema("test")
+            .unwrap()
+            .table_definition("cpu")
+            .is_none(),
+        "rejected line must not create the table"
+    );
+}
 
 #[tokio::test]
 async fn write_validator_v1() -> Result<(), Error> {
     let node_id = Arc::from("sample-host-id");
     let obj_store = Arc::new(InMemory::new());
     let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-    let namespace = NamespaceName::new("test").unwrap();
+    let database_name = DatabaseName::new("test").unwrap();
     let catalog = Arc::new(
         Catalog::new(node_id, obj_store, time_provider, Default::default())
             .await
             .unwrap(),
     );
     let expected_sequence = catalog.sequence_number().next();
-    let result = WriteValidator::initialize(namespace.clone(), Arc::clone(&catalog))?
+    let result = WriteValidator::initialize(database_name.clone(), Arc::clone(&catalog))?
         .v1_parse_lines_and_catalog_updates(
             "cpu,tag1=foo val1=\"bar\" 1234",
             false,
@@ -40,7 +205,10 @@ async fn write_validator_v1() -> Result<(), Error> {
     assert_eq!(result.index_count, 1);
     assert!(result.errors.is_empty());
     assert_eq!(expected_sequence, catalog.sequence_number());
-    assert_eq!(result.valid_data.database_name.as_ref(), namespace.as_str());
+    assert_eq!(
+        result.valid_data.database_name.as_ref(),
+        database_name.as_str()
+    );
     // cpu table
     let batch = result
         .valid_data
@@ -52,7 +220,7 @@ async fn write_validator_v1() -> Result<(), Error> {
     // Validate another write, the result should be very similar, but now the catalog
     // has the table/columns added, so it will excercise a different code path:
     let expected_sequence = catalog.sequence_number();
-    let result = WriteValidator::initialize(namespace.clone(), Arc::clone(&catalog))?
+    let result = WriteValidator::initialize(database_name.clone(), Arc::clone(&catalog))?
         .v1_parse_lines_and_catalog_updates(
             "cpu,tag1=foo val1=\"bar\" 1235",
             false,
@@ -73,7 +241,7 @@ async fn write_validator_v1() -> Result<(), Error> {
 
     // Validate another write, this time adding a new field:
     let expected_sequence = catalog.sequence_number().next();
-    let result = WriteValidator::initialize(namespace.clone(), Arc::clone(&catalog))?
+    let result = WriteValidator::initialize(database_name.clone(), Arc::clone(&catalog))?
         .v1_parse_lines_and_catalog_updates(
             "cpu,tag1=foo val1=\"bar\",val2=false 1236",
             false,
@@ -104,7 +272,7 @@ async fn write_validator_rejects_duplicate_tag() -> Result<(), Error> {
     let node_id = Arc::from("sample-host-id");
     let obj_store = Arc::new(InMemory::new());
     let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
-    let database_name = NamespaceName::new("test").unwrap();
+    let database_name = DatabaseName::new("test").unwrap();
     let catalog = Arc::new(
         Catalog::new(node_id, obj_store, time_provider, Default::default())
             .await
@@ -157,4 +325,62 @@ async fn write_validator_rejects_duplicate_tag() -> Result<(), Error> {
     );
 
     Ok(())
+}
+
+/// A timestamp at `MAX_WRITE_TIMESTAMP_NS` is accepted and any later one is rejected, both when
+/// a write accepts partial success and when one bad line fails the whole write.
+#[tokio::test]
+async fn rejects_timestamps_past_the_latest_supported() {
+    let max = influxdb3_wal::MAX_WRITE_TIMESTAMP_NS;
+    let catalog = Catalog::new_in_memory("test").await.unwrap();
+    let database_name = DatabaseName::new("test").unwrap();
+
+    let lp = format!("cpu v=1 {max}\ncpu v=2 {}\ncpu v=3 {}", max + 1, i64::MAX);
+    let result = WriteValidator::initialize(database_name.clone(), Arc::clone(&catalog))
+        .unwrap()
+        .v1_parse_lines_and_catalog_updates(
+            &lp,
+            true,
+            Time::from_timestamp_nanos(0),
+            Precision::Nanosecond,
+        )
+        .unwrap()
+        .commit_catalog_changes()
+        .await
+        .unwrap()
+        .unwrap_success()
+        .convert_lines_to_buffer(Gen1Duration::new_5m());
+    assert_eq!(result.line_count, 1);
+    assert_eq!(
+        result
+            .errors
+            .iter()
+            .map(|e| e.line_number)
+            .collect::<Vec<_>>(),
+        [2, 3]
+    );
+    assert!(
+        result.errors.iter().all(|e| e
+            .error_message
+            .contains("later than the latest supported timestamp")),
+        "unexpected error messages: {:?}",
+        result.errors
+    );
+
+    let err = WriteValidator::initialize(database_name, catalog)
+        .unwrap()
+        .v1_parse_lines_and_catalog_updates(
+            &format!("cpu v=2 {}", max + 1),
+            false,
+            Time::from_timestamp_nanos(0),
+            Precision::Nanosecond,
+        )
+        .err();
+    assert!(
+        matches!(
+            &err,
+            Some(Error::ParseError(e)) if e.error_message.contains("later than the latest supported timestamp")
+        ),
+        "unexpected result: {err:?}"
+    );
 }

@@ -1,6 +1,6 @@
 use super::{DeleteManagerArgs, ObjectDeleter, run};
 use influxdb3_catalog::catalog::{Catalog, HardDeletionTime};
-use influxdb3_catalog::log::FieldDataType;
+use influxdb3_catalog::catalog::{DeletionScope, FieldDataType};
 use influxdb3_id::{DbId, TableId};
 use influxdb3_shutdown::ShutdownManager;
 use iox_time::{MockProvider, Time};
@@ -15,7 +15,6 @@ struct MockObjectDeleter {
     table_sender: mpsc::UnboundedSender<(DbId, TableId)>,
 }
 
-#[allow(dead_code, reason = "used in future PR")]
 struct MockObjectDeleterWaiter {
     db_receiver: mpsc::UnboundedReceiver<DbId>,
     table_receiver: mpsc::UnboundedReceiver<(DbId, TableId)>,
@@ -101,7 +100,12 @@ async fn test_delete_table() {
 
     // Mark table_2 as deleted, which will default to a hard delete time of 10 ms from now.
     catalog
-        .soft_delete_table("foo", "table_2", HardDeletionTime::Default)
+        .soft_delete_table(
+            "foo",
+            "table_2",
+            HardDeletionTime::Default,
+            DeletionScope::default(),
+        )
         .await
         .expect("soft delete table");
 
@@ -115,7 +119,7 @@ async fn test_delete_table() {
             object_deleter: Some(Arc::new(object_deleter)),
             delete_grace_period: Duration::from_millis(0),
         },
-        shutdown_manager.register(),
+        shutdown_manager.register("test"),
     );
 
     // First check that the object deleter was not called before the hard delete time
@@ -141,7 +145,12 @@ async fn test_delete_table() {
 
     // Delete a table and verify the object deleter is called.
     catalog
-        .soft_delete_table("foo", "table_1", HardDeletionTime::Default)
+        .soft_delete_table(
+            "foo",
+            "table_1",
+            HardDeletionTime::Default,
+            DeletionScope::default(),
+        )
         .await
         .expect("soft delete table");
     time_provider.inc(Duration::from_millis(15));
@@ -155,7 +164,12 @@ async fn test_delete_table() {
 
     // Delete a table without a delay and verify the object deleter is called immediately.
     catalog
-        .soft_delete_table("foo", "table_3", HardDeletionTime::Now)
+        .soft_delete_table(
+            "foo",
+            "table_3",
+            HardDeletionTime::Now,
+            DeletionScope::default(),
+        )
         .await
         .expect("soft delete table");
     let res = waiter
@@ -168,7 +182,12 @@ async fn test_delete_table() {
 
     // Soft-delete the table only.
     catalog
-        .soft_delete_table("foo", "table_4", HardDeletionTime::Never)
+        .soft_delete_table(
+            "foo",
+            "table_4",
+            HardDeletionTime::Never,
+            DeletionScope::default(),
+        )
         .await
         .expect("soft delete table");
     waiter
@@ -207,7 +226,7 @@ async fn test_delete_database() {
 
     // Mark db2 as deleted, which will default to a hard delete time of 10 ms from now.
     catalog
-        .soft_delete_database("db2", HardDeletionTime::Default)
+        .soft_delete_database("db2", HardDeletionTime::Default, DeletionScope::default())
         .await
         .expect("soft delete database");
 
@@ -221,7 +240,7 @@ async fn test_delete_database() {
             object_deleter: Some(Arc::new(object_deleter)),
             delete_grace_period: Duration::from_millis(0),
         },
-        shutdown_manager.register(),
+        shutdown_manager.register("test"),
     );
 
     // First check that the object deleter was not called before the hard delete time
@@ -247,7 +266,7 @@ async fn test_delete_database() {
 
     // Delete a database and verify the object deleter is called.
     catalog
-        .soft_delete_database("db1", HardDeletionTime::Default)
+        .soft_delete_database("db1", HardDeletionTime::Default, DeletionScope::default())
         .await
         .expect("soft delete database");
     time_provider.inc(Duration::from_millis(15));
@@ -261,7 +280,7 @@ async fn test_delete_database() {
 
     // Delete a database without a delay and verify the object deleter is called immediately.
     catalog
-        .soft_delete_database("db3", HardDeletionTime::Now)
+        .soft_delete_database("db3", HardDeletionTime::Now, DeletionScope::default())
         .await
         .expect("soft delete database");
     let res = waiter
@@ -274,7 +293,7 @@ async fn test_delete_database() {
 
     // Soft-delete the database only.
     catalog
-        .soft_delete_database("db4", HardDeletionTime::Never)
+        .soft_delete_database("db4", HardDeletionTime::Never, DeletionScope::default())
         .await
         .expect("soft delete database");
     waiter

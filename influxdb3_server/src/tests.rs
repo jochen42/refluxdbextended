@@ -15,6 +15,8 @@ use influxdb3_catalog::catalog::Catalog;
 use influxdb3_processing_engine::ProcessingEngineManagerImpl;
 use influxdb3_processing_engine::environment::DisabledManager;
 use influxdb3_processing_engine::plugins::ProcessingEngineEnvironmentManager;
+use influxdb3_processing_engine::query::InProcessQueryEndpoint;
+use influxdb3_processing_engine::write::InProcessWriteEndpoint;
 use influxdb3_query_executor::{CreateQueryExecutorArgs, QueryExecutorImpl};
 use influxdb3_shutdown::ShutdownManager;
 use influxdb3_sys_events::SysEventStore;
@@ -133,7 +135,7 @@ async fn write_and_query() {
 
     assert_eq!(
         batches[0]["host"].to_data().child_data()[0].buffers()[1],
-        Buffer::from([b'a'])
+        Buffer::from(*b"a")
     );
 
     assert_eq!(
@@ -171,7 +173,7 @@ async fn write_lp_tests() {
     assert_eq!(
         body,
         "{\
-            \"error\":\"parsing failed for write_lp endpoint\",\
+            \"error\":\"line protocol parsing error\",\
             \"data\":{\
                 \"error_message\":\"No fields were provided\",\
                 \"line_number\":1,\
@@ -1165,6 +1167,7 @@ async fn query_from_last_cache() {
         .create_last_cache(
             db_name,
             tbl_name,
+            influxdb3_catalog::catalog::ApiNodeSpec::All,
             None,
             None as Option<&[&str]>,
             None as Option<&[&str]>,
@@ -1360,7 +1363,7 @@ async fn setup_server(start_time: i64) -> (String, CancellationToken, Arc<dyn Wr
             snapshotted_wal_files_to_keep: 100,
             query_file_limit: None,
             n_snapshots_to_load_on_start: N_SNAPSHOTS_TO_LOAD_ON_START,
-            shutdown: shutdown_manager.register(),
+            shutdown: shutdown_manager.register("test"),
             wal_replay_concurrency_limit: 1,
             parquet_snapshot_concurrency_limit: NonZeroUsize::new(10).unwrap(),
             shared_inventory: None,
@@ -1397,7 +1400,7 @@ async fn setup_server(start_time: i64) -> (String, CancellationToken, Arc<dyn Wr
         sys_events_store: Arc::clone(&sys_events_store),
         started_with_auth: false,
         time_provider: Arc::clone(&time_provider) as _,
-        processing_engine: None,
+        max_concurrent_queries: cli_types::QUERY_CONCURRENCY_LIMIT_MAX,
     }));
 
     // bind to port 0 will assign a random available port:
@@ -1412,14 +1415,16 @@ async fn setup_server(start_time: i64) -> (String, CancellationToken, Arc<dyn Wr
             plugin_dir: None,
             virtual_env_location: None,
             package_manager: Arc::new(DisabledManager),
+            plugin_dir_only: false,
             plugin_repo: None,
         },
         write_buffer.catalog(),
         node_identifier_prefix,
-        Arc::clone(&write_buffer) as Arc<dyn influxdb3_write::Bufferer>,
-        Arc::clone(&query_executor) as _,
+        Arc::new(InProcessWriteEndpoint::new(
+            Arc::clone(&write_buffer) as Arc<dyn influxdb3_write::Bufferer>
+        )),
+        Arc::new(InProcessQueryEndpoint::new(Arc::clone(&query_executor) as _)),
         Arc::clone(&time_provider) as _,
-        sys_events_store,
     )
     .await
     .unwrap();
@@ -1445,6 +1450,7 @@ async fn setup_server(start_time: i64) -> (String, CancellationToken, Arc<dyn Wr
         Arc::clone(&write_buffer),
         Arc::clone(&query_executor) as _,
         Arc::clone(&processing_engine),
+        vec![],
         usize::MAX,
         Arc::clone(&authorizer) as _,
     ));

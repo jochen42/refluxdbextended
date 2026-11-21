@@ -5,8 +5,11 @@
 
 pub mod create;
 pub mod object_store;
+pub mod observer;
 pub mod serialize;
 mod snapshot_tracker;
+
+pub use observer::{CatalogSnapshotObserver, NoopCatalogSnapshotObserver};
 
 use async_trait::async_trait;
 use data_types::Timestamp;
@@ -16,10 +19,12 @@ use influxdb_line_protocol::FieldValue;
 use influxdb3_id::{ColumnId, DbId, SerdeVecMap, TableId};
 use influxdb3_shutdown::ShutdownToken;
 use iox_time::Time;
+use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::cmp::Ordering;
 use std::fmt::Debug;
+use std::hash::BuildHasherDefault;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,6 +75,9 @@ pub trait Wal: Debug + Send + Sync + 'static {
     /// If it is time for a snapshot, it will tell the notifier to start the snapshot and return
     /// a receiver that will be signalled when the snapshot is complete along with the semaphore
     /// permit to release when done. The caller is responsible for cleaning up the wal.
+    ///
+    /// Flushes run one at a time, and WAL files reach the notifier in WAL file order. A call made
+    /// while another flush is in progress, including a forced one, waits for it to finish.
     async fn flush_buffer(
         &self,
     ) -> Option<(
@@ -82,6 +90,8 @@ pub trait Wal: Debug + Send + Sync + 'static {
     /// than waiting for wal periods to stack up in [`snapshot_tracker::SnapshotTracker`].
     /// Because forcing flush buffer can happen with no ops in wal buffer this call will add
     /// a [`WalOp::Noop`] into the wal buffer if it is empty and then carry on with snapshotting.
+    ///
+    /// Like [`Wal::flush_buffer`], it waits for a flush that is already in progress.
     async fn force_flush_buffer(
         &self,
     ) -> Option<(
@@ -89,6 +99,16 @@ pub trait Wal: Debug + Send + Sync + 'static {
         SnapshotDetails,
         OwnedSemaphorePermit,
     )>;
+
+    /// Wall-clock time the oldest WAL period still waiting for a snapshot
+    /// was written or replayed, or `None` when nothing is waiting. Drives
+    /// the age-based forced snapshot: snapshots otherwise trigger on the
+    /// number of periods, which a trickle or idle node may never reach.
+    ///
+    /// Defaults to `None` for implementations that track no periods.
+    async fn unsnapshotted_since(&self) -> Option<Time> {
+        None
+    }
 
     /// Removes any snapshot wal files
     async fn cleanup_snapshot(
@@ -169,6 +189,13 @@ impl Default for WalConfig {
         }
     }
 }
+
+/// The latest data timestamp a write may carry: the gen1 window holding it, at the longest
+/// gen1 duration, must end within `i64`.
+pub const MAX_WRITE_TIMESTAMP_NS: i64 = {
+    let longest_gen1_ns = 600 * 1_000_000_000;
+    i64::MAX / longest_gen1_ns * longest_gen1_ns - 1
+};
 
 /// The duration of data timestamps, grouped into files persisted into object storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,7 +370,7 @@ impl WriteBatch {
         catalog_sequence: u64,
         database_id: DbId,
         database_name: Arc<str>,
-        table_chunks: IndexMap<TableId, TableChunks>,
+        table_chunks: IndexMap<TableId, TableChunks, BuildHasherDefault<FxHasher>>,
     ) -> Self {
         // find the min and max times across the table chunks
         let (min_time_ns, max_time_ns) = table_chunks.values().fold(

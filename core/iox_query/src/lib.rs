@@ -42,6 +42,7 @@ pub mod provider;
 pub mod pruning;
 pub mod pruning_oracle;
 pub mod query_log;
+pub mod sorts;
 pub mod statistics;
 pub mod util;
 
@@ -103,6 +104,16 @@ pub trait QueryChunk: Debug + Send + Sync + 'static {
 
     /// Return backend as [`Any`] which can be used to downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
+
+    /// Hook for `RecordBatchesExec` to emit a `bytes_scanned` metric on
+    /// behalf of this chunk. Only consumed by record-batch-backed
+    /// chunks; parquet chunks return 0 because their bytes are reported
+    /// by `ParquetExec` directly. Default 0 is the right answer for
+    /// any chunk that doesn't otherwise have a meaningful byte count to
+    /// surface here.
+    fn bytes_scanned(&self) -> u64 {
+        0
+    }
 }
 
 /// `QueryNamespace` is the main trait implemented by the IOx subsystems that store actual data.
@@ -175,8 +186,11 @@ pub trait QueryDatabase: Debug + Send + Sync + 'static {
         not_impl_err!("QueryDatabase::list_namespaces is only used in InfluxDB 3 Core/Enterprise")
     }
 
-    /// Acquire concurrency-limiting semapahore
-    async fn acquire_semaphore(&self, span: Option<Span>) -> InstrumentedAsyncOwnedSemaphorePermit;
+    /// Acquire concurrency-limiting execution semaphore
+    async fn acquire_execution_semaphore(
+        &self,
+        span: Option<Span>,
+    ) -> InstrumentedAsyncOwnedSemaphorePermit;
 
     /// Return the query log entries
     fn query_log(&self) -> QueryLogEntries;

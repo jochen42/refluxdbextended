@@ -7,11 +7,20 @@ license.workspace = true
 
 [dependencies]
 indexmap.workspace = true
-serde.workspace = true
+rustc-hash.workspace = true
+serde = { workspace = true, features = [ "rc" ] }
 thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+criterion.workspace = true
+
+[features]
+test_helpers = []
+
+[[bench]]
+name = "serde_vec_map_comparison"
+harness = false
 
 [lints]
 workspace = true

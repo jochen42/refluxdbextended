@@ -242,8 +242,8 @@ pub struct InfluxDb3ServerConfig {
     )]
     pub auth_token: Option<Secret<String>>,
 
-    /// An optional arg to use a custom ca for useful for testing with self signed certs
-    #[clap(name = "tls-ca", long = "tls-ca")]
+    /// An optional arg to use a custom CA, useful for testing with self-signed certs
+    #[clap(name = "tls-ca", long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     pub ca_cert: Option<PathBuf>,
 
     /// Disable TLS certificate verification
@@ -287,7 +287,7 @@ pub struct CreateAdminTokenConfig {
     #[clap(long)]
     pub format: Option<TokenOutputFormat>,
 
-    /// Generate token without connecting to server (enterprise feature)
+    /// Generate token without connecting to server
     #[clap(long, requires = "output_file")]
     pub offline: bool,
 

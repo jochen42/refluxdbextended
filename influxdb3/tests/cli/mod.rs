@@ -1,9 +1,12 @@
 mod admin_token;
 mod api;
 mod db_retention;
+mod log_filter;
 mod offline_tokens;
+mod schema_enforcement;
 mod system_tables;
 mod tls_no_verify;
+mod update_trigger_gh;
 
 use crate::server::{ConfigProvider, TestServer};
 use assert_cmd::cargo::cargo_bin_cmd;
@@ -1291,6 +1294,63 @@ async fn test_create_trigger_and_run() {
 }
 
 #[test_log::test(tokio::test)]
+async fn test_processing_engine_logs_event_time_mirrors_time() {
+    let plugin_code = r#"
+def process_writes(influxdb3_local, table_batches, args=None):
+    influxdb3_local.info("event time test")
+"#;
+
+    let (temp_dir, plugin_path) = create_plugin_in_temp_dir(plugin_code);
+    let plugin_dir = temp_dir.path().to_str().unwrap();
+    let plugin_filename = plugin_path.file_name().unwrap().to_str().unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(plugin_dir)
+        .spawn()
+        .await;
+    let db_name = "event_time_db";
+    let trigger_name = "event_time_trigger";
+
+    server.create_database(db_name).run().unwrap();
+    server
+        .create_trigger(db_name, trigger_name, plugin_filename, "all_tables")
+        .run()
+        .unwrap();
+
+    server
+        .write_lp_to_db(
+            db_name,
+            "cpu,host=a usage=0.9",
+            influxdb3_client::Precision::Second,
+        )
+        .await
+        .expect("write to db");
+
+    // The log row lands asynchronously; poll until a filter on the virtual
+    // event_time column returns it.
+    let sql = "SELECT log_text, time, event_time \
+               FROM system.processing_engine_logs \
+               WHERE log_text = 'event time test' \
+               AND event_time > now() - INTERVAL '1 hour'";
+    let mut check_count = 0;
+    let rows = loop {
+        match server.query_sql(db_name).with_sql(sql).run() {
+            Ok(Value::Array(rows)) if !rows.is_empty() => break rows,
+            result => {
+                check_count += 1;
+                if check_count > 100 {
+                    panic!("processing_engine_logs never returned the log row: {result:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    for row in &rows {
+        assert_eq!(row["event_time"], row["time"], "{rows:#?}");
+    }
+}
+
+#[test_log::test(tokio::test)]
 async fn test_triggers_are_started() {
     // Create a plugin and trigger and write data in, verifying that the trigger is enabled
     // and sent data
@@ -2022,6 +2082,33 @@ async fn test_show_system() {
         "iox_schema_table_name_exists,_but_should_error_because_we're_concerned_here_with_system_tables",
         format!("{}", result.unwrap_err())
     );
+
+    // 4. `--format parquet` must be rejected (binary format, no `--output` plumbing
+    //    in `show system`) on all three subcommands. Pre-fix this panicked in
+    //    `String::from_utf8(...).unwrap()`.
+    for result in [
+        server
+            .show_system(db_name)
+            .with_format("parquet")
+            .summary()
+            .run(),
+        server
+            .show_system(db_name)
+            .with_format("parquet")
+            .table("queries")
+            .run(),
+        server
+            .show_system(db_name)
+            .with_format("parquet")
+            .table_list()
+            .run(),
+    ] {
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("parquet format is not supported for this command"),
+            "expected parquet-rejection error, got: {err}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2430,6 +2517,71 @@ foo,tag1=bar,tag2=mloem val1=5,val2=199"#,
 }
 
 #[test_log::test(tokio::test)]
+async fn test_schedule_plugin_cross_db_query() {
+    use crate::server::ConfigProvider;
+    use influxdb3_client::Precision;
+
+    // Create plugin file that queries a different database via `database=`
+    let (temp_dir, plugin_path) = create_plugin_in_temp_dir(
+        r#"
+def process_scheduled_call(influxdb3_local, time, args=None):
+    results = influxdb3_local.query("SELECT count(val1) as n FROM bar", database="other_db")
+    influxdb3_local.info(f"other_db row count: {results[0]['n']}")
+    influxdb3_local.info("successfully queried other_db")"#,
+    );
+
+    let plugin_dir = temp_dir.path().to_str().unwrap();
+    let plugin_name = plugin_path.file_name().unwrap().to_str().unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(plugin_dir)
+        .spawn()
+        .await;
+
+    // Write some test data
+    server
+        .write_lp_to_db("foo", "cpu,host=A usage=0.5 100", Precision::Second)
+        .await
+        .unwrap();
+    server
+        .write_lp_to_db(
+            "other_db",
+            "bar,tag1=x val1=5 100\nbar,tag1=x val1=10 200",
+            Precision::Second,
+        )
+        .await
+        .unwrap();
+
+    let db_name = "foo";
+
+    let result = server
+        .test_schedule_plugin(db_name, plugin_name, "*/5 * * * * *")
+        .run()
+        .expect("Failed to run schedule plugin test");
+
+    debug!(result = ?result, "test schedule plugin");
+
+    // Filter out framework start/finish messages (timing varies per run)
+    let log_lines: Vec<_> = result["log_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| {
+            !s.starts_with("INFO: starting execution") && !s.starts_with("INFO: finished execution")
+        })
+        .collect();
+    assert_eq!(result["errors"], json!([]));
+    assert_eq!(
+        log_lines,
+        vec![
+            "INFO: other_db row count: 2",
+            "INFO: successfully queried other_db"
+        ]
+    );
+}
+
+#[test_log::test(tokio::test)]
 async fn test_schedule_plugin_test_with_strftime() {
     use crate::server::ConfigProvider;
     use influxdb3_client::Precision;
@@ -2563,7 +2715,7 @@ def process_writes(influxdb3_local, table_batches, args=None):
 def process_writes(influxdb3_local, table_batches, args=None):
     influxdb3_local.query("SELECT foo FROM not_here")
 "#,
-            expected_error: "error executing plugin: QueryError: error: error while planning query: Error during planning: table 'public.iox.not_here' not found executing query: SELECT foo FROM not_here",
+            expected_error: "error executing plugin: QueryError: Cannot query: error while planning query: Error during planning: table 'public.iox.not_here' not found (query: SELECT foo FROM not_here) (database: foo)",
         },
     ];
 
@@ -2780,6 +2932,106 @@ def process_request(influxdb3_local, query_parameters, request_headers, request_
     let body = serde_json::from_str::<serde_json::Value>(&body).unwrap();
     assert_eq!(body, json!({"status": "updated"}));
 }
+
+#[test_log::test(tokio::test)]
+async fn test_request_trigger_auto_disable_on_error() {
+    let plugin_code = r#"
+def process_request(influxdb3_local, query_parameters, request_headers, request_body, args=None):
+    raise Exception("boom")
+"#;
+
+    let (temp_dir, plugin_path) = create_plugin_in_temp_dir(plugin_code);
+
+    let plugin_dir = temp_dir.path().to_str().unwrap();
+    let plugin_filename = plugin_path.file_name().unwrap().to_str().unwrap();
+
+    let server = TestServer::configure()
+        .with_plugin_dir(plugin_dir)
+        .spawn()
+        .await;
+    let db_name = "request_auto_disable";
+    let trigger_name = "request_auto_disable_trigger";
+    let trigger_path = "request_auto_disable_path";
+
+    server.create_database(db_name).run().unwrap();
+
+    let result = server
+        .create_trigger(
+            db_name,
+            trigger_name,
+            plugin_filename,
+            format!("request:{trigger_path}"),
+        )
+        .error_behavior("disable")
+        .run()
+        .unwrap();
+    assert_contains!(
+        &result,
+        "Trigger request_auto_disable_trigger created successfully"
+    );
+
+    let client = server.http_client();
+    let response = client
+        .post(format!(
+            "{}/api/v3/engine/{trigger_path}",
+            server.client_addr()
+        ))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let mut saw_disabled = false;
+    let mut last_triggers = Value::Null;
+    for _ in 0..100 {
+        let trigger_info = server
+            .show_system(db_name)
+            .with_format("json")
+            .table("processing_engine_triggers")
+            .run()
+            .unwrap();
+        last_triggers = serde_json::from_str::<Value>(&trigger_info).unwrap();
+
+        if last_triggers
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|trigger| trigger["trigger_name"] == trigger_name && trigger["disabled"] == true)
+        {
+            saw_disabled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        saw_disabled,
+        "request trigger should be disabled after first failed request; last system table output: {last_triggers:#}"
+    );
+
+    let mut last_status = None;
+    for _ in 0..100 {
+        let response = client
+            .post(format!(
+                "{}/api/v3/engine/{trigger_path}",
+                server.client_addr()
+            ))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        last_status = Some(response.status());
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(last_status, Some(reqwest::StatusCode::NOT_FOUND));
+}
+
 #[test_log::test(tokio::test)]
 async fn test_flask_string_response() {
     let plugin_code = r#"
@@ -3849,7 +4101,10 @@ async fn write_and_query_via_stdin() {
         .run_with_stdin("bar,tag1=1,tag2=2 field1=1,field2=2 0")
         .unwrap();
 
-    assert_eq!("success", result);
+    assert!(
+        result.is_empty(),
+        "expected no stdout under --quiet, got: {result}"
+    );
     debug!(result = ?result, "wrote data to database");
 
     // Query data
@@ -3860,6 +4115,36 @@ async fn write_and_query_via_stdin() {
         .unwrap();
 
     debug!(result = ?result, "queried data from database");
+    assert_eq!(
+        json!([{"field1":1.0,"field2":2.0,"tag1":"1","tag2":"2","time":"1970-01-01T00:00:00"}]),
+        result
+    );
+}
+
+#[test_log::test(tokio::test)]
+async fn write_and_query_via_stdin_gzip() {
+    // Exercises the CLI --gzip plumbing end-to-end: flag → influxdb3_client gzip
+    // path → server gzip decode → ingest.
+    let server = TestServer::spawn().await;
+    let db_name = "foo";
+
+    let result = server
+        .write(db_name)
+        .with_gzip(true)
+        .run_with_stdin("bar,tag1=1,tag2=2 field1=1,field2=2 0")
+        .unwrap();
+
+    assert!(
+        result.is_empty(),
+        "expected no stdout under --quiet, got: {result}"
+    );
+
+    let result = server
+        .query_sql(db_name)
+        .with_sql("SELECT * FROM bar")
+        .run()
+        .unwrap();
+
     assert_eq!(
         json!([{"field1":1.0,"field2":2.0,"tag1":"1","tag2":"2","time":"1970-01-01T00:00:00"}]),
         result
@@ -3878,7 +4163,10 @@ async fn write_and_query_via_file() {
         .run()
         .unwrap();
 
-    assert_eq!("success", result);
+    assert!(
+        result.is_empty(),
+        "expected no stdout under --quiet, got: {result}"
+    );
     debug!(result = ?result, "wrote data to database");
 
     // Query data via file
@@ -3907,7 +4195,10 @@ async fn write_and_query_via_string() {
         .run()
         .unwrap();
 
-    assert_eq!("success", result);
+    assert!(
+        result.is_empty(),
+        "expected no stdout under --quiet, got: {result}"
+    );
     debug!(result = ?result, "wrote data to database");
 
     // Query data directly
@@ -4191,6 +4482,58 @@ fn test_create_token_requires_subcommand() {
     assert_contains!(&stdout_help, "--admin");
 }
 
+#[test_log::test]
+fn test_write_rejects_zero_max_request_size() {
+    let output = cargo_bin_cmd!("influxdb3")
+        .args([
+            "write",
+            "--host",
+            "http://127.0.0.1:8181",
+            "--database",
+            "foo",
+            "--max-request-size",
+            "0",
+            "cpu a=1",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for --max-request-size 0"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_contains!(&stderr, "--max-request-size");
+    assert_contains!(&stderr, "value must be at least 1");
+    assert_not_contains!(&stderr, "panic");
+}
+
+#[test_log::test]
+fn test_write_rejects_zero_max_concurrent_requests() {
+    let output = cargo_bin_cmd!("influxdb3")
+        .args([
+            "write",
+            "--host",
+            "http://127.0.0.1:8181",
+            "--database",
+            "foo",
+            "--max-concurrent-requests",
+            "0",
+            "cpu a=1",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for --max-concurrent-requests 0"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_contains!(&stderr, "--max-concurrent-requests");
+    assert_contains!(&stderr, "value must be at least 1");
+    assert_not_contains!(&stderr, "panic");
+}
+
 #[test_log::test(tokio::test)]
 async fn test_update_trigger() {
     let plugin_dir = TempDir::new().unwrap();
@@ -4464,4 +4807,35 @@ def process_writes(influxdb3_local, table_batches, args=None):
     );
 
     assert_eq!(result["errors"], serde_json::json!([]));
+}
+
+#[test_log::test]
+fn test_client_failure_hints_unread_env_lookalikes() {
+    let args = ["show", "databases", "--host", "http://127.0.0.1:1"];
+
+    // Guessed-but-unread name set: failure output carries the hint.
+    let output = cargo_bin_cmd!("influxdb3")
+        .args(args)
+        .env("INFLUXDB3_TOKEN", "t")
+        .env_remove("INFLUXDB3_AUTH_TOKEN")
+        .env_remove("INFLUXDB3_HOST")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "unreachable host must fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_contains!(
+        &stderr,
+        "note: INFLUXDB3_TOKEN is not a recognized environment variable and is ignored; use INFLUXDB3_AUTH_TOKEN or --token instead"
+    );
+
+    // Nothing guessed set: same failure, no hint.
+    let output = cargo_bin_cmd!("influxdb3")
+        .args(args)
+        .env_remove("INFLUXDB3_TOKEN")
+        .env_remove("INFLUXDB3_HOST")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "unreachable host must fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_not_contains!(&stderr, "INFLUXDB3_AUTH_TOKEN (or --token)");
 }

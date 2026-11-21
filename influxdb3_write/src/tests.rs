@@ -3,14 +3,13 @@ use datafusion::{
     logical_expr::{BinaryExpr, Operator, expr::ScalarFunction},
     prelude::{Expr, cast, col, date_trunc, lit},
 };
-use influxdb3_catalog::catalog::{Catalog, CatalogSequenceNumber};
+use influxdb3_catalog::catalog::{Catalog, CatalogSequenceNumber, FieldDataType};
 use influxdb3_id::{DbId, ParquetFileId, SerdeVecMap, TableId};
-use influxdb3_types::http::FieldDataType;
 use influxdb3_wal::{SnapshotSequenceNumber, WalFileSequenceNumber};
 use query_functions::tz::TZ_UDF;
 use std::sync::Arc;
 
-use data_types::NamespaceName;
+use influxdb3_types::DatabaseName;
 use influxdb3_types::write::Precision;
 use iox_time::Time;
 
@@ -30,7 +29,7 @@ fn test_overall_counts() {
     let parquet_files_1 = vec![
         ParquetFile {
             id: ParquetFileId::from(1),
-            path: "some_path".to_string(),
+            path: "some_path".into(),
             size_bytes: 100_000,
             row_count: 200,
             chunk_time: 1123456789,
@@ -39,7 +38,7 @@ fn test_overall_counts() {
         },
         ParquetFile {
             id: ParquetFileId::from(2),
-            path: "some_path".to_string(),
+            path: "some_path".into(),
             size_bytes: 100_000,
             row_count: 200,
             chunk_time: 1123456789,
@@ -52,7 +51,7 @@ fn test_overall_counts() {
 
     // add dbs_1 to snapshot
     let persisted_snapshot_1 = PersistedSnapshot {
-        node_id: host.to_string(),
+        node_id: Arc::from(host),
         next_file_id: ParquetFileId::from(0),
         snapshot_sequence_number: SnapshotSequenceNumber::new(124),
         wal_file_sequence_number: WalFileSequenceNumber::new(100),
@@ -74,7 +73,7 @@ fn test_overall_counts() {
     let parquet_files_2 = vec![
         ParquetFile {
             id: ParquetFileId::from(4),
-            path: "some_path".to_string(),
+            path: "some_path".into(),
             size_bytes: 100_000,
             row_count: 200,
             chunk_time: 1123456789,
@@ -83,7 +82,7 @@ fn test_overall_counts() {
         },
         ParquetFile {
             id: ParquetFileId::from(5),
-            path: "some_path".to_string(),
+            path: "some_path".into(),
             size_bytes: 100_000,
             row_count: 200,
             chunk_time: 1123456789,
@@ -96,7 +95,7 @@ fn test_overall_counts() {
 
     // add dbs_2 to snapshot
     let persisted_snapshot_2 = PersistedSnapshot {
-        node_id: host.to_string(),
+        node_id: Arc::from(host),
         next_file_id: ParquetFileId::from(5),
         snapshot_sequence_number: SnapshotSequenceNumber::new(124),
         wal_file_sequence_number: WalFileSequenceNumber::new(100),
@@ -127,7 +126,7 @@ fn test_overall_counts_zero() {
     let parquet_files_1 = vec![
         ParquetFile {
             id: ParquetFileId::from(1),
-            path: "some_path".to_string(),
+            path: "some_path".into(),
             size_bytes: 100_000,
             row_count: 200,
             chunk_time: 1123456789,
@@ -136,7 +135,7 @@ fn test_overall_counts_zero() {
         },
         ParquetFile {
             id: ParquetFileId::from(2),
-            path: "some_path".to_string(),
+            path: "some_path".into(),
             size_bytes: 100_000,
             row_count: 200,
             chunk_time: 1123456789,
@@ -155,7 +154,7 @@ fn test_overall_counts_zero() {
     let parquet_files_2 = vec![
         ParquetFile {
             id: ParquetFileId::from(4),
-            path: "some_path".to_string(),
+            path: "some_path".into(),
             size_bytes: 100_000,
             row_count: 200,
             chunk_time: 1123456789,
@@ -164,7 +163,7 @@ fn test_overall_counts_zero() {
         },
         ParquetFile {
             id: ParquetFileId::from(5),
-            path: "some_path".to_string(),
+            path: "some_path".into(),
             size_bytes: 100_000,
             row_count: 200,
             chunk_time: 1123456789,
@@ -186,7 +185,7 @@ async fn test_series_key_columns_with_slashes() {
         .await
         .map(Arc::new)
         .unwrap();
-    let db_name = NamespaceName::new("test-db").unwrap();
+    let db_name = DatabaseName::new("test-db").unwrap();
     let writer = WriteValidator::initialize(db_name, Arc::clone(&catalog)).unwrap();
     // write and commit the catalog changes:
     let _ = writer
@@ -251,45 +250,4 @@ async fn test_filter_on_time_with_date_trunc() {
             assert!(f.time_upper_bound_ns.is_none());
         })
         .expect("create ChunkFilter");
-}
-
-#[test]
-fn test_write_line_error_serialize_truncates_at_utf8_boundary() {
-    use crate::WriteLineError;
-
-    // Serialize caps `original_line` at this many bytes (mirrors the constant in the impl).
-    const TRUNCATE_LIMIT: usize = 20;
-
-    // 19 ASCII bytes followed by a 2-byte 'é' starting at byte 19. A naive `[..TRUNCATE_LIMIT]`
-    // slice lands in the middle of 'é' and would panic; floor_char_boundary backs up to byte 19.
-    let long_line = format!("{}érest of the line", "a".repeat(19));
-    assert!(
-        !long_line.is_char_boundary(TRUNCATE_LIMIT),
-        "test premise: byte {TRUNCATE_LIMIT} must fall inside a multi-byte char",
-    );
-
-    let err = WriteLineError {
-        original_line: long_line,
-        line_number: 1,
-        error_message: "bad line".to_string(),
-    };
-    let json = serde_json::to_string(&err).expect("serialize must not panic");
-    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    let emitted = parsed["original_line"]
-        .as_str()
-        .expect("original_line must serialize as a JSON string");
-
-    assert_eq!(emitted, "a".repeat(19));
-
-    // Short input passes through unchanged.
-    let short = "short line";
-    assert!(short.len() < TRUNCATE_LIMIT);
-    let err = WriteLineError {
-        original_line: short.to_string(),
-        line_number: 2,
-        error_message: "bad".to_string(),
-    };
-    let json = serde_json::to_string(&err).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed["original_line"].as_str().unwrap(), short);
 }

@@ -9,15 +9,16 @@ clippy::clone_on_ref_ptr,
 // See https://github.com/influxdata/influxdb_iox/pull/1671
 clippy::future_not_send
 )]
-#![allow(unused_crate_dependencies)]
+#![expect(unused_crate_dependencies)]
 
 use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
 use dotenvy::dotenv;
 use influxdb3_clap_blocks::tokio::{TokioDatafusionConfig, TokioIoConfig};
 use influxdb3_server::VERSION_STRING;
+use influxdb3_shutdown::IO_SHUTDOWN_TIMEOUT;
 use influxdb3_startup::env_compat::{self, ENV_ALIASES};
 use influxdb3_telemetry::ServeInvocationMethod;
-use observability_deps::tracing::warn;
+use observability_deps::tracing::{self, info, warn};
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
 
@@ -29,6 +30,7 @@ use trogging::{
 
 pub mod commands {
     pub use influxdb3_commands::common;
+    pub use influxdb3_commands::debug;
     pub use influxdb3_commands::disable;
     pub use influxdb3_commands::enable;
     pub use influxdb3_commands::helpers;
@@ -48,6 +50,28 @@ pub mod commands {
 enum ReturnCode {
     Failure = 1,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct DeprecatedServeOption {
+    arg_id: &'static str,
+    message: &'static str,
+}
+
+const PACKAGE_MANAGER_ARG_ID: &str = "package_manager";
+const PACKAGE_MANAGER_DEPRECATED_MESSAGE: &str = "--package-manager is deprecated and will be removed in a future release. Python and pip are bundled with InfluxDB; remove this option because pip is always used.";
+const PACKAGE_MANAGER_DISABLED_DEPRECATED_MESSAGE: &str = "--package-manager disabled is deprecated and will be removed in a future release. Use --disable-package-management instead. Python and pip are bundled with InfluxDB and pip is always used for environment setup; disabled only blocks plugin package install API calls for compatibility.";
+
+const DEPRECATED_SERVE_OPTIONS: &[DeprecatedServeOption] = &[DeprecatedServeOption {
+    arg_id: PACKAGE_MANAGER_ARG_ID,
+    message: PACKAGE_MANAGER_DEPRECATED_MESSAGE,
+}];
+
+const ASYNC_TRIGGER_CONCURRENCY_LIMIT_ARG_ID: &str = "async_trigger_concurrency_limit";
+/// The default `--async-trigger-concurrency-limit` planned for a future release.
+const FUTURE_DEFAULT_ASYNC_TRIGGER_CONCURRENCY_LIMIT: usize = 8;
+const ASYNC_TRIGGER_CONCURRENCY_DEFAULT_CHANGE_MESSAGE: &str = "async triggers (run_asynchronous) currently default to unlimited concurrency; in a future release the default --async-trigger-concurrency-limit will change to 8. Set --async-trigger-concurrency-limit explicitly to keep the concurrency you want across upgrades.";
+const ASYNC_TRIGGER_CONCURRENCY_ABOVE_FUTURE_DEFAULT_MESSAGE: &str = "--async-trigger-concurrency-limit is set above 8; in a future release the default will change to 8. Explicitly configured values are preserved across that change.";
+const ASYNC_TRIGGER_CONCURRENCY_SATURATES_QUEUE_MESSAGE: &str = "--async-trigger-concurrency-limit is at or above the per-trigger queue capacity (60). The capacity rises to the configured limit, so every outstanding invocation slot can be executing with no queued headroom; trigger producers block on admission while all slots are busy.";
 
 #[derive(Debug, clap::Parser)]
 #[clap(
@@ -101,7 +125,7 @@ struct Config {
 // Ignoring clippy here since this enum is just used for running
 // the CLI command
 #[derive(Debug, clap::Subcommand)]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 enum Command {
     /// Enable a resource such as a trigger
     Enable(commands::enable::Config),
@@ -123,6 +147,9 @@ enum Command {
 
     /// Install packages for the processing engine
     Install(commands::install::Config),
+
+    /// Diagnostic and support tooling
+    Debug(commands::debug::Config),
 
     /// List resources on the InfluxDB 3 Core server
     Show(commands::show::Config),
@@ -309,11 +336,13 @@ fn serve_main(
     matches: &clap::ArgMatches,
     runtime_config: TokioIoConfig,
 ) -> Result<(), std::io::Error> {
+    warn_serve_option_notices(&serve_config, matches);
+
     // Extract user-provided parameters only for serve command
     let user_params = extract_user_params(matches);
 
     let tokio_runtime = runtime_config.builder()?.build()?;
-    if let Err(e) = tokio_runtime.block_on(async move {
+    let result = tokio_runtime.block_on(async move {
         fn handle_init_logs(r: Result<TroggingGuard, trogging::Error>) -> TroggingGuard {
             match r {
                 Ok(guard) => guard,
@@ -323,15 +352,174 @@ fn serve_main(
                 }
             }
         }
-        let _tracing_guard = handle_init_logs(init_logs_and_tracing(&serve_config.logging_config));
+        let _tracing_guard = handle_init_logs(init_logs_and_tracing(
+            &serve_config.logging_config,
+            serve_config.disable_log_filter_noise_reduction,
+        ));
 
         commands::serve::command(serve_config, user_params).await
-    }) {
+    });
+    // A plugin stuck in an uninterruptible call holds a blocking-pool thread, and
+    // dropping the runtime would wait on it forever. The thread dies with the process.
+    tokio_runtime.shutdown_timeout(IO_SHUTDOWN_TIMEOUT);
+    info!("io runtime stopped");
+    if let Err(e) = result {
         eprintln!("Serve command failed: {e}");
 
         std::process::exit(ReturnCode::Failure as _)
     }
     Ok(())
+}
+
+fn warn_serve_option_notices(serve_config: &commands::serve::Config, matches: &clap::ArgMatches) {
+    let Some(("serve", serve_matches)) = matches.subcommand() else {
+        return;
+    };
+
+    for warning in deprecated_serve_option_warnings(serve_matches, DEPRECATED_SERVE_OPTIONS) {
+        influxdb3_startup::early_logging::warn("influxdb3", warning);
+    }
+
+    if let Some(warning) = disabled_package_manager_deprecation_warning(
+        serve_config.processing_engine_config.package_manager,
+        serve_matches.value_source(PACKAGE_MANAGER_ARG_ID),
+    ) {
+        influxdb3_startup::early_logging::warn("influxdb3", warning);
+    }
+
+    if let Some(warning) = async_trigger_concurrency_default_change_warning(
+        serve_config
+            .processing_engine_config
+            .async_trigger_concurrency_limit,
+        serve_matches.value_source(ASYNC_TRIGGER_CONCURRENCY_LIMIT_ARG_ID),
+    ) {
+        influxdb3_startup::early_logging::warn("influxdb3", warning);
+    }
+
+    if let Some(warning) = async_trigger_concurrency_saturates_queue_warning(
+        serve_config
+            .processing_engine_config
+            .async_trigger_concurrency_limit,
+    ) {
+        influxdb3_startup::early_logging::warn("influxdb3", warning);
+    }
+
+    if let Some(limit) = serve_config.max_concurrent_queries
+        && let Some(warning) = max_concurrent_queries_too_low_warning(
+            limit.0,
+            serve_config.tokio_datafusion_config.num_threads,
+            num_cpus::get(),
+        )
+    {
+        influxdb3_startup::early_logging::warn("influxdb3", &warning);
+    }
+}
+
+/// Warn when an explicitly configured query concurrency limit is too low for
+/// a production node: below the effective query parallelism — the smaller of
+/// the CPU count and the `--num-datafusion-threads` setting (threads above
+/// the core count add no parallelism, and the executor may cap threads to
+/// licensed cores) — admission caps concurrent queries under what the
+/// executor can run in parallel, so execution threads can sit idle while
+/// queries wait for admission; and below
+/// [`cli_types::QUERY_CONCURRENCY_LIMIT_ADVISORY_MIN`] regardless of
+/// parallelism, matching the floor the runtime configure API enforces.
+/// Advisory only: the configured value is honored, and deliberate throttling
+/// still works. The computed default is never below either threshold, so
+/// only explicit values warn.
+fn max_concurrent_queries_too_low_warning(
+    limit: usize,
+    configured_datafusion_threads: Option<std::num::NonZeroUsize>,
+    cpus: usize,
+) -> Option<String> {
+    let threads = configured_datafusion_threads.map_or(cpus, std::num::NonZeroUsize::get);
+    let parallelism = cpus.min(threads);
+    let advisory_min = cli_types::QUERY_CONCURRENCY_LIMIT_ADVISORY_MIN;
+    if limit >= parallelism.max(advisory_min) {
+        return None;
+    }
+    Some(if parallelism >= advisory_min {
+        format!(
+            "--max-concurrent-queries ({limit}) is below the effective query parallelism \
+             ({parallelism}: the smaller of {cpus} CPU cores and {threads} DataFusion \
+             threads): execution threads can sit idle while queries wait for admission. \
+             Raise it to at least {parallelism} unless deliberately throttling queries."
+        )
+    } else {
+        format!(
+            "--max-concurrent-queries ({limit}) is below the advisory minimum of \
+             {advisory_min}: limits this low mostly serialize query execution and suit \
+             testing, not production. Raise it to at least {advisory_min} unless \
+             deliberately throttling queries."
+        )
+    })
+}
+
+/// Warn while the async trigger concurrency limit defaults to unlimited: a
+/// future release changes the default to
+/// [`FUTURE_DEFAULT_ASYNC_TRIGGER_CONCURRENCY_LIMIT`]. Warns when the server
+/// runs with a limit above that upcoming default — either the unlimited
+/// default (the behavior that will change) or an explicitly configured value
+/// (preserved, but worth advertising the change for).
+fn async_trigger_concurrency_default_change_warning(
+    limit: std::num::NonZeroUsize,
+    source: Option<ValueSource>,
+) -> Option<&'static str> {
+    if limit.get() <= FUTURE_DEFAULT_ASYNC_TRIGGER_CONCURRENCY_LIMIT {
+        return None;
+    }
+    if user_provided_value_source(source) {
+        Some(ASYNC_TRIGGER_CONCURRENCY_ABOVE_FUTURE_DEFAULT_MESSAGE)
+    } else {
+        Some(ASYNC_TRIGGER_CONCURRENCY_DEFAULT_CHANGE_MESSAGE)
+    }
+}
+
+/// Warn when a configured async trigger concurrency limit is at or above the
+/// per-trigger outstanding-invocations capacity
+/// ([`influxdb3_processing_engine::TRIGGER_QUEUE_SIZE`]): the capacity rises to
+/// the limit, leaving no queued headroom. The unlimited default
+/// (`NonZeroUsize::MAX`) is excluded — its capacity is unreachable in practice,
+/// so admission never blocks, and it is covered by the default-change warning.
+fn async_trigger_concurrency_saturates_queue_warning(
+    limit: std::num::NonZeroUsize,
+) -> Option<&'static str> {
+    (limit != std::num::NonZeroUsize::MAX
+        && limit.get() >= influxdb3_processing_engine::TRIGGER_QUEUE_SIZE)
+        .then_some(ASYNC_TRIGGER_CONCURRENCY_SATURATES_QUEUE_MESSAGE)
+}
+
+fn deprecated_serve_option_warnings<'a>(
+    serve_matches: &'a clap::ArgMatches,
+    deprecated_options: &'a [DeprecatedServeOption],
+) -> impl Iterator<Item = &'static str> + 'a {
+    deprecated_options.iter().filter_map(|option| {
+        user_provided_value_source(serve_matches.value_source(option.arg_id))
+            .then_some(option.message)
+    })
+}
+
+fn user_provided_value_source(source: Option<ValueSource>) -> bool {
+    matches!(
+        source,
+        Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable)
+    )
+}
+
+fn disabled_package_manager_deprecation_warning(
+    package_manager: influxdb3_clap_blocks::plugins::PackageManager,
+    source: Option<ValueSource>,
+) -> Option<&'static str> {
+    if user_provided_value_source(source)
+        && matches!(
+            package_manager,
+            influxdb3_clap_blocks::plugins::PackageManager::Disabled
+        )
+    {
+        Some(PACKAGE_MANAGER_DISABLED_DEPRECATED_MESSAGE)
+    } else {
+        None
+    }
 }
 
 fn non_serve_main(
@@ -346,25 +534,25 @@ fn non_serve_main(
             Some(Command::Enable(config)) => {
                 if let Err(e) = commands::enable::command(config).await {
                     eprintln!("Enable command failed: {e}");
-                    std::process::exit(ReturnCode::Failure as _)
+                    exit_client_command_failure()
                 }
             }
             Some(Command::Create(config)) => {
                 if let Err(e) = commands::create::command(config).await {
                     eprintln!("Create command failed: {e}");
-                    std::process::exit(ReturnCode::Failure as _)
+                    exit_client_command_failure()
                 }
             }
             Some(Command::Disable(config)) => {
                 if let Err(e) = commands::disable::command(config).await {
                     eprintln!("Disable command failed: {e}");
-                    std::process::exit(ReturnCode::Failure as _)
+                    exit_client_command_failure()
                 }
             }
             Some(Command::Delete(config)) => {
                 if let Err(e) = commands::delete::command(config).await {
                     eprintln!("Delete command failed: {e}");
-                    std::process::exit(ReturnCode::Failure as _)
+                    exit_client_command_failure()
                 }
             }
             Some(Command::Serve(_)) => {
@@ -373,37 +561,43 @@ fn non_serve_main(
             Some(Command::Install(config)) => {
                 if let Err(e) = commands::install::command(config).await {
                     eprintln!("Install command failed: {e}");
-                    std::process::exit(ReturnCode::Failure as _)
+                    exit_client_command_failure()
+                }
+            }
+            Some(Command::Debug(config)) => {
+                if let Err(e) = commands::debug::command(config).await {
+                    eprintln!("Debug command failed: {e}");
+                    exit_client_command_failure()
                 }
             }
             Some(Command::Show(config)) => {
                 if let Err(e) = commands::show::command(config).await {
                     eprintln!("Show command failed: {e}");
-                    std::process::exit(ReturnCode::Failure as _)
+                    exit_client_command_failure()
                 }
             }
             Some(Command::Test(config)) => {
                 if let Err(e) = commands::test::command(config).await {
                     eprintln!("Test command failed: {e}");
-                    std::process::exit(ReturnCode::Failure as _)
+                    exit_client_command_failure()
                 }
             }
             Some(Command::Update(config)) => {
                 if let Err(e) = commands::update::command(config).await {
                     eprintln!("Update command failed: {e}");
-                    std::process::exit(ReturnCode::Failure as _)
+                    exit_client_command_failure()
                 }
             }
             Some(Command::Query(config)) => {
                 if let Err(e) = commands::query::command(config).await {
                     eprintln!("Query command failed: {e}");
-                    std::process::exit(ReturnCode::Failure as _)
+                    exit_client_command_failure()
                 }
             }
             Some(Command::Write(config)) => {
                 if let Err(e) = commands::write::command(config).await {
                     eprintln!("Write command failed: {e}");
-                    std::process::exit(ReturnCode::Failure as _)
+                    exit_client_command_failure()
                 }
             }
             Some(Command::Migrate(config)) => {
@@ -418,9 +612,37 @@ fn non_serve_main(
     Ok(())
 }
 
+/// Exit with failure after a client (non-serve) command error, first
+/// pointing out env-var lookalikes that are set but never read.
+fn exit_client_command_failure() -> ! {
+    for note in unread_env_lookalike_notes(|name| std::env::var_os(name).is_some()) {
+        eprintln!("{note}");
+    }
+    std::process::exit(ReturnCode::Failure as _)
+}
+
+/// Notes for intuitively-derived but unread env vars.
+///
+/// `--host` and `--token` keep their legacy-exception env names
+/// `INFLUXDB3_HOST_URL` / `INFLUXDB3_AUTH_TOKEN` (see
+/// docs/cli-conventions.md, "Legacy exceptions"), so users
+/// reasonably guess `INFLUXDB3_HOST` / `INFLUXDB3_TOKEN`. When a client
+/// command fails, a guessed name is set, and the read name is not, say so.
+fn unread_env_lookalike_notes(is_set: impl Fn(&str) -> bool) -> Vec<String> {
+    [
+        ("INFLUXDB3_HOST", "INFLUXDB3_HOST_URL", "--host"),
+        ("INFLUXDB3_TOKEN", "INFLUXDB3_AUTH_TOKEN", "--token"),
+    ]
+    .into_iter()
+    .filter(|(unread, read, _)| is_set(unread) && !is_set(read))
+    .map(|(unread, read, flag)| {
+        format!("note: {unread} is not a recognized environment variable and is ignored; use {read} or {flag} instead")
+    })
+    .collect()
+}
+
 /// Print the help for the cli if asked for and then exit the program
 fn maybe_print_help() {
-    #[allow(clippy::if_same_then_else)] // They are in fact dear reader not the same
     let mut help = false;
     let mut help_all = false;
     let mut command = None;
@@ -432,6 +654,7 @@ fn maybe_print_help() {
         Query,
         Serve,
         Install,
+        Debug,
         Show,
         Test,
         Write,
@@ -459,6 +682,7 @@ fn maybe_print_help() {
                 "query" => command = Some(SubCommand::Query),
                 "serve" => command = Some(SubCommand::Serve),
                 "install" => command = Some(SubCommand::Install),
+                "debug" => command = Some(SubCommand::Debug),
                 "show" => command = Some(SubCommand::Show),
                 "test" => command = Some(SubCommand::Test),
                 "write" => command = Some(SubCommand::Write),
@@ -668,52 +892,108 @@ unsafe fn set_signal_handler(signal: libc::c_int, handler: unsafe extern "C" fn(
     }
 }
 
+static LOG_FILTER_NOISE_REDUCTION: &[&str] = &[
+    "influxdb3_server::http=info",
+    "reqwest=info",
+    "object_store_metrics=info",
+    "hyper_util=info",
+    "hyper::proto::h1=info",
+    "h2=info",
+    "datafusion_optimizer=info",
+    "influxdb3_wal=info",
+    "iox_query=info",
+    "datafusion=info",
+];
+
+fn expand_log_filter(filter: &str, disable: bool) -> String {
+    if disable {
+        return filter.to_string();
+    }
+    let trimmed = filter.trim();
+    if trimmed.starts_with("debug") || trimmed.starts_with("trace") {
+        format!("{},{}", trimmed, LOG_FILTER_NOISE_REDUCTION.join(","))
+    } else {
+        filter.to_string()
+    }
+}
+
+fn apply_noise_reduction(config: &mut trogging::cli::LoggingConfig, disable: bool) {
+    if let Some(ref filter) = config.log_filter.clone() {
+        config.log_filter = Some(expand_log_filter(filter, disable));
+    }
+    if config.log_verbose_count >= 2 {
+        let base = if config.log_verbose_count == 2 {
+            "debug"
+        } else {
+            "trace"
+        };
+        config.log_filter = Some(expand_log_filter(base, disable));
+        config.log_verbose_count = 0;
+    }
+}
+
 fn init_logs_and_tracing(
     config: &trogging::cli::LoggingConfig,
+    disable_expansion: bool,
 ) -> Result<TroggingGuard, trogging::Error> {
+    let mut config = config.clone();
+    apply_noise_reduction(&mut config, disable_expansion);
+
     let log_layer = trogging::Builder::new()
         .with_default_log_filter(
             "info,iox_query::query_log=warn,influxdb3_query_executor::query_planner=warn",
         )
-        .with_logging_config(config)
+        .with_logging_config(&config)
         .build()?;
 
     let layers = log_layer;
 
+    // This fn is necessary because we used to do essentially
+    // `layers = layers.and_then(tokio_console.enabled.then_some(ConsoleLayer))` and then install
+    // that as the global logger, but we somehow seem to still be suffering from
+    // https://github.com/tokio-rs/tracing/issues/2265, which resets the log level whenever you
+    // install a `None` layer. So can't ever use a `Option<impl Layer>`.
+    fn install_layers(
+        config: &trogging::cli::LoggingConfig,
+        layers: impl tracing_subscriber::layer::Layer<Registry> + Send + Sync + 'static,
+    ) -> Result<TroggingGuard, trogging::Error> {
+        let subscriber = Registry::default().with(layers);
+        let guard = trogging::install_global(subscriber)?;
+        if let Some(ref f) = config.log_filter {
+            tracing::debug!(log_filter = %f, "log_filter_active");
+        }
+        Ok(guard)
+    }
+
     // Attach the tokio-console exporter layer only when requested via
-    // `--tokio-console-enabled` / `TOKIO_CONSOLE_ENABLED`. It spawns a
+    // `--tokio-console-enabled` / `INFLUXDB3_TOKIO_CONSOLE_ENABLED`. It spawns a
     // background task serving instrumentation data and retains per-task span
     // stats whose memory scales with task-spawn rate × retention, so it must
     // be opt-in, and the upstream 1 h retention default is lowered to 60 s
-    // (`TOKIO_CONSOLE_RETENTION` still overrides). See influxdb_pro#4040.
-    #[cfg(feature = "tokio_console")]
-    let layers = {
-        use console_subscriber::ConsoleLayer;
-        let console_layer = if config.tokio_console.enabled {
-            let mut builder = ConsoleLayer::builder()
-                .retention(std::time::Duration::from_secs(60))
-                .with_default_env();
-            if let Some(capacity) = config.tokio_console.event_buffer_capacity {
-                builder = builder.event_buffer_capacity(capacity);
-            }
-            if let Some(capacity) = config.tokio_console.client_buffer_capacity {
-                builder = builder.client_buffer_capacity(capacity);
-            }
-            Some(builder.spawn())
-        } else {
-            None
-        };
-        layers.and_then(console_layer)
-    };
-
-    #[cfg(not(feature = "tokio_console"))]
+    // (`TOKIO_CONSOLE_RETENTION` still overrides). See #4040.
     if config.tokio_console.enabled {
-        return Err(trogging::Error::TokioConsoleMissing);
+        return cfg_select! {
+            feature = "tokio_console" => {{
+                let mut builder = console_subscriber::ConsoleLayer::builder()
+                    .retention(std::time::Duration::from_secs(60))
+                    .with_default_env();
+                if let Some(capacity) = config.tokio_console.event_buffer_capacity {
+                    builder = builder.event_buffer_capacity(capacity);
+                }
+                if let Some(capacity) = config.tokio_console.client_buffer_capacity {
+                    builder = builder.client_buffer_capacity(capacity);
+                }
+                install_layers(&config, layers.and_then(builder.spawn()))
+            }}
+            _ => Err(trogging::Error::TokioConsoleMissing),
+        };
     }
 
-    let subscriber = Registry::default().with(layers);
-    trogging::install_global(subscriber)
+    install_layers(&config, layers)
 }
+
+#[cfg(test)]
+mod lib_tests;
 
 /// Extract user-provided parameters from ArgMatches using clap's ids()
 /// Returns a simple map of CLI argument name -> string value for all user-provided arguments
@@ -737,7 +1017,7 @@ fn extract_user_params(matches: &clap::ArgMatches) -> HashMap<String, String> {
 
         // Only include arguments that were explicitly provided by the user
         let source = serve_matches.value_source(id_str);
-        if source == Some(ValueSource::CommandLine) || source == Some(ValueSource::EnvVariable) {
+        if user_provided_value_source(source) {
             // Get display name (prefer long, then short, then id)
             let display_name = arg
                 .get_long()
@@ -771,4 +1051,38 @@ fn extract_user_params(matches: &clap::ArgMatches) -> HashMap<String, String> {
     }
 
     params
+}
+
+#[cfg(test)]
+mod env_hint_tests {
+    use super::unread_env_lookalike_notes;
+
+    #[test]
+    fn notes_only_for_set_unread_lookalikes() {
+        // Nothing set: no notes.
+        assert!(unread_env_lookalike_notes(|_| false).is_empty());
+
+        // Guessed token name set, real name unset: one note.
+        let notes = unread_env_lookalike_notes(|name| name == "INFLUXDB3_TOKEN");
+        assert_eq!(
+            notes,
+            vec![
+                "note: INFLUXDB3_TOKEN is not a recognized environment variable \
+                 and is ignored; use INFLUXDB3_AUTH_TOKEN or --token instead"
+            ]
+        );
+
+        // Both guessed names set: both notes, host first.
+        let notes = unread_env_lookalike_notes(|name| {
+            name == "INFLUXDB3_HOST" || name == "INFLUXDB3_TOKEN"
+        });
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].contains("INFLUXDB3_HOST_URL"));
+
+        // Real name also set: the guess is moot, no note.
+        let notes = unread_env_lookalike_notes(|name| {
+            name == "INFLUXDB3_TOKEN" || name == "INFLUXDB3_AUTH_TOKEN"
+        });
+        assert!(notes.is_empty());
+    }
 }

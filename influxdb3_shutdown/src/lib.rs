@@ -15,14 +15,24 @@
 //! cleanup logic before signaling back via [`complete`][ShutdownToken::complete] to indicate that
 //! shutdown can proceed.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use iox_time::TimeProvider;
-use observability_deps::tracing::{info, warn};
+use observability_deps::tracing::{info, trace, warn};
 use parking_lot::Mutex;
 use tokio::{sync::oneshot, task::JoinError};
 pub use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+
+/// How long process exit waits for the io runtime's threads. Threads still running after this
+/// are leaked.
+pub const IO_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Wait for a `SIGTERM` or `SIGINT` to stop the process on UNIX systems
 #[cfg(unix)]
@@ -45,6 +55,10 @@ pub async fn wait_for_signal() {
     info!("Received SIGINT");
 }
 
+/// Bound on how long a DataFusion executor's runtime waits for worker threads at shutdown. A task
+/// that never yields would otherwise hold up the process exit for the executor's 5 min default.
+pub const EXECUTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Manage application shutdown
 ///
 /// This derives `Clone`, as the underlying `tokio` types can be shared via clone.
@@ -53,6 +67,9 @@ pub struct ShutdownManager {
     frontend_shutdown: CancellationToken,
     backend_shutdown: CancellationToken,
     tasks: TaskTracker,
+    next_id: Arc<AtomicUsize>,
+    pending: Arc<Mutex<Vec<(&'static str, usize)>>>,
+    shutdown_started_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ShutdownManager {
@@ -65,6 +82,9 @@ impl ShutdownManager {
             frontend_shutdown,
             backend_shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
+            next_id: Arc::new(AtomicUsize::new(0)),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            shutdown_started_at: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -77,6 +97,9 @@ impl ShutdownManager {
             frontend_shutdown: CancellationToken::new(),
             backend_shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
+            next_id: Arc::new(AtomicUsize::new(0)),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            shutdown_started_at: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -84,10 +107,19 @@ impl ShutdownManager {
     ///
     /// Provides a [`ShutdownToken`] which the caller is responsible for handling. The caller must
     /// invoke [`complete`][ShutdownToken::complete] in order for process shutdown to succeed.
-    pub fn register(&self) -> ShutdownToken {
+    pub fn register(&self, name: &'static str) -> ShutdownToken {
         let (tx, rx) = oneshot::channel();
         self.tasks.spawn(rx);
-        ShutdownToken::new(self.backend_shutdown.clone(), tx)
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.pending.lock().push((name, id));
+        ShutdownToken::new(
+            self.backend_shutdown.clone(),
+            tx,
+            name,
+            id,
+            Arc::clone(&self.pending),
+            Arc::clone(&self.shutdown_started_at),
+        )
     }
 
     /// Waits for registered tasks to complete before signaling shutdown to frontend
@@ -96,7 +128,28 @@ impl ShutdownManager {
     /// [`complete`][ShutdownToken::complete]
     pub async fn join(&self) {
         self.tasks.close();
-        self.tasks.wait().await;
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = self.tasks.wait() => break,
+                _ = ticker.tick() => {
+                    let elapsed = self.shutdown_started_at.lock()
+                        .as_ref().map(|t| t.elapsed());
+                    if let Some(elapsed) = elapsed {
+                        let pending = self.pending_components();
+                        if !pending.is_empty() {
+                            info!(
+                                count = pending.len(),
+                                ?pending,
+                                ?elapsed,
+                                "waiting for components to complete shutdown"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         self.frontend_shutdown.cancel();
     }
 
@@ -106,12 +159,20 @@ impl ShutdownManager {
     /// [`wait_for_shutdown`][ShutdownToken::wait_for_shutdown] future so that registered tasks can
     /// clean up before indicating completion.
     pub fn shutdown(&self) {
+        self.shutdown_started_at
+            .lock()
+            .get_or_insert(Instant::now());
         self.backend_shutdown.cancel();
     }
 
     /// Check if backend has been shutdown
     pub fn is_backend_shutdown(&self) -> bool {
         self.backend_shutdown.is_cancelled()
+    }
+
+    /// Returns the names of components that have not yet signaled completion
+    pub fn pending_components(&self) -> Vec<&'static str> {
+        self.pending.lock().iter().map(|(name, _)| *name).collect()
     }
 }
 
@@ -124,19 +185,37 @@ impl ShutdownManager {
 pub struct ShutdownToken {
     token: CancellationToken,
     complete_tx: Mutex<Option<oneshot::Sender<()>>>,
+    name: &'static str,
+    id: usize,
+    pending: Arc<Mutex<Vec<(&'static str, usize)>>>,
+    shutdown_started_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ShutdownToken {
     /// Create a new [`ShutdownToken`]
-    fn new(token: CancellationToken, complete_tx: oneshot::Sender<()>) -> Self {
+    fn new(
+        token: CancellationToken,
+        complete_tx: oneshot::Sender<()>,
+        name: &'static str,
+        id: usize,
+        pending: Arc<Mutex<Vec<(&'static str, usize)>>>,
+        shutdown_started_at: Arc<Mutex<Option<Instant>>>,
+    ) -> Self {
         Self {
             token,
             complete_tx: Mutex::new(Some(complete_tx)),
+            name,
+            id,
+            pending,
+            shutdown_started_at,
         }
     }
 
     /// Trigger application shutdown due to some unrecoverable state
     pub fn trigger_shutdown(&self) {
+        self.shutdown_started_at
+            .lock()
+            .get_or_insert(Instant::now());
         self.token.cancel();
     }
 
@@ -163,6 +242,20 @@ impl ShutdownToken {
     /// type invokes this method on `Drop`.
     pub fn complete(&self) {
         if let Some(s) = self.complete_tx.lock().take() {
+            let elapsed = self
+                .shutdown_started_at
+                .lock()
+                .as_ref()
+                .map(|t| t.elapsed());
+            self.pending.lock().retain(|(_, id)| *id != self.id);
+            if let Some(elapsed) = elapsed {
+                info!(component = self.name, ?elapsed, "shutdown complete");
+            } else {
+                trace!(
+                    component = self.name,
+                    "shutdown complete (not triggered by shutdown signal)"
+                );
+            }
             let _ = s.send(());
         }
     }

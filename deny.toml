@@ -8,122 +8,120 @@ ignore = [
     # paste crate is no longer maintained, but it is past 1.0
     # Keep this here until our transisent dependencies no longer
     # need it
-    "RUSTSEC-2024-0436",
+    "RUSTSEC-2024-0436", # https://rustsec.org/advisories/RUSTSEC-2024-0436
     # rustls-pemfile is unmaintained but still used as a transitive dependency
     # from object_store. We've removed our direct dependency and migrated to
     # rustls-pki-types. Remove once object_store updates.
-    "RUSTSEC-2025-0134",
+    "RUSTSEC-2025-0134", # https://rustsec.org/advisories/RUSTSEC-2025-0134
     # bincode is unmaintained but does not have any known issues;
     # there are multiple replacements at this time but there isn't
     # yet a clear choice
-    "RUSTSEC-2025-0141",
+    "RUSTSEC-2025-0141", # https://rustsec.org/advisories/RUSTSEC-2025-0141
     # quick-xml < 0.41.0 two DoS advisories: unbounded namespace-declaration
     # allocation in NsReader (0195) and quadratic-time attribute duplicate check
     # (0194). Pulled in transitively at two versions with no upgrade path yet:
     # object_store (latest 0.14.0) pins quick-xml ^0.40.1 and inferno (latest
     # 0.12.6, via pprof) pins ^0.39 — neither reaches the patched 0.41.0. Remove
     # once object_store and pprof/inferno move to quick-xml >= 0.41.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0194", # https://rustsec.org/advisories/RUSTSEC-2026-0194
+    "RUSTSEC-2026-0195", # https://rustsec.org/advisories/RUSTSEC-2026-0195
     # rustls-webpki 0.102.8 CRL distribution point matching bug; low impact
     # (requires CA compromise). Stuck on 0.102.x via wasmtime's rustls 0.22.x
     # dep in datafusion-udf-wasm. Upstream also ignores this advisory.
-    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0049", # https://rustsec.org/advisories/RUSTSEC-2026-0049
     # rustls-webpki 0.102.8 wildcard name-constraint bug; stuck on 0.102.x via
     # wasmtime's rustls 0.22.x dep in datafusion-udf-wasm. Upstream fix pulls in
     # newer DataFusion/wasmtime and is not yet compatible with this repo.
-    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0099", # https://rustsec.org/advisories/RUSTSEC-2026-0099
     # rustls-webpki 0.102.8 URI name-constraint bug; same transitive 0.102.x path
     # via datafusion-udf-wasm/wasmtime/rustls 0.22.x, with the same current
     # incompatibility on the available upstream fix path.
-    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0098", # https://rustsec.org/advisories/RUSTSEC-2026-0098
     # rustls-webpki CRL parsing reachable panic; only 0.103.13+ and 0.104.0-alpha.7+
     # ship the fix. The 0.103.x transitive is patched via the Cargo.toml pin bump,
     # but the 0.102.x transitive is still stuck via datafusion-udf-wasm/wasmtime/
     # rustls 0.22.x with no patched 0.102.x release available. We don't configure
     # CRLs anywhere in this repo, so the panic is unreachable in practice on that
     # remaining 0.102.x path.
-    "RUSTSEC-2026-0104",
-
-    # wasmtime 41.0.4 advisories (transitive dep via datafusion-udf-wasm)
-    #
-    # Wasm UDFs are disabled by default (udfs_enabled = false in iox_query config).
-    # The Wasm component model code path is never entered unless explicitly enabled.
-    # Additionally, none of the advisories match our runtime configuration:
-    #
-    # Winch compiler backend required (we use Cranelift, the default):
-    "RUSTSEC-2026-0086", # GHSA-m9w2-8782-2946: host data leakage with 64-bit tables and Winch
-    "RUSTSEC-2026-0089", # GHSA-q49f-xg75-m9xw: host panic on table.fill with Winch
-    "RUSTSEC-2026-0094", # GHSA-f984-pcp8-v2p7: improperly masked table.grow return with Winch
-    "RUSTSEC-2026-0095", # GHSA-xx5w-cvp6-jv83: Winch sandbox-escaping memory access
-    #
-    # Non-default runtime config required (we use defaults: spectre on, on-demand allocator):
-    "RUSTSEC-2026-0087", # GHSA-qqfj-4vcm-26hv: f64x2.splat segfault (requires signals-based-traps disabled)
-    "RUSTSEC-2026-0088", # GHSA-6wgr-89rj-399p: pooling allocator data leakage (requires pooling allocator)
-    "RUSTSEC-2026-0096", # GHSA-jhxm-h53p-jm7w: aarch64 sandbox escape (requires spectre mitigations disabled)
-    #
-    # Component model features we don't use (no flags types, no cross-component string passing):
-    "RUSTSEC-2026-0085", # GHSA-m758-wjhj-p3jq: panic lifting flags component value (no flags in our WIT)
-    "RUSTSEC-2026-0092", # GHSA-jxhv-7h78-9775: panic on misaligned UTF-16 strings (cross-component only)
-    "RUSTSEC-2026-0093", # GHSA-hx6p-xpx3-jvvv: heap OOB read in UTF-16 transcoding (cross-component only)
-    #
-    # Guest realloc validation (single-component host-guest interaction; low risk given UDFs are disabled):
-    "RUSTSEC-2026-0091", # GHSA-394w-hwhg-8vgm: OOB write from unvalidated guest realloc
-    "RUSTSEC-2026-0114", # GHSA-p8xm-42r7-89xg: Panic when allocating a table exceeding the size of the host's address space
-    #
-    # WASI filesystem access required (we don't grant any preopened dirs to UDFs):
-    "RUSTSEC-2026-0149", # GHSA-2r75-cxrj-cmph: WASI path_open(TRUNCATE) bypasses FilePerms::WRITE host restriction
-    #
-    # Another wasmtime advisory:
-    "RUSTSEC-2026-0182",
-    #
-    # TODO: update wasmtime via datafusion-udf-wasm to a patched version (>=42.0.2)
-    #
-    # wasmtime-wasi 41.0.4 WASI hard links and renames bypass FilePerms for the
-    # destination (https://rustsec.org/advisories/RUSTSEC-2026-0188). Same transitive
-    # path via datafusion-udf-wasm; only reachable if a Wasm UDF is loaded with WASI
-    # filesystem preopens granted, and UDFs are disabled by default
-    # (udfs_enabled = false). Fix requires wasmtime-wasi >=45.0.3, which needs an
-    # upstream datafusion-udf-wasm bump.
-    "RUSTSEC-2026-0188",
-    #
-    # wasmtime 41.0.4 stores can mix up type indices between engines
-    # (https://rustsec.org/advisories/RUSTSEC-2026-0222). Same transitive path via
-    # datafusion-udf-wasm; only reachable if a Wasm UDF is loaded, and UDFs are
-    # disabled by default (udfs_enabled = false). The 41.x line has no patched
-    # release. The fix requires wasmtime >=46.0.2, which needs an upstream
-    # datafusion-udf-wasm bump to a DataFusion 52 rev.
-    "RUSTSEC-2026-0222",
-    #
-    # wasmtime 41.0.4 filesystem sandbox escape when paths or symlinks contain
-    # trailing slashes (https://rustsec.org/advisories/RUSTSEC-2026-0269). Same
-    # transitive path via datafusion-udf-wasm; only reachable if a Wasm UDF is
-    # loaded with WASI filesystem preopens granted, and UDFs are disabled by
-    # default (udfs_enabled = false). The 41.x line has no patched release. The
-    # fix requires wasmtime >=46.0.3, which needs an upstream datafusion-udf-wasm
-    # bump.
-    "RUSTSEC-2026-0269",
-    #
-    # TODO: update wasmtime-wasi via datafusion-udf-wasm to a patched version (>=45.0.3; >=46.0.1 is also fixed)
-
-    # rand unsoundness: only reachable with rand's `log` feature plus a custom logger
-    # that calls rand::rng() and triggers a reseed. We don't enable rand's `log`
-    # feature (verified via `cargo tree -e features -i rand`), so the UB path is
-    # unreachable. Patched in rand >=0.9.3 / >=0.8.6; the 0.8.x copy is pinned
-    # transitively via cap-rand/wasmtime. Tracked for a version bump on main.
-    "RUSTSEC-2026-0097", # rand unsound with custom logger calling thread_rng (log feature not enabled here)
-    #
-    # pyo3 0.24-0.28 out-of-bounds read in Iterator::nth/nth_back on
-    # PyList/PyTuple iterators; fix is only in pyo3 0.29 (API-breaking bump,
-    # tracked in influxdb_pro#4072). Not reachable here: no nth/nth_back calls
-    # in our pyo3-consuming crates, and the overflow needs a Rust-side n near
-    # usize::MAX, which our embedding never produces.
-    "RUSTSEC-2026-0176",
-    #
-    # pyo3 0.15-0.29 unsoundness bug. Possible data race in functions supplied
-    # to PyCFunction::new_closure, or PyCFunction::new_closure_bound.
-    # Neither of these methods are used in this code.
-    "RUSTSEC-2026-0177",
+    "RUSTSEC-2026-0104", # https://rustsec.org/advisories/RUSTSEC-2026-0104
+    # rustls 0.22.4 advisories with no fix on the 0.22.x line. It comes in only
+    # through wasmtime-wasi-http via datafusion-udf-wasm, and Wasm UDFs are
+    # disabled by default (udfs_enabled = false). rustls 0.23.x is updated to
+    # 0.23.46, which fixes both. main no longer has rustls 0.22.
+    # Debug impls for client session values expose TLS secrets
+    "RUSTSEC-2026-0346", # https://rustsec.org/advisories/RUSTSEC-2026-0346
+    # unauthenticated ServerHello can downgrade later key exchange
+    "RUSTSEC-2026-0349", # https://rustsec.org/advisories/RUSTSEC-2026-0349
+    # zstd 0.13 advisories with no fix on the 0.13 line. The fixed zstd 0.14.3
+    # and zstd-safe 8.2.0 are only accepted by arrow-ipc and parquet 60, so
+    # moving to them is an arrow and DataFusion upgrade. Until then:
+    # - RUSTSEC-2026-0391: `with_context` carries an abandoned stream's buffers
+    #   into the next stream. Nothing in the graph calls `with_context`.
+    # - RUSTSEC-2026-0398: `Seekable::decompress` is behind the `seekable`
+    #   feature, which nothing enables, so the code is not compiled.
+    # - RUSTSEC-2026-0403: a corrupt legacy frame leaks stale heap through
+    #   `zstd::stream::write::Decoder`. Nothing uses the write-side decoder:
+    #   our code calls `decode_all`, tonic, arrow-ipc and parquet use the
+    #   read-side and bulk decoders, and compression-codecs (DataFusion's file
+    #   decompression) decodes into a caller-provided slice, not a `Vec`.
+    "RUSTSEC-2026-0391", # https://rustsec.org/advisories/RUSTSEC-2026-0391
+    "RUSTSEC-2026-0398", # https://rustsec.org/advisories/RUSTSEC-2026-0398
+    "RUSTSEC-2026-0403", # https://rustsec.org/advisories/RUSTSEC-2026-0403
+    # thrift 0.17 has an unbounded read from untrusted parquet files (denial of
+    # service attack). See https://rustsec.org/advisories/RUSTSEC-2026-0435. We
+    # can't take arrow/parquet 58.2+ on DataFusion 53 (per comment in
+    # Cargo.toml and the DataFusion 54 upgrade already in progress
+    # (https://github.com/influxdata/influxdb_pro/issues/6494)); ignore for now
+    "RUSTSEC-2026-0435", # https://rustsec.org/advisories/RUSTSEC-2026-0435
+    # SQLite's page-cache disclosure requires opening an attacker-supplied
+    # DB and sibling WAL with mismatched page sizes. Core uses SQLx only for
+    # data_types' type/codec implementations, not to open databases.
+    # sqlx-sqlite 0.8.6 requires libsqlite3-sys 0.30.x; even 0.9.0 requires
+    # <0.38.0, excluding the fixed >=0.39.0. Remove when SQLx accepts the fix.
+    "RUSTSEC-2026-0459", # https://rustsec.org/advisories/RUSTSEC-2026-0459
+    # chrono, chrono-tz and humantime are unmaintained across all versions;
+    # no patched upgrades exist. These are maintenance-only advisories.
+    # We use chrono, chrono-tz and humantime directly, and Arrow/DataFusion also
+    # require chrono and chrono-tz. Remove these exceptions when we and our
+    # dependencies migrate to maintained alternatives.
+    "RUSTSEC-2026-0542", # https://rustsec.org/advisories/RUSTSEC-2026-0542
+    "RUSTSEC-2026-0543", # https://rustsec.org/advisories/RUSTSEC-2026-0543
+    "RUSTSEC-2026-0555", # https://rustsec.org/advisories/RUSTSEC-2026-0555
+    # wasmtime 50.0.1 advisories, all fixed in wasmtime 50.0.2. Each one lets a
+    # WebAssembly guest make the host panic, abort or use memory without bound
+    # (denial of service). The only guests we run are Python UDFs, which are
+    # off unless `iox.udfs_enabled` is set. Remove these exceptions when
+    # wasmtime moves to 50.0.2 or later.
+    # - RUSTSEC-2026-0566: empty writes to a wasmtime-wasi `AsyncWriteStream`
+    #   grow host memory without bound.
+    # - RUSTSEC-2026-0567: abort when the threads proposal is enabled in a
+    #   build without the `threads` feature.
+    # - RUSTSEC-2026-0568: a stale GC heap base pointer lets a guest abort the
+    #   host process.
+    # - RUSTSEC-2026-0569: `Caller::get_module_export` panics when the host
+    #   function was not called from WebAssembly.
+    # - RUSTSEC-2026-0570: abort on a function subtype check in a build
+    #   without the `gc` feature.
+    # - RUSTSEC-2026-0571: empty wasmtime-wasi-http body writes over HTTP/2
+    #   grow host memory without bound.
+    # - RUSTSEC-2026-0572: panic when a component cancels a stream or future
+    #   copy on the wrong end.
+    # - RUSTSEC-2026-0573: abort when a GC heap that cannot move has a
+    #   reservation that is not a multiple of the page size.
+    "RUSTSEC-2026-0566", # https://rustsec.org/advisories/RUSTSEC-2026-0566
+    "RUSTSEC-2026-0567", # https://rustsec.org/advisories/RUSTSEC-2026-0567
+    "RUSTSEC-2026-0568", # https://rustsec.org/advisories/RUSTSEC-2026-0568
+    "RUSTSEC-2026-0569", # https://rustsec.org/advisories/RUSTSEC-2026-0569
+    "RUSTSEC-2026-0570", # https://rustsec.org/advisories/RUSTSEC-2026-0570
+    "RUSTSEC-2026-0571", # https://rustsec.org/advisories/RUSTSEC-2026-0571
+    "RUSTSEC-2026-0572", # https://rustsec.org/advisories/RUSTSEC-2026-0572
+    "RUSTSEC-2026-0573", # https://rustsec.org/advisories/RUSTSEC-2026-0573
+    # RUSTSEC-2026-0587: on Windows, a WASI guest can escape its filesystem
+    # sandbox through a drive-prefixed path component. Fixed in wasmtime
+    # 36.0.22, 48.0.10, 49.0.7 and 50.0.3. The only guests we run are Python
+    # UDFs, which see an in-memory file system, not a host directory. Remove
+    # this exception when wasmtime moves to a fixed version.
+    "RUSTSEC-2026-0587", # https://rustsec.org/advisories/RUSTSEC-2026-0587
 ]
 git-fetch-with-cli = true
 
@@ -141,16 +139,8 @@ allow = [
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
-    "NCSA",
-    "Unicode-DFS-2016",
     "Unicode-3.0",
     "Zlib",
-]
-exceptions = [
-    # We should probably NOT bundle CA certs but use the OS ones.
-    { name = "webpki-roots", allow = ["MPL-2.0"] },
-    # aws sdk-s3 uses aws-lc-sys for rustls
-    { name = "aws-lc-sys", allow = ["OpenSSL"] },
 ]
 
 [[licenses.clarify]]
@@ -180,11 +170,3 @@ deny = [
     # Use stdlib ( https://doc.rust-lang.org/stable/std/io/trait.IsTerminal.html )
     { name = "atty" },
 ]
-
-# rand's `log` feature enables the RUSTSEC-2026-0097 unsoundness path
-# (custom logger calling rand::rng() during reseed). The advisory is
-# ignored above on the basis that this feature is not enabled; this ban
-# enforces that invariant.
-[[bans.features]]
-name = "rand"
-deny = ["log"]

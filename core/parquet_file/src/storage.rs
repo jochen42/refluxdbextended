@@ -128,13 +128,12 @@ impl DataSourceExecInput {
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
         // Compute final (output) schema after selection
         let schema = Arc::new(projection.project_schema(&schema).as_ref().clone());
-        let file_scan_config = FileScanConfigBuilder::new(
-            self.object_store_url.clone(),
-            schema,
-            Arc::new(ParquetSource::new(table_parquet_options())),
-        )
-        .with_file(PartitionedFile::from(self.object_meta.clone()))
-        .build();
+        let parquet_source = ParquetSource::new(Arc::clone(&schema))
+            .with_table_parquet_options(table_parquet_options());
+        let file_scan_config =
+            FileScanConfigBuilder::new(self.object_store_url.clone(), Arc::new(parquet_source))
+                .with_file(PartitionedFile::from(self.object_meta.clone()))
+                .build();
         let exec = DataSourceExec::from_data_source(file_scan_config);
         let exec_schema = exec.schema();
         datafusion::physical_plan::collect(exec, session_ctx.task_ctx())
@@ -493,11 +492,18 @@ mod tests {
         assert_eq!(batch.num_columns(), 4);
         assert_eq!(batch.num_rows(), 8192 * 2);
 
-        // NOTE: previously, this test asserted that IoxSchema::try_from would
-        // fail on a batch without IOx metadata. With the schema crate's "v3"
-        // feature (enabled by influxdb3_catalog and unified across the
-        // workspace), columns lacking metadata are accepted as arrow-native
-        // columns, so that assertion no longer holds.
+        // With schema crate `v3`, columns lacking metadata are accepted as
+        // Arrow-native columns, so this assertion only holds without `v3`.
+        #[cfg(not(feature = "v3"))]
+        {
+            use schema::{Error::InvalidInfluxColumnType, Schema as IoxSchema};
+
+            let iox_schema = IoxSchema::try_from(batch.schema());
+            assert!(
+                matches!(iox_schema, Err(InvalidInfluxColumnType { .. })),
+                "should not have iox schema, yet"
+            );
+        }
 
         // build & use iox_schema
         let iox_schema = SchemaBuilder::new()
@@ -795,7 +801,7 @@ mod tests {
         assert_schema_check_fail(
             other_batch,
             schema,
-            "Error during planning: Cannot cast file schema field a of type Int64 to table schema field of type Interval(MonthDayNano)",
+            "Execution error: Cannot cast column 'a' from 'Int64' (physical data type) to 'Interval(MonthDayNano)' (logical data type)",
         ).await;
     }
 
@@ -807,8 +813,9 @@ mod tests {
         assert_schema_check_fail(
             other_batch,
             schema,
-            "Arrow error: Invalid argument error: Column 'a' is declared as non-nullable but contains null values",
-        ).await;
+            "Execution error: Non-nullable column 'a' is missing from the physical schema",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -823,8 +830,9 @@ mod tests {
         assert_schema_check_fail(
             other_batch,
             schema,
-            "Arrow error: Invalid argument error: Column 'b' is declared as non-nullable but contains null values",
-        ).await;
+            "Execution error: Non-nullable column 'b' is missing from the physical schema",
+        )
+        .await;
     }
 
     /// This test, and the following test [`test_schema_check_ignore_additional_metadata_in_file`]

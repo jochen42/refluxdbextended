@@ -3,7 +3,7 @@ use pretty_assertions::assert_eq;
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use crate::server::TestServer;
+use crate::server::{ConfigProvider, TestServer};
 
 #[tokio::test]
 async fn api_v1_write_request_parsing() {
@@ -299,6 +299,67 @@ async fn api_v2_write_round_trip() {
     );
 }
 
+#[tokio::test]
+async fn api_v2_write_without_token_returns_unauthorized() {
+    let server = TestServer::configure().with_auth().spawn().await;
+    let client = server.http_client();
+    let write_url = format!("{base}/api/v2/write", base = server.client_addr());
+    let db_name = "mydb";
+
+    server.create_database(db_name).run().unwrap();
+
+    let resp = client
+        .post(&write_url)
+        .query(&[("bucket", db_name), ("precision", "ns")])
+        .body("cpu,host=a usage=0.5")
+        .send()
+        .await
+        .expect("send api/v2/write request without token");
+
+    assert_eq!(StatusCode::UNAUTHORIZED, resp.status());
+
+    let body = resp.text().await.expect("response body as text");
+    let json: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|_| panic!("Failed to parse JSON response. Body: {}", body));
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "error": "the request was not authenticated",
+        })
+    );
+}
+
+#[tokio::test]
+async fn api_v2_write_invalid_token_returns_unauthorized() {
+    let server = TestServer::configure().with_auth().spawn().await;
+    let client = server.http_client();
+    let write_url = format!("{base}/api/v2/write", base = server.client_addr());
+    let db_name = "mydb";
+
+    server.create_database(db_name).run().unwrap();
+
+    let resp = client
+        .post(&write_url)
+        .query(&[("bucket", db_name), ("precision", "ns")])
+        .body("cpu,host=a usage=0.5")
+        .bearer_auth("apiv3_nonexistent_token") // Use a non-existent token to simulate invalid authentication
+        .send()
+        .await
+        .expect("send api/v2/write request with invalid token");
+
+    assert_eq!(StatusCode::UNAUTHORIZED, resp.status());
+
+    let body = resp.text().await.expect("response body as text");
+    let json: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|_| panic!("Failed to parse JSON response. Body: {}", body));
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "error": "the request was not authenticated",
+        })
+    );
+}
+
 /// Reproducer for [#25006][issue]
 ///
 /// [issue]: https://github.com/influxdata/influxdb/issues/25006
@@ -337,10 +398,38 @@ async fn writes_with_different_schema_should_fail() {
             error,
             influxdb3_client::Error::ApiError {
                 code: StatusCode::BAD_REQUEST,
-                message: _
+                ..
             }
         ),
         "the request should have failed with an API Error"
+    );
+}
+
+#[tokio::test]
+async fn write_past_the_latest_supported_timestamp_is_rejected() {
+    let server = TestServer::spawn().await;
+    let error = server
+        .write_lp_to_db(
+            "foo",
+            format!(
+                "cpu,host=a usage=0.5 {}",
+                influxdb3_wal::MAX_WRITE_TIMESTAMP_NS + 1
+            ),
+            Precision::Nanosecond,
+        )
+        .await
+        .expect_err("a timestamp past the latest supported one should be rejected");
+
+    assert!(
+        matches!(
+            &error,
+            influxdb3_client::Error::ApiError {
+                code: StatusCode::BAD_REQUEST,
+                message,
+                ..
+            } if message.contains("later than the latest supported timestamp"),
+        ),
+        "unexpected error: {error:?}"
     );
 }
 
@@ -362,10 +451,11 @@ async fn duplicate_field_names_should_fail() {
     // is duplicated.
     assert!(
         matches!(
-            error,
+            &error,
             influxdb3_client::Error::ApiError {
                 code: StatusCode::BAD_REQUEST,
                 message,
+                ..
             } if message.contains("multiple instances of 'usage' field found"),
         ),
         "the request should have failed with an API Error for duplicate field names"
@@ -744,4 +834,181 @@ async fn test_table_creation_with_special_characters_line_protocol_compatibility
 
     // Use insta snapshot to verify the table columns
     insta::assert_json_snapshot!("special_chars_table_columns", table_info);
+}
+
+/// Regression test for <https://github.com/influxdata/influxdb_pro/issues/5352> (EAR 7056):
+/// overwrites of the same (series key, timestamp) that share one write buffer chunk must
+/// resolve to the last acknowledged write, both in query results and in what
+/// `sort_dedupe_persist` bakes into the gen1 parquet file. Before the write buffer collapsed
+/// overwrites (`table_buffer.rs`), the duplicate rows tied on both dedup sort keys and an
+/// unstable sort picked an arbitrary survivor — this test failed with superseded versions
+/// persisted in every trial.
+///
+/// Each table's batch interleaves N series x M versions of the same (series, time) in one
+/// request, so every version lands in a single buffer chunk. The historical failure was
+/// input-deterministic (no RNG in the sort), so repetition only samples the space if the
+/// layout varies: each table uses a different (series x versions) shape as an independent
+/// trial.
+#[test_log::test(tokio::test)]
+async fn overwrite_last_write_wins_through_persistence() {
+    // Distinct layouts per table: same defect, different equal-key run sizes and
+    // positions, so each is an independent trial of the unstable sort.
+    const TRIALS: &[(usize, i64)] = &[(10, 12), (7, 15), (12, 9), (9, 20)];
+
+    // A fixed timestamp ~20 minutes in the past: old enough that the chunk is
+    // eligible for persistence as soon as a snapshot runs, and constant across
+    // the batch so every row of a series is a duplicate of the others.
+    let ts_ns = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time after epoch")
+        .as_nanos() as i64)
+        - 20 * 60 * 1_000_000_000;
+
+    let server = TestServer::spawn().await;
+    let db_name = "repro_5352";
+
+    // Version-major interleave: every series gets v, then every series gets v+1, ...
+    // mirroring an ETL that rewrites a whole aggregate table each cycle.
+    let mut lp = String::new();
+    for (table, &(n_series, n_versions)) in TRIALS.iter().enumerate() {
+        for v in 0..n_versions {
+            for s in 0..n_series {
+                lp.push_str(&format!(
+                    "tbl_{table},probe=sensor_{s:04} v={}i {ts_ns}\n",
+                    1000 + v
+                ));
+            }
+        }
+    }
+    server
+        .write_lp_to_db(db_name, lp, Precision::Nanosecond)
+        .await
+        .expect("write overwrite batch");
+
+    // Wait until every table's chunk has been persisted, so the assertion checks the
+    // durable winner rather than racing the snapshot. Snapshots only run on new
+    // WAL activity, so each poll iteration writes a filler row (to its own table,
+    // at the current time) to drive the WAL forward until the probe tables'
+    // now-cold chunk is persisted.
+    for table in 0..TRIALS.len() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut filler = 0u64;
+        loop {
+            filler += 1;
+            server
+                .write_lp_to_db(
+                    db_name,
+                    format!("filler,f=a x={filler}i"),
+                    Precision::Nanosecond,
+                )
+                .await
+                .expect("write filler");
+            let resp = server
+                .api_v3_query_sql(&[
+                    ("db", db_name),
+                    (
+                        "q",
+                        &format!(
+                            "SELECT COUNT(*) AS n FROM system.parquet_files \
+                             WHERE table_name = 'tbl_{table}'"
+                        ),
+                    ),
+                    ("format", "json"),
+                ])
+                .await
+                .json::<Value>()
+                .await
+                .expect("query parquet_files");
+            if resp[0]["n"].as_i64().unwrap_or(0) > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tbl_{table} was not persisted within 30s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    let mut failures = Vec::new();
+    for (table, &(n_series, n_versions)) in TRIALS.iter().enumerate() {
+        let want = 1000 + n_versions - 1;
+        let resp = server
+            .api_v3_query_sql(&[
+                ("db", db_name),
+                (
+                    "q",
+                    &format!("SELECT probe, v FROM tbl_{table} ORDER BY probe"),
+                ),
+                ("format", "json"),
+            ])
+            .await
+            .json::<Value>()
+            .await
+            .expect("query json");
+        let rows = resp.as_array().expect("json array response");
+        if rows.len() != n_series {
+            failures.push(format!(
+                "tbl_{table}: expected {n_series} rows after dedup, got {}",
+                rows.len()
+            ));
+        }
+        for row in rows {
+            let probe = row["probe"].as_str().unwrap_or("?");
+            let got = row["v"].as_i64().unwrap_or(-1);
+            if got != want {
+                failures.push(format!(
+                    "tbl_{table}/{probe}: persisted v={got}, want v={want} (last acknowledged write)"
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "superseded versions won dedup and were persisted:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// A node that receives one write and then goes idle never reaches the
+/// count-based snapshot trigger; the age-based one persists its data
+/// anyway (influxdb_pro#4078). The buffer checker runs every 10 s, hence
+/// the poll budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_node_snapshots_after_max_unsnapshotted_age() {
+    let tmp_dir = tempfile::TempDir::new().expect("temp dir");
+    let data_dir = tmp_dir.path().to_str().expect("tmp dir string").to_owned();
+    let server = TestServer::configure()
+        .with_object_store_dir(&data_dir)
+        .with_env_var("INFLUXDB3_FORCE_SNAPSHOT_MAX_AGE", "1s")
+        .spawn()
+        .await;
+
+    server
+        .write_lp_to_db("idle_db", "cpu,host=a usage=1i 100", Precision::Nanosecond)
+        .await
+        .expect("write lp");
+
+    let snapshot_files = || {
+        walkdir::WalkDir::new(&data_dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .components()
+                        .any(|component| component.as_os_str() == "snapshots")
+            })
+            .count()
+    };
+    let start = std::time::Instant::now();
+    while snapshot_files() == 0 {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(45),
+            "no snapshot was forced by age within 45s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    drop(server);
 }

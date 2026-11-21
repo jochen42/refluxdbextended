@@ -1,5 +1,6 @@
 use crate::environment::PluginEnvironmentError;
 use influxdb3_catalog::CatalogError;
+use influxdb3_id::{DbId, TriggerId};
 use std::fmt::Debug;
 use thiserror::Error;
 
@@ -17,17 +18,11 @@ pub enum ProcessingEngineError {
     #[error("wal error: {0}")]
     WalError(#[from] influxdb3_wal::Error),
 
-    #[error("plugin not found: {0}")]
-    PluginNotFound(String),
-
     #[error("plugin error: {0}")]
     PluginError(#[from] crate::plugins::PluginError),
 
-    #[error("failed to shutdown trigger {trigger_name} in database {database}")]
-    TriggerShutdownError {
-        database: String,
-        trigger_name: String,
-    },
+    #[error("processing engine trigger {trigger_id} not found in database {db_id}")]
+    TriggerNotFound { db_id: DbId, trigger_id: TriggerId },
 
     #[error("request trigger not found")]
     RequestTriggerNotFound,

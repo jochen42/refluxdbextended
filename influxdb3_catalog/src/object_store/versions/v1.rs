@@ -13,9 +13,7 @@ use crate::catalog::versions::v1::{InnerCatalog, Snapshot};
 use crate::snapshot::versions::v3::CatalogSnapshot;
 use crate::{
     catalog::CatalogSequenceNumber,
-    object_store::{
-        CATALOG_LOG_FILE_EXTENSION, PersistCatalogResult, Result, log_failed_head_diagnostics,
-    },
+    object_store::{CATALOG_LOG_FILE_EXTENSION, PersistCatalogResult, Result},
     serialize::versions::v1::{load_catalog, serialize_catalog_file},
 };
 
@@ -151,16 +149,15 @@ impl ObjectStoreCatalog {
     /// the catalog has been initialized, and is used to check if there is a Core catalog on server
     /// start.
     pub(crate) async fn checkpoint_exists(&self) -> Result<bool> {
-        let path = CatalogFilePath::checkpoint(&self.prefix);
-        match self.store.head(&path).await {
+        match self
+            .store
+            .head(&CatalogFilePath::checkpoint(&self.prefix))
+            .await
+        {
             Ok(_) => Ok(true),
             // nothing there, so we don't need to migrate:
             Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(error) => {
-                let diagnostics =
-                    log_failed_head_diagnostics(self.store.as_ref(), &path, &error).await;
-                Err(anyhow::Error::new(error).context(diagnostics))?
-            }
+            Err(error) => Err(error)?,
         }
     }
 }

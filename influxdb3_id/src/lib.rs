@@ -5,10 +5,17 @@ use std::fmt::Display;
 use std::hash::Hash;
 use std::num::ParseIntError;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 mod serialize;
 pub use serialize::{SerdeVecMap, SerdeVecSet};
+
+#[derive(Debug, thiserror::Error)]
+#[error("unable to parse as integer: {0}")]
+pub struct IdParsingError(#[from] ParseIntError);
 
 pub trait CatalogId: Default + Hash + Eq + Copy + Ord + Serialize + Display {
     type Integer;
@@ -16,6 +23,8 @@ pub trait CatalogId: Default + Hash + Eq + Copy + Ord + Serialize + Display {
     const MAX: Self;
 
     fn next(&self) -> Self;
+
+    fn checked_next(&self) -> Option<Self>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +45,10 @@ macro_rules! catalog_identifier_type {
 
             fn next(&self) -> Self {
                 Self::new(self.0.checked_add(1).expect("incrementing id overflow"))
+            }
+
+            fn checked_next(&self) -> Option<Self> {
+                self.0.checked_add(1).map(Self::new)
             }
         }
 
@@ -79,16 +92,19 @@ macro_rules! catalog_identifier_type {
 }
 
 catalog_identifier_type!(NodeId, u32);
+catalog_identifier_type!(QueryGroupId, u32);
 catalog_identifier_type!(DbId, u32);
 catalog_identifier_type!(TableId, u32);
 catalog_identifier_type!(TriggerId, u32);
 catalog_identifier_type!(ColumnId, u16);
-catalog_identifier_type!(TagId, u8);
+catalog_identifier_type!(TagId, u16);
 catalog_identifier_type!(FieldFamilyId, u16);
 catalog_identifier_type!(FieldId, u16);
 catalog_identifier_type!(LastCacheId, u16);
 catalog_identifier_type!(DistinctCacheId, u16);
 catalog_identifier_type!(TokenId, u64);
+catalog_identifier_type!(UserId, u64);
+catalog_identifier_type!(RoleId, u64);
 
 /// The next file id to be used when persisting `ParquetFile`s
 pub static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -101,7 +117,7 @@ impl ParquetFileId {
     pub fn new() -> Self {
         Self(
             NEXT_FILE_ID
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
                 .expect("Overflowed with Parquet File IDs"),
         )
     }
@@ -110,8 +126,12 @@ impl ParquetFileId {
         Self(NEXT_FILE_ID.load(Ordering::SeqCst))
     }
 
-    pub fn set_next_id(&self) {
-        NEXT_FILE_ID.store(self.0, Ordering::SeqCst)
+    /// Advance the global counter to at least this id, never moving it backwards.
+    /// Restoring persisted state must not lower the counter: ids at or above a
+    /// previously observed value may already be in use, and reusing them would
+    /// collide (see #5586).
+    pub fn advance_next_id(&self) {
+        NEXT_FILE_ID.fetch_max(self.0, Ordering::SeqCst);
     }
 
     pub fn as_u64(&self) -> u64 {
@@ -134,23 +154,33 @@ impl Default for ParquetFileId {
 /// Used for addressing into `TableIndex`-related collections.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TableIndexId {
-    node_id: String,
+    node_id: Arc<str>,
     db_id: DbId,
     table_id: TableId,
 }
 
 impl TableIndexId {
     /// Create a new FullTableId
-    pub fn new(node_id: impl Into<String>, db_id: DbId, table_id: TableId) -> Self {
+    pub fn new(
+        node_id: cfg_select! {
+            any(test, feature = "test_helpers") => { impl Into<Arc<str>> },
+            _ => { Arc<str> }
+        },
+        db_id: DbId,
+        table_id: TableId,
+    ) -> Self {
+        #[cfg(any(test, feature = "test_helpers"))]
+        let node_id = node_id.into();
+
         Self {
-            node_id: node_id.into(),
+            node_id,
             db_id,
             table_id,
         }
     }
 
     /// Get the node_id
-    pub fn node_id(&self) -> &str {
+    pub fn node_id(&self) -> &Arc<str> {
         &self.node_id
     }
 
@@ -255,3 +285,18 @@ impl From<&TagId> for ColumnIdentifier {
         Self::Tag(*id)
     }
 }
+
+/// Shard identifier within a window (initially always 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct ShardId(pub u32);
+
+impl fmt::Display for ShardId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Keep the legacy `p` prefix because object-store paths still encode
+        // shard IDs as `p{shard_id}` for compatibility.
+        write!(f, "p{}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests;

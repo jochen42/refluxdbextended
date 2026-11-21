@@ -7,7 +7,10 @@ use arrow::{
         ArrayRef, Float32Array, Float64Array, RecordBatchOptions, StringArray, downcast_array,
         new_null_array,
     },
-    compute::kernels::sort::{SortColumn, SortOptions, lexsort},
+    compute::{
+        cast,
+        kernels::sort::{SortColumn, SortOptions, lexsort},
+    },
     datatypes::{DataType, Schema},
     error::ArrowError,
     record_batch::RecordBatch,
@@ -95,6 +98,34 @@ pub fn batches_to_lines(batches: &[RecordBatch]) -> Vec<String> {
 /// comparing in tests where sorting does not matter.
 pub fn batches_to_sorted_lines(batches: &[RecordBatch]) -> Vec<String> {
     sort_lines(batches_to_lines(batches))
+}
+
+/// Returns the values of string column `column` across `batches` in row
+/// order, decoded from either plain or dictionary encoding.
+///
+/// # Panics
+///
+/// Panics if the column is missing from any batch, holds a null, or does not
+/// cast to a string.
+pub fn string_column_values(batches: &[RecordBatch], column: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for batch in batches {
+        let index = batch
+            .schema()
+            .index_of(column)
+            .unwrap_or_else(|_| panic!("batch has no '{column}' column"));
+        // Cast rather than matching on the encoding, so dictionary encoded
+        // columns (e.g. tags) decode the same as plain strings.
+        let strings =
+            cast(batch.column(index), &DataType::Utf8).expect("string column casts to Utf8");
+        let strings: StringArray = downcast_array(&strings);
+        values.extend(
+            strings
+                .iter()
+                .map(|value| value.expect("non-null value").to_string()),
+        );
+    }
+    values
 }
 
 /// Sorts the lines (assumed to be the output of `batches_to_lines` for stable comparison)
@@ -239,11 +270,23 @@ static REGEX_METRICS: LazyLock<Regex> =
 static REGEX_TIMING: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[0-9]+(\.[0-9]+)?.s").expect("timing regex"));
 
-/// Matches things like `FilterExec: .*` and `DataSourceExec: .*`
+/// Matches things like `FilterExec: .*`, `DataSourceExec: .*`, `Filter: .*`,
+/// and `TableScan: .*`
 ///
-/// Should be used in combination w/ [`REGEX_TIME_OP`].
+/// Should be used in combination w/ [`REGEX_TIME_OP`] and [`REGEX_TIMESTAMP_NANOSECOND`].
+///
+/// Example matches:
+/// * `FilterExec: time @compactor/src/components/df_planner/planner_v1.rs >= 123456789, projection=[tag0 @compactor/tests/steady_state/vary_l0_file_overlap.rs]`
+/// * `Filter: m0.time >= TimestampNanosecond(1775484002505303000, None)`
+/// * `TableScan: m0 projection=[tag0, time], partial_filters=[m0.time >= TimestampNanosecond(1775484002505303000, None)]`
 static REGEX_FILTER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new("(?P<prefix>(FilterExec)|(DataSourceExec): )(?P<expr>.*)").expect("filter regex")
+    Regex::new("(?P<prefix>(FilterExec)|(DataSourceExec)|(Filter)|(TableScan): )(?P<expr>.*)")
+        .expect("filter regex")
+});
+
+/// Matches things like `TimestampNanosecond(1773673285696531000, None)` in logical plan output
+static REGEX_TIMESTAMP_NANOSECOND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"TimestampNanosecond\(\s*(?P<value>-?[0-9]+)").expect("timestamp nanosecond regex")
 });
 
 /// Matches things like `time@3 < -9223372036854775808` and `time_min@2 > 1641031200399937022`
@@ -263,12 +306,13 @@ pub fn strip_table_lines(s: Cow<'_, str>) -> String {
 }
 
 fn normalize_time_ops(s: &str) -> String {
-    REGEX_TIME_OP
-        .replace_all(s, |c: &Captures<'_>| {
-            let prefix = c.name("prefix").expect("always captures").as_str();
-            let suffix = c.name("suffix").map_or("", |m| m.as_str());
-            format!("{prefix}<REDACTED>{suffix}")
-        })
+    let s = REGEX_TIME_OP.replace_all(s, |c: &Captures<'_>| {
+        let prefix = c.name("prefix").expect("always captures").as_str();
+        let suffix = c.name("suffix").map_or("", |m| m.as_str());
+        format!("{prefix}<REDACTED>{suffix}")
+    });
+    REGEX_TIMESTAMP_NANOSECOND
+        .replace_all(&s, "TimestampNanosecond(<REDACTED>")
         .to_string()
 }
 
@@ -463,11 +507,15 @@ impl Normalizer {
         //
         // Converts:
         // FilterExec: time@2 < -9223372036854775808 OR time@2 > 1640995204240217000
-        // DataSourceExec: limit=None, partitions={...}, predicate=time@2 > 1640995204240217000, pruning_predicate=time@2 > 1640995204240217000, output_ordering=[...], projection=[...]
+        // DataSourceExec: limit=None, partitions={...}, predicate=time@2 > 1640995204240217000, ...
+        // Filter: m0.time >= TimestampNanosecond(1773673285696531000, None)
+        // TableScan: m0 projection=[tag0, time], partial_filters=[m0.time >= TimestampNanosecond(1773673285696531000, None)]
         //
         // to
         // FilterExec: time@2 < <REDACTED> OR time@2 > <REDACTED>
-        // DataSourceExec: limit=None, partitions={...}, predicate=time@2 > <REDACTED>, pruning_predicate=time@2 > <REDACTED>, output_ordering=[...], projection=[...]
+        // DataSourceExec: limit=None, partitions={...}, predicate=time@2 > <REDACTED>, ...
+        // Filter: m0.time >= TimestampNanosecond(<REDACTED>, None)
+        // TableScan: m0 projection=[tag0, time], partial_filters=[m0.time >= TimestampNanosecond(<REDACTED>, None)]
         if *normalized_filters {
             current_results = current_results
                 .into_iter()
@@ -591,3 +639,38 @@ impl PartialEq<Self> for Formatter {
 }
 
 impl Eq for Formatter {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalizer_filters() {
+        let mut normalizer = Normalizer::new();
+        normalizer.normalized_filters = true;
+
+        let cases = vec![
+            (
+                "FilterExec: time@3 >= 123456789",
+                "FilterExec: time@3 >= <REDACTED>",
+            ),
+            (
+                "Filter: m0.time >= TimestampNanosecond(1775484002505303000, None)",
+                "Filter: m0.time >= TimestampNanosecond(<REDACTED>, None)",
+            ),
+            (
+                "TableScan: m0 projection=[tag0, time], partial_filters=[m0.time >= TimestampNanosecond(1775484002505303000, None)]",
+                "TableScan: m0 projection=[tag0, time], partial_filters=[m0.time >= TimestampNanosecond(<REDACTED>, None)]",
+            ),
+            (
+                "FilterExec: time @compactor/src/components/df_planner/planner_v1.rs >= 123456789",
+                "FilterExec: time @compactor/src/components/df_planner/planner_v1.rs >= 123456789", // Current behavior: no redact
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let result = normalizer.normalize_text(vec![input.to_string()]);
+            assert_eq!(result[0], expected, "Input: {}", input);
+        }
+    }
+}

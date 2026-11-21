@@ -1,9 +1,11 @@
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use std::{borrow::Cow, future::Future};
 
+use crate::adaptive_put::AdaptivePutExt;
 use backon::{ExponentialBuilder, Retryable};
+use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
 use object_store::{
     Error as ObjectStoreError, GetOptions, GetResult, ListResult, ObjectMeta, ObjectStore,
@@ -86,7 +88,7 @@ fn get_default_retry_params() -> RetryParams {
 
 async fn retry_operation<T, F, Fut>(
     retry_params: RetryParams,
-    context_message: String,
+    context_message: &str,
     operation_label: &'static str,
     path: &Path,
     default_should_retry: Option<fn(&ObjectStoreError) -> bool>,
@@ -98,14 +100,11 @@ where
 {
     let retry_builder = retry_params.exponential_builder();
 
-    let retryable = op.retry(&retry_builder).notify({
-        move |err: &ObjectStoreError, dur: Duration| {
-            warn!(
-                "{context_message}: Retrying object store {operation_label} operation for {path} after error: {err}. Retry after {}ms",
-                dur.as_millis()
-            );
-        }
-    });
+    let retryable = op.retry(&retry_builder)
+        .notify(move |err: &ObjectStoreError, dur: Duration| warn!(
+            "{context_message}: Retrying object store {operation_label} operation for {path} after error: {err}. Retry after {}ms",
+            dur.as_millis()
+        ));
 
     if let Some(when_fn) = retry_params.when {
         retryable.when(move |err| when_fn(err)).await
@@ -129,7 +128,7 @@ pub trait RetryableObjectStore: ObjectStore {
     async fn get_with_default_retries(
         &self,
         path: &Path,
-        context_message: String,
+        context_message: &str,
     ) -> Result<GetResult> {
         self.get_with_retries(path, context_message, get_default_retry_params())
             .await
@@ -138,7 +137,7 @@ pub trait RetryableObjectStore: ObjectStore {
     async fn get_with_retries(
         &self,
         path: &Path,
-        context_message: String,
+        context_message: &str,
         retry_params: RetryParams,
     ) -> Result<GetResult> {
         let store = self;
@@ -154,11 +153,56 @@ pub trait RetryableObjectStore: ObjectStore {
         .await
     }
 
+    /// GET an object and materialize its body, retrying the two together.
+    ///
+    /// [`Self::get_with_retries`] retries only the request. The body arrives
+    /// as a stream afterwards, and that stream can fail on its own; a caller
+    /// that resolves it after the retry has ended sees a transient network
+    /// error as a hard failure. This method puts the request and the body read
+    /// inside one retried unit, so a failed body read starts a fresh request.
+    ///
+    /// Returns the object metadata alongside the bytes, because a caller that
+    /// needs the ETag or version must read them from the same response the
+    /// bytes came from.
+    async fn get_bytes_with_default_retries(
+        &self,
+        path: &Path,
+        context_message: &str,
+    ) -> Result<(ObjectMeta, Bytes)> {
+        self.get_bytes_with_retries(path, context_message, get_default_retry_params())
+            .await
+    }
+
+    /// [`Self::get_bytes_with_default_retries`] with explicit retry parameters.
+    async fn get_bytes_with_retries(
+        &self,
+        path: &Path,
+        context_message: &str,
+        retry_params: RetryParams,
+    ) -> Result<(ObjectMeta, Bytes)> {
+        let store = self;
+
+        retry_operation(
+            retry_params,
+            context_message,
+            "get_bytes",
+            path,
+            Some(|err| !matches!(err, ObjectStoreError::NotFound { .. })),
+            || async {
+                let result = store.get(path).await?;
+                let meta = result.meta.clone();
+                let bytes = result.bytes().await?;
+                Ok((meta, bytes))
+            },
+        )
+        .await
+    }
+
     async fn get_opts_with_default_retries(
         &self,
         path: &Path,
         options: GetOptions,
-        context_message: String,
+        context_message: &str,
     ) -> Result<GetResult> {
         self.get_opts_with_retries(path, options, context_message, get_default_retry_params())
             .await
@@ -168,7 +212,7 @@ pub trait RetryableObjectStore: ObjectStore {
         &self,
         path: &Path,
         options: GetOptions,
-        context_message: String,
+        context_message: &str,
         retry_params: RetryParams,
     ) -> Result<GetResult> {
         let store = self;
@@ -192,7 +236,7 @@ pub trait RetryableObjectStore: ObjectStore {
     async fn head_with_default_retries(
         &self,
         path: &Path,
-        context_message: String,
+        context_message: &str,
     ) -> Result<ObjectMeta> {
         self.head_with_retries(path, context_message, get_default_retry_params())
             .await
@@ -201,7 +245,7 @@ pub trait RetryableObjectStore: ObjectStore {
     async fn head_with_retries(
         &self,
         path: &Path,
-        context_message: String,
+        context_message: &str,
         retry_params: RetryParams,
     ) -> Result<ObjectMeta> {
         let store = self;
@@ -221,7 +265,7 @@ pub trait RetryableObjectStore: ObjectStore {
         &self,
         path: &Path,
         payload: PutPayload,
-        context_message: String,
+        context_message: &str,
     ) -> Result<PutResult> {
         self.put_with_retries(path, payload, context_message, get_default_retry_params())
             .await
@@ -232,7 +276,7 @@ pub trait RetryableObjectStore: ObjectStore {
         path: &Path,
         payload: PutPayload,
         options: PutOptions,
-        context_message: String,
+        context_message: &str,
     ) -> Result<PutResult> {
         self.put_opts_with_retries(
             path,
@@ -255,17 +299,13 @@ pub trait RetryableObjectStore: ObjectStore {
         path: &Path,
         payload: PutPayload,
         options: PutOptions,
-        context_message: String,
+        context_message: &str,
         retry_params: RetryParams,
     ) -> Result<PutResult> {
         let store = self;
 
-        retry_operation(
-            retry_params,
-            context_message,
-            "put_opts",
-            path,
-            Some(|err| {
+        let retry_if: Option<fn(&ObjectStoreError) -> bool> = match options.mode {
+            object_store::PutMode::Update(..) => Some(|err| {
                 !matches!(
                     err,
                     ObjectStoreError::NotFound { .. }
@@ -273,6 +313,29 @@ pub trait RetryableObjectStore: ObjectStore {
                         | ObjectStoreError::AlreadyExists { .. }
                 )
             }),
+            object_store::PutMode::Create => {
+                Some(|err| {
+                    !matches!(
+                        err,
+                        // docs say we should only have to handle `AlreadyExists`: https://docs.rs/object_store/latest/object_store/enum.PutMode.html#variant.Create
+                        ObjectStoreError::AlreadyExists { .. }
+                        // but a different backend may decide to not conform and just return it without
+                        // translating the error
+                        | ObjectStoreError::Precondition { .. }
+                        // and this is returned by the aws backend https://github.com/apache/arrow-rs-object-store/blob/699c4fc675df8bc8d8fbd756c4cc426186513f97/src/aws/mod.rs#L188
+                        | ObjectStoreError::NotImplemented
+                    )
+                })
+            }
+            object_store::PutMode::Overwrite => None,
+        };
+
+        retry_operation(
+            retry_params,
+            context_message,
+            "put_opts",
+            path,
+            retry_if,
             || async { store.put_opts(path, payload.clone(), options.clone()).await },
         )
         .await
@@ -282,7 +345,7 @@ pub trait RetryableObjectStore: ObjectStore {
         &self,
         path: &Path,
         payload: PutPayload,
-        context_message: String,
+        context_message: &str,
         retry_params: RetryParams,
     ) -> Result<PutResult> {
         let path_clone = path.clone();
@@ -294,10 +357,41 @@ pub trait RetryableObjectStore: ObjectStore {
         .await
     }
 
+    async fn put_adaptive_with_default_retries(
+        &self,
+        path: &Path,
+        bytes: Bytes,
+        context_message: &str,
+    ) -> Result<PutResult> {
+        self.put_adaptive_with_retries(path, bytes, context_message, get_default_retry_params())
+            .await
+    }
+
+    async fn put_adaptive_with_retries(
+        &self,
+        path: &Path,
+        bytes: Bytes,
+        context_message: &str,
+        retry_params: RetryParams,
+    ) -> Result<PutResult> {
+        let path_clone = path.clone();
+        let store = self;
+
+        retry_operation(
+            retry_params,
+            context_message,
+            "put_adaptive",
+            path,
+            None,
+            || async { store.put_adaptive(&path_clone, bytes.clone()).await },
+        )
+        .await
+    }
+
     async fn raw_delete_with_retries(
         &self,
         path: &Path,
-        context_message: String,
+        context_message: &str,
         retry_params: RetryParams,
     ) -> Result<()> {
         let path_clone = path.clone();
@@ -317,17 +411,13 @@ pub trait RetryableObjectStore: ObjectStore {
     async fn raw_delete_with_default_retries(
         &self,
         path: &Path,
-        context_message: String,
+        context_message: &str,
     ) -> Result<()> {
         self.raw_delete_with_retries(path, context_message, get_default_retry_params())
             .await
     }
 
-    async fn delete_with_default_retries(
-        &self,
-        path: &Path,
-        context_message: String,
-    ) -> Result<()> {
+    async fn delete_with_default_retries(&self, path: &Path, context_message: &str) -> Result<()> {
         self.delete_with_retries(path, context_message, get_default_retry_params())
             .await
     }
@@ -335,7 +425,7 @@ pub trait RetryableObjectStore: ObjectStore {
     async fn delete_with_retries(
         &self,
         path: &Path,
-        context_message: String,
+        context_message: &str,
         retry_params: RetryParams,
     ) -> Result<()> {
         match self
@@ -350,7 +440,7 @@ pub trait RetryableObjectStore: ObjectStore {
     async fn list_with_delimiter_with_default_retries(
         &self,
         prefix: Option<&Path>,
-        context_message: String,
+        context_message: &str,
     ) -> Result<ListResult> {
         self.list_with_delimiter_with_retries(prefix, context_message, get_default_retry_params())
             .await
@@ -359,7 +449,7 @@ pub trait RetryableObjectStore: ObjectStore {
     async fn list_with_delimiter_with_retries(
         &self,
         prefix: Option<&Path>,
-        context_message: String,
+        context_message: &str,
         retry_params: RetryParams,
     ) -> Result<ListResult> {
         let prefix_clone = prefix.cloned();
@@ -403,7 +493,7 @@ pub trait RetryableObjectStore: ObjectStore {
         &self,
         prefix: Option<&Path>,
         offset: Option<&Path>,
-        context_message: String,
+        context_message: Cow<'static, str>,
     ) -> BoxStream<'static, Result<ObjectMeta>>
     where
         Self: Clone + Send + Sync + 'static,
@@ -415,7 +505,7 @@ pub trait RetryableObjectStore: ObjectStore {
         &self,
         prefix: Option<&Path>,
         offset: Option<&Path>,
-        context_message: String,
+        context_message: Cow<'static, str>,
         retry_params: RetryParams,
     ) -> BoxStream<'static, Result<ObjectMeta>>
     where
@@ -485,7 +575,7 @@ impl RetryableObjectStore for Arc<dyn ObjectStore> {
         &self,
         prefix: Option<&Path>,
         offset: Option<&Path>,
-        context_message: String,
+        context_message: Cow<'static, str>,
         retry_params: RetryParams,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
         let prefix_str = prefix

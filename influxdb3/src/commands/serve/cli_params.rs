@@ -24,7 +24,7 @@ const SENSITIVE_PARAMS: &[&str] = &[
 
 /// List of all known non-sensitive CLI parameters - only used in test but declared at module level
 /// for visibility
-#[allow(dead_code)]
+#[cfg(test)]
 const NON_SENSITIVE_PARAMS: &[&str] = &[
     // Core parameters
     "node-id",
@@ -38,28 +38,33 @@ const NON_SENSITIVE_PARAMS: &[&str] = &[
     "verbose",
     "bucket",
     // Memory and performance parameters
+    "exec-mem-pool-size",
     "exec-mem-pool-bytes",
     "exec-spill-enabled",
     "exec-spill-dir",
     "exec-spill-max-mb",
     "num-datafusion-threads",
     "query-file-limit",
+    "max-concurrent-queries",
+    "force-snapshot-mem-size",
+    "force-snapshot-max-age",
     "force-snapshot-mem-threshold",
     // WAL parameters
     "wal-flush-interval",
-    "wal-snapshot-size",
-    "wal-max-write-buffer-size",
+    "wal-files-per-snapshot",
+    "wal-max-buffered-writes",
     "wal-replay-fail-on-error",
     "wal-replay-concurrency-limit",
     "snapshot-concurrency-limit",
     "snapshotted-wal-files-to-keep",
     "checkpoint-interval",
     // Cache parameters
+    "file-cache-size",
     "parquet-mem-cache-size",
     "parquet-mem-cache-prune-percentage",
     "parquet-mem-cache-prune-interval",
-    "parquet-mem-cache-query-path-duration",
-    "disable-parquet-mem-cache",
+    "file-cache-recency",
+    "disable-file-cache",
     "table-index-cache-max-entries",
     "table-index-cache-concurrency-limit",
     // Distinct cache parameters
@@ -99,9 +104,10 @@ const NON_SENSITIVE_PARAMS: &[&str] = &[
     "gen1-lookback-duration",
     // Logging and tracing parameters
     "log-filter",
+    "disable-log-filter-noise-reduction",
     "log-destination",
     "log-format",
-    "query-log-size",
+    "query-log-max-entries",
     "traces-exporter",
     "traces-exporter-jaeger-agent-host",
     "traces-exporter-jaeger-agent-port",
@@ -123,7 +129,6 @@ const NON_SENSITIVE_PARAMS: &[&str] = &[
     "datafusion-runtime-max-io-events-per-tick",
     "datafusion-runtime-max-blocking-threads",
     // Object store parameters
-    "object-store-cache-endpoint",
     "object-store-connection-limit",
     "object-store-http2-only",
     "object-store-http2-max-frame-size",
@@ -134,6 +139,7 @@ const NON_SENSITIVE_PARAMS: &[&str] = &[
     "object-store-tls-ca",
     // Feature flags and modes
     "disable-authz",
+    "test-mode",
     // Telemetry
     "telemetry-endpoint",
     "disable-telemetry-upload",
@@ -144,9 +150,14 @@ const NON_SENSITIVE_PARAMS: &[&str] = &[
     "plugin-dir",
     "virtual-env-location",
     "package-manager",
+    "disable-package-management",
     "plugin-repo",
+    "restrict-plugin-triggers-to",
+    "async-trigger-concurrency-limit",
     // Other parameters
     "tcp-listener-file-path",
+    // Operator control parameters
+    "operator-socket-path",
     // Tokio console parameters
     "tokio-console-enabled",
     "tokio-console-event-buffer-capacity",

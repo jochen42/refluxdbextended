@@ -34,7 +34,7 @@ pub enum SubCommand {
 
 #[derive(Debug, Parser)]
 pub struct ShowTokensConfig {
-    /// The host URL of the running InfluxDB 3 Enterprise server
+    /// The host URL of the running InfluxDB 3 Core server
     #[clap(
         short = 'H',
         long = "host",
@@ -43,7 +43,7 @@ pub struct ShowTokensConfig {
     )]
     host_url: Url,
 
-    /// The token for authentication with the InfluxDB 3 Enterprise server
+    /// The token for authentication with the InfluxDB 3 Core server
     #[clap(long = "token", env = "INFLUXDB3_AUTH_TOKEN", hide_env_values = true)]
     auth_token: Option<Secret<String>>,
 
@@ -51,7 +51,7 @@ pub struct ShowTokensConfig {
     #[clap(value_enum, long = "format", default_value = "pretty")]
     output_format: Format,
 
-    /// An optional arg to use a custom ca for useful for testing with self signed certs
+    /// An optional arg to use a custom CA, useful for testing with self-signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
 
@@ -79,7 +79,7 @@ pub struct PluginsConfig {
     #[clap(value_enum, long = "format", default_value = "pretty")]
     output_format: Format,
 
-    /// An optional arg to use a custom ca for useful for testing with self signed certs
+    /// An optional arg to use a custom CA, useful for testing with self-signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
 
@@ -111,7 +111,7 @@ pub struct RetentionConfig {
     #[clap(value_enum, long = "format", default_value = "pretty")]
     output_format: Format,
 
-    /// An optional arg to use a custom ca for useful for testing with self signed certs
+    /// An optional arg to use a custom CA, useful for testing with self-signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
 
@@ -143,7 +143,7 @@ pub struct DatabaseConfig {
     #[clap(value_enum, long = "format", default_value = "pretty")]
     output_format: Format,
 
-    /// An optional arg to use a custom ca for useful for testing with self signed certs
+    /// An optional arg to use a custom CA, useful for testing with self-signed certs
     #[clap(long = "tls-ca", env = "INFLUXDB3_TLS_CA")]
     ca_cert: Option<PathBuf>,
 

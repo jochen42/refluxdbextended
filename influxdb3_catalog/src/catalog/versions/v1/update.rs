@@ -10,20 +10,23 @@ use schema::{InfluxColumnType, InfluxFieldType};
 use std::time::Duration;
 
 use super::{
-    Catalog, CatalogSequenceNumber, ColumnDefinition, DatabaseSchema, NUM_TAG_COLUMNS_LIMIT,
-    NodeState, TIME_COLUMN_NAME, TableDefinition,
+    ApiNodeSpec, Catalog, CatalogSequenceNumber, ColumnDefinition, DatabaseSchema,
+    NUM_TAG_COLUMNS_LIMIT, NodeState, TIME_COLUMN_NAME, TableDefinition,
 };
 use crate::catalog::key;
+use crate::error::enterprise::EnterpriseCatalogError;
 use crate::{
     CatalogError, Result,
     catalog::INTERNAL_DB_NAME,
+    error,
     log::versions::v3::{
         AddFieldsLog, CatalogBatch, CreateDatabaseLog, CreateTableLog, DatabaseCatalogOp, DeleteOp,
         DistinctCacheDefinition, FieldDataType, FieldDefinition, LastCacheDefinition,
         LastCacheSize, LastCacheTtl, LastCacheValueColumnsDef, MaxAge, MaxCardinality,
-        NodeCatalogOp, NodeMode, OrderedCatalogBatch, RegisterNodeLog, RetentionPeriod,
-        SetRetentionPeriodLog, SoftDeleteDatabaseLog, SoftDeleteTableLog, StopNodeLog,
-        TriggerDefinition, TriggerSettings, TriggerSpecificationDefinition, ValidPluginFilename,
+        NodeCatalogOp, NodeMode, NodeModes, NodeSpec, OrderedCatalogBatch, RegisterNodeLog,
+        RetentionPeriod, SetRetentionPeriodLog, SoftDeleteDatabaseLog, SoftDeleteTableLog,
+        StopNodeLog, TriggerDefinition, TriggerSettings, TriggerSpecificationDefinition,
+        ValidPluginFilename,
     },
 };
 
@@ -325,10 +328,28 @@ impl Catalog {
         tags: &[impl AsRef<str> + Send + Sync],
         fields: &[(impl AsRef<str> + Send + Sync, FieldDataType)],
     ) -> Result<OrderedCatalogBatch> {
+        self.create_table_opts(
+            db_name,
+            table_name,
+            tags,
+            fields,
+            CreateTableOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn create_table_opts(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        tags: &[impl AsRef<str> + Send + Sync],
+        fields: &[(impl AsRef<str> + Send + Sync, FieldDataType)],
+        options: CreateTableOptions,
+    ) -> Result<OrderedCatalogBatch> {
         info!(db_name, table_name, "create table");
         self.catalog_update_with_retry(|| {
             let mut txn = self.begin(db_name)?;
-            txn.create_table(table_name, tags, fields)?;
+            txn.create_table(table_name, tags, fields, options.retention_period)?;
             Ok(txn.into())
         })
         .await
@@ -413,7 +434,7 @@ impl Catalog {
                 return Err(CatalogError::NotFound(format!("database id: {}", db_id)));
             };
             let Some(_table_def) = db.table_definition_by_id(table_id) else {
-                return Err(CatalogError::NotFound(format!("table id: {}", table_id)));
+                return Err(CatalogError::NotFound(format!("table id: {}", db_id)));
             };
 
             let deletion_time = self.time_provider.now().timestamp_nanos();
@@ -455,12 +476,11 @@ impl Catalog {
         })
         .await
     }
-
-    #[allow(clippy::too_many_arguments)]
     pub async fn create_distinct_cache(
         &self,
         db_name: &str,
         table_name: &str,
+        node_spec: ApiNodeSpec,
         cache_name: Option<&str>,
         columns: &[impl AsRef<str> + Send + Sync],
         max_cardinality: MaxCardinality,
@@ -528,6 +548,7 @@ impl Catalog {
                     DistinctCacheDefinition {
                         table_id: tbl.table_id,
                         table_name: Arc::clone(&tbl.table_name),
+                        node_spec: NodeSpec::try_from((node_spec.clone(), self))?,
                         cache_id,
                         cache_name,
                         column_ids,
@@ -539,12 +560,11 @@ impl Catalog {
         })
         .await
     }
-
-    #[allow(clippy::too_many_arguments)]
     pub async fn create_last_cache(
         &self,
         db_name: &str,
         table_name: &str,
+        node_spec: ApiNodeSpec,
         cache_name: Option<&str>,
         key_columns: Option<&[impl AsRef<str> + Send + Sync]>,
         value_columns: Option<&[impl AsRef<str> + Send + Sync]>,
@@ -648,6 +668,7 @@ impl Catalog {
                     table_id: tbl.table_id,
                     table: Arc::clone(&tbl.table_name),
                     id: cache_id,
+                    node_spec: NodeSpec::try_from((node_spec.clone(), self))?,
                     name: cache_name,
                     key_columns: key_ids,
                     value_columns,
@@ -660,13 +681,12 @@ impl Catalog {
     }
 
     /// Insert a new trigger for the processing engine
-    #[allow(clippy::too_many_arguments)]
     pub async fn create_processing_engine_trigger(
         &self,
         db_name: &str,
         trigger_name: &str,
         plugin_filename: ValidPluginFilename<'_>,
-        node_id: Arc<str>,
+        node_spec: ApiNodeSpec,
         trigger_specification: &str,
         trigger_settings: TriggerSettings,
         trigger_arguments: &Option<HashMap<String, String>>,
@@ -682,6 +702,26 @@ impl Catalog {
                 return Err(CatalogError::AlreadyExists);
             }
 
+            /************* Enterprise-specific handling for the different node types *************/
+
+            // if node ids are explicitly identified, make sure they all have the right mode.
+            if let ApiNodeSpec::Nodes(nodes) = &node_spec {
+                let inner = self.inner.read();
+                for node_name in nodes {
+                    let Some(node) = inner.nodes.get_by_name(node_name.as_str()) else {
+                        return Err(CatalogError::InvalidNodeName(node_name.clone()));
+                    };
+                    if !NodeModes::from(node.modes().clone()).is_processor() {
+                        return Err(EnterpriseCatalogError::InvalidNodeMode {
+                            expected: error::enterprise::NodeMode::Process,
+                        }
+                        .into());
+                    }
+                }
+            }
+
+            /*********** End Enterprise-specific handling for the different node types ***********/
+
             let trigger_id = Arc::make_mut(&mut db)
                 .processing_engine_triggers
                 .get_and_increment_next_id();
@@ -695,7 +735,7 @@ impl Catalog {
                     trigger_name: trigger_name.into(),
                     plugin_filename: plugin_filename.to_string(),
                     database_name: Arc::clone(&db.name),
-                    node_id: Arc::clone(&node_id),
+                    node_spec: NodeSpec::try_from((node_spec.clone(), self))?,
                     trigger: trigger.clone(),
                     trigger_settings,
                     trigger_arguments: trigger_arguments.clone(),
@@ -728,6 +768,7 @@ impl Catalog {
                     SetRetentionPeriodLog {
                         database_name: db.name(),
                         database_id: db.id,
+                        table: None,
                         retention_period: RetentionPeriod::Duration(duration),
                     },
                 )],
@@ -812,6 +853,7 @@ impl DatabaseCatalogTransaction {
                         table_id: table_def.table_id,
                         field_definitions: vec![],
                         key: vec![],
+                        retention_period: None,
                     }));
                 Ok(table_def)
             }
@@ -836,12 +878,20 @@ impl DatabaseCatalogTransaction {
             }),
             None => {
                 if table_def.num_columns() >= self.columns_per_table_limit {
-                    return Err(CatalogError::TooManyColumns(self.columns_per_table_limit));
+                    return Err(CatalogError::too_many_columns(
+                        table_name,
+                        table_def.num_columns() + 1,
+                        self.columns_per_table_limit,
+                    ));
                 }
                 if matches!(column_type, FieldDataType::Tag)
                     && table_def.num_tag_columns() >= NUM_TAG_COLUMNS_LIMIT
                 {
-                    return Err(CatalogError::TooManyTagColumns(NUM_TAG_COLUMNS_LIMIT));
+                    return Err(CatalogError::too_many_tag_columns(
+                        table_name,
+                        table_def.num_tag_columns() + 1,
+                        NUM_TAG_COLUMNS_LIMIT,
+                    ));
                 }
                 let database_id = self.database_schema.id;
                 let database_name = Arc::clone(&self.database_schema.name);
@@ -878,6 +928,7 @@ impl DatabaseCatalogTransaction {
         table_name: &str,
         tags: &[impl AsRef<str>],
         fields: &[(impl AsRef<str>, FieldDataType)],
+        retention_period: Option<Duration>,
     ) -> Result<()> {
         debug!(table_name, "create table in catalog transaction");
         if self.database_schema.table_definition(table_name).is_some() {
@@ -890,10 +941,18 @@ impl DatabaseCatalogTransaction {
             });
         }
         if tags.len() > NUM_TAG_COLUMNS_LIMIT {
-            return Err(CatalogError::TooManyTagColumns(NUM_TAG_COLUMNS_LIMIT));
+            return Err(CatalogError::too_many_tag_columns(
+                table_name,
+                tags.len(),
+                NUM_TAG_COLUMNS_LIMIT,
+            ));
         }
         if tags.len() + fields.len() > self.columns_per_table_limit - 1 {
-            return Err(CatalogError::TooManyColumns(self.columns_per_table_limit));
+            return Err(CatalogError::too_many_columns(
+                table_name,
+                tags.len() + fields.len() + 1,
+                self.columns_per_table_limit,
+            ));
         }
 
         // Validate tag and field names using the same rules as the line protocol parser
@@ -957,6 +1016,7 @@ impl DatabaseCatalogTransaction {
                 table_id,
                 field_definitions,
                 key,
+                retention_period,
             }));
 
         Ok(())

@@ -2,83 +2,65 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authz::{
-    Action as IoxAction, Authorization, Authorizer as IoxAuthorizer, Error as IoxError,
-    Permission as IoxPermission, Resource as IoxResource, Target as IoxTarget,
+    Authorization, Authorizer as IoxAuthorizer, Error as IoxError, Permission as IoxPermission,
 };
-use influxdb3_id::{DbId, TokenId};
+use indexmap::IndexMap;
+use influxdb3_id::{DbId, TokenId, UserId};
 use iox_time::{Time, TimeProvider};
 use observability_deps::tracing::{debug, trace};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::fmt::Debug;
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DatabaseActions(pub u16);
+pub mod authorizer;
+pub mod permissions;
+pub mod role;
 
-impl DatabaseActions {
-    pub const READ: Self = Self(1);
-    pub const WRITE: Self = Self(1 << 1);
-    pub const CREATE: Self = Self(1 << 2);
+pub use authorizer::{
+    CatalogProvider, IdProvider, TokenAuthenticatorAndAuthorizer, TokenPermissionProvider,
+};
 
-    /// True when every action bit in `other` is also set in `self`.
-    pub fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+#[derive(Debug, Copy, Clone, PartialEq, Serialize)]
+pub struct DatabaseActions(u16);
+
+#[derive(Debug, Copy, Clone, PartialEq, Serialize)]
+pub struct CrudActions(u16);
+
+#[derive(Debug, Copy, Clone, PartialEq, Serialize)]
+pub struct SystemActions(u16);
+
+#[derive(Debug, Copy, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct SystemResourceIdentifier(u16);
+
+#[derive(Debug, Clone)]
+pub enum Subject {
+    Token(TokenId),
+    User {
+        user_id: UserId,
+        permissions: role::Permissions,
+    },
+}
+
+impl std::fmt::Display for Subject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Subject::Token(_) => write!(f, "token"),
+            Subject::User { .. } => write!(f, "user"),
+        }
     }
 }
 
-impl std::ops::BitOr for DatabaseActions {
-    type Output = Self;
-
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
-}
-
-impl From<u16> for DatabaseActions {
-    fn from(value: u16) -> Self {
-        DatabaseActions(value)
-    }
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CrudActions(pub u16);
-
-impl CrudActions {
-    pub const READ: Self = Self(1);
-    pub const WRITE: Self = Self(1 << 1);
-    pub const CREATE: Self = Self(1 << 2);
-    pub const DELETE: Self = Self(1 << 3);
-
-    /// True when every action bit in `other` is also set in `self`.
-    pub fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-}
-
-impl std::ops::BitOr for CrudActions {
-    type Output = Self;
-
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
-}
-
-impl From<u16> for CrudActions {
-    fn from(value: u16) -> Self {
-        CrudActions(value)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AccessRequest {
-    /// Access to an existing database.
+    MaybeDatabase(Option<DbId>, DatabaseActions),
     Database(DbId, DatabaseActions),
-    /// Access to a database that is not (yet) in the catalog, e.g. a write that
-    /// auto-creates the database. Only a wildcard database grant can match it,
-    /// because a grant for specific databases is stored by id.
-    UnknownDatabase(DatabaseActions),
+    AnyDatabase(DatabaseActions),
     Token(TokenId, CrudActions),
-    /// Operator-level access: configure endpoints, token management, plugins.
+    System(SystemResourceIdentifier, SystemActions),
+    User(role::UserAction),
+    Role(role::RoleAction),
+    AdminToken(role::AdminTokenAction),
+    ResourceToken(role::TokenAction),
     Admin,
 }
 
@@ -102,6 +84,12 @@ pub enum AuthenticatorError {
     /// Error for missing token (this should really be handled at the HTTP/Grpc API layer itself)
     #[error("missing token to authenticate")]
     MissingToken,
+    /// Error for invalid JWT (bad signature, malformed, etc.)
+    #[error("invalid JWT")]
+    InvalidJwt,
+    /// Error for expired JWT
+    #[error("JWT has expired")]
+    ExpiredJwt,
 }
 
 impl From<AuthenticatorError> for IoxError {
@@ -115,6 +103,11 @@ impl From<AuthenticatorError> for IoxError {
                 IoxError::InvalidToken
             }
             AuthenticatorError::MissingToken => IoxError::NoToken,
+            AuthenticatorError::InvalidJwt => IoxError::InvalidToken,
+            AuthenticatorError::ExpiredJwt => {
+                debug!("JWT has expired");
+                IoxError::InvalidToken
+            }
         }
     }
 }
@@ -127,18 +120,17 @@ pub trait AuthProvider: Debug + Send + Sync + 'static {
         unhashed_token: Option<Vec<u8>>,
     ) -> Result<TokenId, AuthenticatorError>;
 
-    /// Authorize an action for an already authenticated request
+    /// Authorize an action for an already authenticated request.
+    ///
+    /// When auth is disabled, implementations should return `Ok(())`.
+    /// When auth is enabled and `subject` is `None`, implementations should
+    /// return `Unauthorized`.
     async fn authorize_action(
         &self,
-        // you must have a token if you're trying to authorize request
-        token_id: &TokenId,
+        subject: Option<&Subject>,
         access_request: AccessRequest,
     ) -> Result<(), ResourceAuthorizationError>;
 
-    // When authenticating we fetch the token_id and add it to http req extensions and
-    // later lookup extension. This extra indicator allows to check if the missing token
-    // in extension is an authentication issue or not, otherwise need to pass a flag to indicate
-    // whether server has been started with auth flag or not
     fn should_check_token(&self) -> bool;
 
     /// this is only needed so that grpc service can get hold of a `Arc<dyn IoxAuthorizer>`
@@ -147,12 +139,6 @@ pub trait AuthProvider: Debug + Send + Sync + 'static {
 
 pub trait TokenProvider: Send + Debug + Sync + 'static {
     fn get_token(&self, token_hash: Vec<u8>) -> Option<Arc<TokenInfo>>;
-
-    fn get_token_by_id(&self, token_id: &TokenId) -> Option<Arc<TokenInfo>>;
-
-    /// Resolve a database name to its id. Token grants for specific databases
-    /// are stored by id, so name-based requests are resolved through this.
-    fn db_name_to_id(&self, db_name: &str) -> Option<DbId>;
 }
 
 #[derive(Clone, Debug)]
@@ -173,13 +159,15 @@ impl TokenAuthenticator {
     }
 }
 
-impl TokenAuthenticator {
-    /// Look up and validate (existence, expiry) the token for a raw secret.
-    fn authenticate_token(
+#[async_trait]
+impl AuthProvider for TokenAuthenticator {
+    async fn authenticate(
         &self,
-        unhashed_token: Option<&[u8]>,
-    ) -> Result<Arc<TokenInfo>, AuthenticatorError> {
-        let provided = unhashed_token.ok_or(AuthenticatorError::MissingToken)?;
+        unhashed_token: Option<Vec<u8>>,
+    ) -> Result<TokenId, AuthenticatorError> {
+        let provided = unhashed_token
+            .as_deref()
+            .ok_or(AuthenticatorError::MissingToken)?;
         let hashed_token = Sha512::digest(provided);
         if let Some(token) = self.token_provider.get_token(hashed_token.to_vec()) {
             let expiry_ms = token.expiry_millis();
@@ -187,7 +175,7 @@ impl TokenAuthenticator {
             debug!(?expiry_ms, ?current_timestamp_ms, "time comparison");
             let is_active = expiry_ms > current_timestamp_ms;
             if is_active {
-                return Ok(token);
+                return Ok(token.id);
             } else {
                 trace!(token_expiry = ?expiry_ms, "token has expired");
                 let formatted = Time::from_timestamp_millis(expiry_ms)
@@ -202,58 +190,13 @@ impl TokenAuthenticator {
         Err(AuthenticatorError::InvalidToken)
     }
 
-    /// Map an IOx permission (used by the v1 query API and Flight) onto a
-    /// token grant check.
-    fn grants_iox_permission(&self, token: &TokenInfo, permission: &IoxPermission) -> bool {
-        let IoxPermission::ResourceAction(IoxResource::Database(target), action) = permission;
-        let wanted = match action {
-            IoxAction::Read | IoxAction::ReadSchema | IoxAction::Describe => DatabaseActions::READ,
-            IoxAction::Write => DatabaseActions::WRITE,
-            IoxAction::Create => DatabaseActions::CREATE,
-            // Deleting a database is operator-level.
-            IoxAction::Delete => return token.permits(&AccessRequest::Admin),
-        };
-        let request = match target {
-            IoxTarget::ResourceName(name) => match self.token_provider.db_name_to_id(name) {
-                Some(db_id) => AccessRequest::Database(db_id, wanted),
-                None => AccessRequest::UnknownDatabase(wanted),
-            },
-            IoxTarget::ResourceId(_) => AccessRequest::UnknownDatabase(wanted),
-        };
-        token.permits(&request)
-    }
-}
-
-#[async_trait]
-impl AuthProvider for TokenAuthenticator {
-    async fn authenticate(
-        &self,
-        unhashed_token: Option<Vec<u8>>,
-    ) -> Result<TokenId, AuthenticatorError> {
-        self.authenticate_token(unhashed_token.as_deref())
-            .map(|token| token.id)
-    }
-
     async fn authorize_action(
         &self,
-        token_id: &TokenId,
-        access_request: AccessRequest,
+        _subject: Option<&Subject>,
+        _access_request: AccessRequest,
     ) -> Result<(), ResourceAuthorizationError> {
-        // The token may have been deleted between authentication and here.
-        let token = self
-            .token_provider
-            .get_token_by_id(token_id)
-            .ok_or(ResourceAuthorizationError::Unauthorized)?;
-        if token.permits(&access_request) {
-            Ok(())
-        } else {
-            debug!(
-                ?token_id,
-                ?access_request,
-                "token lacks permission for request"
-            );
-            Err(ResourceAuthorizationError::Unauthorized)
-        }
+        // this is a no-op in authenticator
+        Ok(())
     }
 
     fn should_check_token(&self) -> bool {
@@ -273,29 +216,11 @@ impl IoxAuthorizer for TokenAuthenticator {
         token: Option<Vec<u8>>,
         perms: &[IoxPermission],
     ) -> Result<Authorization, IoxError> {
-        let token_info = self.authenticate_token(token.as_deref())?;
-        // Per the `Authorizer` contract, return the subset of requested permissions the token
-        // grants, and `Forbidden` when it grants none of them. Callers such as SHOW DATABASES
-        // rely on the subset to filter their output.
-        //
+        let _token_id = self.authenticate(token).await?;
         // (trevor) The "subject" may just use the `token_id` as a string, but we withheld doing so
         // in order to decided and ensure that we make use of the subject consistently throughout
         // the system. See: https://github.com/influxdata/influxdb/issues/26440
-        if perms.is_empty() {
-            return Ok(Authorization::new(None, vec![]));
-        }
-        let granted: Vec<IoxPermission> = perms
-            .iter()
-            .filter(|perm| self.grants_iox_permission(&token_info, perm))
-            .cloned()
-            .collect();
-        if granted.is_empty() {
-            debug!(token_id = ?token_info.id, ?perms, "token lacks all requested permissions");
-            return Err(IoxError::Forbidden {
-                authorization: Authorization::new(None, vec![]),
-            });
-        }
-        Ok(Authorization::new(None, granted))
+        Ok(Authorization::new(None, perms.to_vec()))
     }
 }
 
@@ -328,7 +253,7 @@ impl AuthProvider for NoAuthAuthenticator {
 
     async fn authorize_action(
         &self,
-        _token_id: &TokenId,
+        _subject: Option<&Subject>,
         _access_request: AccessRequest,
     ) -> Result<(), ResourceAuthorizationError> {
         Ok(())
@@ -391,21 +316,42 @@ impl TokenInfo {
         Some(self.expiry_millis)
     }
 
+    // enterprise only
     pub fn set_permissions(&mut self, all_permissions: Vec<Permission>) {
         self.permissions = all_permissions;
     }
 
-    /// True when at least one of the token's permissions grants `request`.
-    pub fn permits(&self, request: &AccessRequest) -> bool {
-        self.permissions.iter().any(|p| p.grants(request))
-    }
-
+    /// Returns true if this token carries unrestricted admin privileges (the
+    /// `*:*:*` permission) rather than being scoped to specific resources.
+    /// Admin tokens are managed via admin-token permissions, not the
+    /// resource-token permissions held by non-admin roles such as `Member`.
+    ///
+    /// This mirrors the canonical definition the catalog uses elsewhere: an
+    /// admin token is exactly the single `*:*:*` permission (the v2->v3
+    /// migration's `is_admin_permissions`), and `create_token_with_permission`
+    /// enforces the inverse by rejecting a `*` resource type for any non-admin
+    /// token. There is no separate token-type discriminator in the catalog.
     pub fn is_admin(&self) -> bool {
-        self.permissions.iter().any(Permission::is_admin)
+        matches!(
+            self.permissions.as_slice(),
+            [Permission {
+                resource_type: ResourceType::Wildcard,
+                resource_identifier: ResourceIdentifier::Wildcard,
+                actions: Actions::Wildcard,
+                ..
+            }]
+        )
     }
 }
 
 // common types
+
+/// Metadata about a resource, including its name and deletion status
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResourceMetadata {
+    pub name: String,
+    pub deleted: bool,
+}
 
 /// This permission should map exactly to any of these variations
 ///   --permission "db:db1,db2:read"
@@ -420,90 +366,38 @@ impl TokenInfo {
 /// itself. The wildcards at each level makes the setup harder to model everything within a single
 /// enum for example. So, once we add few more resources this should be fairly straightforward to
 /// refine to make certain combinations impossible to set
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Permission {
     pub resource_type: ResourceType,
     pub resource_identifier: ResourceIdentifier,
     pub actions: Actions,
+    /// Optional mapping of resource IDs to their metadata, used when resources are deleted
+    /// but we want to preserve the original names for display purposes
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resource_names: Option<IndexMap<String, ResourceMetadata>>,
 }
 
-impl Permission {
-    /// The `*:*:*` grant that admin tokens carry.
-    pub fn is_admin(&self) -> bool {
-        matches!(
-            (self.resource_type, &self.resource_identifier, self.actions),
-            (
-                ResourceType::Wildcard,
-                ResourceIdentifier::Wildcard,
-                Actions::Wildcard
-            )
-        )
-    }
-
-    /// Whether this single permission covers `request`.
-    pub fn grants(&self, request: &AccessRequest) -> bool {
-        if self.is_admin() {
-            return true;
-        }
-        match *request {
-            AccessRequest::Admin => false,
-            AccessRequest::Database(db_id, wanted) => {
-                self.resource_type == ResourceType::Database
-                    && match &self.resource_identifier {
-                        ResourceIdentifier::Wildcard => true,
-                        ResourceIdentifier::Database(ids) => ids.contains(&db_id),
-                        ResourceIdentifier::Token(_) => false,
-                    }
-                    && self.grants_database_actions(wanted)
-            }
-            AccessRequest::UnknownDatabase(wanted) => {
-                self.resource_type == ResourceType::Database
-                    && self.resource_identifier == ResourceIdentifier::Wildcard
-                    && self.grants_database_actions(wanted)
-            }
-            AccessRequest::Token(token_id, wanted) => {
-                self.resource_type == ResourceType::Token
-                    && match &self.resource_identifier {
-                        ResourceIdentifier::Wildcard => true,
-                        ResourceIdentifier::Token(ids) => ids.contains(&token_id),
-                        ResourceIdentifier::Database(_) => false,
-                    }
-                    && match self.actions {
-                        Actions::Wildcard => true,
-                        Actions::Token(have) => have.contains(wanted),
-                        Actions::Database(_) => false,
-                    }
-            }
-        }
-    }
-
-    fn grants_database_actions(&self, wanted: DatabaseActions) -> bool {
-        match self.actions {
-            Actions::Wildcard => true,
-            Actions::Database(have) => have.contains(wanted),
-            Actions::Token(_) => false,
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Eq, Hash, PartialEq, Serialize)]
 pub enum ResourceType {
     Database,
     Token,
+    System,
     Wildcard,
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize)]
 pub enum ResourceIdentifier {
     Database(Vec<DbId>),
     Token(Vec<TokenId>),
+    System(Vec<SystemResourceIdentifier>),
     Wildcard,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize)]
 pub enum Actions {
     Database(DatabaseActions),
     Token(CrudActions),
+    System(SystemActions),
     Wildcard,
 }
 

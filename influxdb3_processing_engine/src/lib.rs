@@ -1,46 +1,50 @@
 use crate::environment::PythonEnvironmentManager;
 use crate::manager::ProcessingEngineError;
+use influxdb3_processing_engine_telemetry::PluginTriggerInvocationRegistry;
 
-use crate::plugins::PluginContext;
 use crate::plugins::{PluginError, ProcessingEngineEnvironmentManager};
 use anyhow::{Context, anyhow};
 use bytes::Bytes;
 use hashbrown::HashMap;
-use influxdb3_catalog::CatalogError;
-use influxdb3_catalog::catalog::Catalog;
-use influxdb3_catalog::channel::CatalogUpdateReceiver;
-use influxdb3_catalog::log::{
-    CatalogBatch, DatabaseCatalogOp, DeleteOp, DeleteTriggerLog, PluginType, SoftDeleteDatabaseLog,
-    TriggerDefinition, TriggerIdentifier, TriggerSpecificationDefinition, ValidPluginFilename,
+use influxdb3_catalog::catalog::{
+    Catalog, CatalogEvent, CatalogUpdateReceiver, NodeSpec, PluginType,
+    TriggerSpecificationDefinition, ValidPluginFilename,
 };
-use influxdb3_id::DbId;
-use influxdb3_internal_api::query_executor::QueryExecutor;
-use influxdb3_py_api::system_py::CacheStore;
-use influxdb3_sys_events::SysEventStore;
+use influxdb3_id::{DbId, TriggerId};
+use influxdb3_py_api::cache::CacheStore;
+use influxdb3_py_api::logging::PROCESSING_ENGINE_LOGS_TABLE_NAME;
+use influxdb3_py_api::query::QueryEndpoint;
+use influxdb3_py_api::wal::WalFlushElement;
+use influxdb3_py_api::write::WriteEndpoint;
+use influxdb3_shutdown::ShutdownToken;
 use influxdb3_types::http::{
     SchedulePluginTestRequest, SchedulePluginTestResponse, WalPluginTestRequest,
     WalPluginTestResponse,
 };
-use influxdb3_wal::{SnapshotDetails, WalContents, WalFileNotifier};
-use influxdb3_write::Bufferer;
 use iox_http_util::Response;
 use iox_time::TimeProvider;
 use observability_deps::tracing::{debug, error, info, warn};
 use parking_lot::Mutex;
-use std::any::Any;
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::fs as async_fs;
-use tokio::sync::oneshot::Receiver;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
 
 pub mod environment;
+pub mod logging;
 pub mod manager;
 pub mod plugins;
+pub mod query;
+mod scheduler;
+mod scheduler_worker_protocol;
+mod wal;
+mod worker;
+pub mod write;
 
 // Constants for plugin file naming
 const INIT_PY: &str = "__init__.py";
@@ -111,268 +115,256 @@ pub struct ProcessingEngineManagerImpl {
     environment_manager: ProcessingEngineEnvironmentManager,
     catalog: Arc<Catalog>,
     node_id: Arc<str>,
-    write_buffer: Arc<dyn Bufferer>,
-    query_executor: Arc<dyn QueryExecutor>,
+    query_endpoint: Arc<dyn QueryEndpoint>,
     time_provider: Arc<dyn TimeProvider>,
-    sys_event_store: Arc<SysEventStore>,
     cache: Arc<Mutex<CacheStore>>,
-    plugin_event_tx: RwLock<PluginChannels>,
-    /// Stores (original_db_name, request_trigger_paths) during soft delete for use
-    /// during the subsequent hard delete. After soft delete, the database is renamed
-    /// and may be removed from the catalog entirely, so the hard delete handler cannot
-    /// reliably resolve the original name or trigger paths from the catalog.
-    soft_deleted_trigger_info: RwLock<HashMap<DbId, (String, Vec<String>)>>,
+    scheduler: scheduler::Scheduler,
+    worker: Arc<worker::local::PythonTriggerWorker>,
+    /// Maximum concurrent invocations per `run_async` trigger; `NonZeroUsize::MAX`
+    /// means unlimited.
+    async_trigger_concurrency_limit: NonZeroUsize,
+    trigger_registry: RwLock<TriggerRegistry>,
+    /// Cancelled when the server begins shutting down. Passed into each plugin
+    /// execution so that long-running plugins are interrupted and cannot block
+    /// graceful shutdown (see influxdb_pro#2444).
+    plugin_shutdown: CancellationToken,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessingEngineManagerOptions {
+    pub plugin_trigger_invocation_registry: Option<Arc<PluginTriggerInvocationRegistry>>,
+    /// Maximum concurrent invocations per `run_async` trigger; `NonZeroUsize::MAX`
+    /// means unlimited.
+    pub async_trigger_concurrency_limit: NonZeroUsize,
+}
+
+impl Default for ProcessingEngineManagerOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProcessingEngineManagerOptions {
+    pub fn new() -> Self {
+        Self {
+            plugin_trigger_invocation_registry: None,
+            async_trigger_concurrency_limit: NonZeroUsize::MAX,
+        }
+    }
+
+    pub fn with_plugin_trigger_invocation_registry(
+        mut self,
+        plugin_trigger_invocation_registry: Option<Arc<PluginTriggerInvocationRegistry>>,
+    ) -> Self {
+        self.plugin_trigger_invocation_registry = plugin_trigger_invocation_registry;
+        self
+    }
+
+    pub fn with_async_trigger_concurrency_limit(
+        mut self,
+        async_trigger_concurrency_limit: NonZeroUsize,
+    ) -> Self {
+        self.async_trigger_concurrency_limit = async_trigger_concurrency_limit;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+enum WalRouteFilter {
+    AllTables,
+    SingleTable(String),
+}
+
+#[derive(Debug, Clone)]
+struct WalRoute {
+    database_name: Arc<str>,
+    filter: WalRouteFilter,
+}
+
+impl WalRoute {
+    fn matches(&self, database_name: &str, wal_contents: &[WalFlushElement]) -> bool {
+        if self.database_name.as_ref() != database_name {
+            return false;
+        }
+
+        match &self.filter {
+            WalRouteFilter::AllTables => !wal_contents.is_empty(),
+            WalRouteFilter::SingleTable(table_name) => wal_contents
+                .iter()
+                .any(|element| element.table_name.as_ref() == table_name),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TriggerRoute {
+    Wal(WalRoute),
+    Request { path: String },
 }
 
 #[derive(Debug, Default)]
-struct PluginChannels {
-    /// Map of database to wal trigger name to handler
-    wal_triggers: HashMap<String, HashMap<String, mpsc::Sender<WalEvent>>>,
-    /// Map of database to schedule trigger name to handler
-    schedule_triggers: HashMap<String, HashMap<String, mpsc::Sender<ScheduleEvent>>>,
-    /// Map of database to schedule trigger name to the cancellation token used,
-    /// when the trigger is stopped, to make the schedule loop stop awaiting an
-    /// in-flight run (the run itself keeps executing, detached) so it can't block
-    /// shutdown.
-    schedule_cancels: HashMap<String, HashMap<String, CancellationToken>>,
-    /// Map of request path to the request trigger handler
-    request_triggers: HashMap<String, mpsc::Sender<RequestEvent>>,
+struct TriggerRegistry {
+    /// Routing metadata for triggers that receive externally supplied events.
+    routes: HashMap<scheduler::TriggerKey, TriggerRoute>,
+    /// Secondary index: HTTP request triggers are routed by URL path, which
+    /// is all the request handler knows. Maps path -> trigger key.
+    request_paths: HashMap<String, scheduler::TriggerKey>,
 }
 
-const PLUGIN_EVENT_BUFFER_SIZE: usize = 60;
+/// Nominal per-trigger outstanding-invocations capacity. For async triggers a
+/// configured concurrency limit above this raises the capacity to the limit
+/// (see [`scheduler::SchedulerConfig`]).
+pub const TRIGGER_QUEUE_SIZE: usize = 60;
 
-impl PluginChannels {
-    // returns Ok(Some(receiver)) if there was a sender to the named trigger.
-    async fn send_shutdown(
-        &self,
-        db: String,
-        trigger: String,
-        trigger_spec: &TriggerSpecificationDefinition,
-    ) -> Result<Option<Receiver<()>>, ProcessingEngineError> {
-        match trigger_spec {
-            TriggerSpecificationDefinition::SingleTableWalWrite { .. }
-            | TriggerSpecificationDefinition::AllTablesWalWrite => {
-                if let Some(trigger_map) = self.wal_triggers.get(&db)
-                    && let Some(sender) = trigger_map.get(&trigger)
-                {
-                    // create a one shot to wait for the shutdown to complete
-                    let (tx, rx) = oneshot::channel();
-                    if sender.send(WalEvent::Shutdown(tx)).await.is_err() {
-                        return Err(ProcessingEngineError::TriggerShutdownError {
-                            database: db,
-                            trigger_name: trigger,
-                        });
-                    }
-                    return Ok(Some(rx));
-                }
-            }
-            TriggerSpecificationDefinition::Schedule { .. }
-            | TriggerSpecificationDefinition::Every { .. } => {
-                if let Some(trigger_map) = self.schedule_triggers.get(&db)
-                    && let Some(sender) = trigger_map.get(&trigger)
-                {
-                    // cancel any in-flight scheduled plugin run so the trigger task can
-                    // observe the shutdown promptly instead of blocking on the run.
-                    if let Some(token) =
-                        self.schedule_cancels.get(&db).and_then(|m| m.get(&trigger))
-                    {
-                        token.cancel();
-                    }
-                    // create a one shot to wait for the shutdown to complete
-                    let (tx, rx) = oneshot::channel();
-                    if sender.send(ScheduleEvent::Shutdown(tx)).await.is_err() {
-                        return Err(ProcessingEngineError::TriggerShutdownError {
-                            database: db,
-                            trigger_name: trigger,
-                        });
-                    }
-                    return Ok(Some(rx));
-                }
-            }
-            TriggerSpecificationDefinition::RequestPath { .. } => {
-                if let Some(sender) = self.request_triggers.get(&trigger) {
-                    // create a one shot to wait for the shutdown to complete
-                    let (tx, rx) = oneshot::channel();
-                    if sender.send(RequestEvent::Shutdown(tx)).await.is_err() {
-                        return Err(ProcessingEngineError::TriggerShutdownError {
-                            database: db,
-                            trigger_name: trigger,
-                        });
-                    }
-                    return Ok(Some(rx));
-                }
-            }
+impl TriggerRegistry {
+    fn remove_request_path_for_route(&mut self, key: scheduler::TriggerKey, route: TriggerRoute) {
+        if let TriggerRoute::Request { path } = route
+            && self
+                .request_paths
+                .get(&path)
+                .is_some_and(|mapped| *mapped == key)
+        {
+            self.request_paths.remove(&path);
         }
-
-        Ok(None)
     }
 
-    fn remove_trigger(
+    fn insert_route(&mut self, key: scheduler::TriggerKey, route: TriggerRoute) {
+        if let Some(old_route) = self.routes.insert(key, route) {
+            self.remove_request_path_for_route(key, old_route);
+        }
+    }
+
+    fn remove_trigger(&mut self, key: scheduler::TriggerKey) {
+        if let Some(route) = self.routes.remove(&key) {
+            self.remove_request_path_for_route(key, route);
+        }
+    }
+
+    fn remove_all_for_db(&mut self, db_id: DbId) {
+        let keys: Vec<_> = self
+            .routes
+            .keys()
+            .filter(|key| key.db_id == db_id)
+            .copied()
+            .collect();
+        for key in keys {
+            self.remove_trigger(key);
+        }
+    }
+
+    fn add_wal_trigger(
         &mut self,
-        db: String,
-        trigger: String,
-        trigger_spec: &TriggerSpecificationDefinition,
+        key: scheduler::TriggerKey,
+        database_name: Arc<str>,
+        filter: WalRouteFilter,
     ) {
-        match trigger_spec {
-            TriggerSpecificationDefinition::SingleTableWalWrite { .. }
-            | TriggerSpecificationDefinition::AllTablesWalWrite => {
-                if let Some(trigger_map) = self.wal_triggers.get_mut(&db) {
-                    trigger_map.remove(&trigger);
-                }
-            }
-            TriggerSpecificationDefinition::Schedule { .. }
-            | TriggerSpecificationDefinition::Every { .. } => {
-                if let Some(trigger_map) = self.schedule_triggers.get_mut(&db) {
-                    trigger_map.remove(&trigger);
-                }
-                if let Some(cancel_map) = self.schedule_cancels.get_mut(&db) {
-                    cancel_map.remove(&trigger);
-                }
-            }
-            TriggerSpecificationDefinition::RequestPath { .. } => {
-                self.request_triggers.remove(&trigger);
-            }
-        }
+        self.insert_route(
+            key,
+            TriggerRoute::Wal(WalRoute {
+                database_name,
+                filter,
+            }),
+        );
     }
 
-    async fn shutdown_all_for_db(&self, db: &str, request_paths: &[String]) -> Vec<Receiver<()>> {
-        let mut receivers = Vec::new();
+    fn add_request_trigger(&mut self, key: scheduler::TriggerKey, path: String) {
+        self.insert_route(key, TriggerRoute::Request { path: path.clone() });
+        self.request_paths.insert(path, key);
+    }
 
-        if let Some(trigger_map) = self.wal_triggers.get(db) {
-            for (trigger_name, sender) in trigger_map {
-                let (tx, rx) = oneshot::channel();
-                if sender.send(WalEvent::Shutdown(tx)).await.is_err() {
-                    warn!(
-                        db,
-                        trigger_name,
-                        "failed to send shutdown to WAL trigger during database deletion"
-                    );
-                } else {
-                    receivers.push(rx);
-                }
-            }
+    fn wal_invocations(
+        &self,
+        database_name: Arc<str>,
+        wal_contents: Arc<[WalFlushElement]>,
+    ) -> Vec<scheduler::TriggerInvocation> {
+        let wal_contents: Arc<[WalFlushElement]> = wal_contents
+            .iter()
+            .filter(|element| element.table_name.as_ref() != PROCESSING_ENGINE_LOGS_TABLE_NAME)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        if wal_contents.is_empty() {
+            return Vec::new();
         }
 
-        if let Some(trigger_map) = self.schedule_triggers.get(db) {
-            for (trigger_name, sender) in trigger_map {
-                // cancel any in-flight scheduled plugin run so the trigger task can
-                // observe the shutdown promptly instead of blocking on the run.
-                if let Some(token) = self
-                    .schedule_cancels
-                    .get(db)
-                    .and_then(|m| m.get(trigger_name))
-                {
-                    token.cancel();
+        self.routes
+            .iter()
+            .filter_map(|(key, route)| {
+                let TriggerRoute::Wal(route) = route else {
+                    return None;
+                };
+                if !route.matches(&database_name, &wal_contents) {
+                    return None;
                 }
-                let (tx, rx) = oneshot::channel();
-                if sender.send(ScheduleEvent::Shutdown(tx)).await.is_err() {
-                    warn!(
-                        db,
-                        trigger_name,
-                        "failed to send shutdown to schedule trigger during database deletion"
-                    );
-                } else {
-                    receivers.push(rx);
-                }
-            }
-        }
-
-        for path in request_paths {
-            if let Some(sender) = self.request_triggers.get(path.as_str()) {
-                let (tx, rx) = oneshot::channel();
-                if sender.send(RequestEvent::Shutdown(tx)).await.is_err() {
-                    warn!(
-                        db,
-                        path, "failed to send shutdown to request trigger during database deletion"
-                    );
-                } else {
-                    receivers.push(rx);
-                }
-            }
-        }
-
-        receivers
+                Some(scheduler::TriggerInvocation::new(
+                    *key,
+                    scheduler::TriggerPayload::Wal {
+                        database_name: Arc::clone(&database_name),
+                        wal_contents: Arc::clone(&wal_contents),
+                    },
+                ))
+            })
+            .collect()
     }
 
-    fn remove_all_for_db(&mut self, db: &str, request_paths: &[String]) {
-        self.wal_triggers.remove(db);
-        self.schedule_triggers.remove(db);
-        self.schedule_cancels.remove(db);
-        for path in request_paths {
-            self.request_triggers.remove(path.as_str());
-        }
-    }
-
-    fn add_wal_trigger(&mut self, db: String, trigger: String) -> mpsc::Receiver<WalEvent> {
-        let (tx, rx) = mpsc::channel(PLUGIN_EVENT_BUFFER_SIZE);
-        self.wal_triggers.entry(db).or_default().insert(trigger, tx);
-        rx
-    }
-
-    fn add_schedule_trigger(
-        &mut self,
-        db: String,
-        trigger: String,
-        cancel: CancellationToken,
-    ) -> mpsc::Receiver<ScheduleEvent> {
-        let (tx, rx) = mpsc::channel(PLUGIN_EVENT_BUFFER_SIZE);
-        self.schedule_triggers
-            .entry(db.clone())
-            .or_default()
-            .insert(trigger.clone(), tx);
-        self.schedule_cancels
-            .entry(db)
-            .or_default()
-            .insert(trigger, cancel);
-        rx
-    }
-
-    fn add_request_trigger(&mut self, path: String) -> mpsc::Receiver<RequestEvent> {
-        let (tx, rx) = mpsc::channel(PLUGIN_EVENT_BUFFER_SIZE);
-        self.request_triggers.insert(path, tx);
-        rx
-    }
-
-    async fn send_wal_contents(&self, wal_contents: Arc<WalContents>) {
-        for (db, trigger_map) in &self.wal_triggers {
-            for (trigger, sender) in trigger_map {
-                if let Err(e) = sender
-                    .send(WalEvent::WriteWalContents(Arc::clone(&wal_contents)))
-                    .await
-                {
-                    warn!(%e, %db, ?trigger, "error sending wal contents to plugin");
-                }
-            }
-        }
-    }
-
-    async fn send_request(
+    fn request_invocation(
         &self,
         trigger_path: &str,
-        request: Request,
-    ) -> Result<(), ProcessingEngineError> {
-        let event = RequestEvent::Request(request);
-        if let Some(sender) = self.request_triggers.get(trigger_path) {
-            if sender.send(event).await.is_err() {
-                return Err(ProcessingEngineError::RequestTriggerNotFound);
-            }
-        } else {
+        payload: scheduler::RequestPayload,
+    ) -> Result<scheduler::TriggerInvocation, ProcessingEngineError> {
+        let Some(key) = self.request_paths.get(trigger_path).copied() else {
             return Err(ProcessingEngineError::RequestTriggerNotFound);
-        }
+        };
+        let Some(TriggerRoute::Request { .. }) = self.routes.get(&key) else {
+            return Err(ProcessingEngineError::RequestTriggerNotFound);
+        };
 
-        Ok(())
+        let payload = scheduler::TriggerPayload::Request(payload);
+        Ok(scheduler::TriggerInvocation::new(key, payload))
     }
 }
 
 impl ProcessingEngineManagerImpl {
+    async fn enqueue_wal_invocations(
+        scheduler: &scheduler::Scheduler,
+        invocations: Vec<scheduler::TriggerInvocation>,
+    ) {
+        for invocation in invocations {
+            let key = invocation.key;
+            if let Err(e) = scheduler.enqueue(invocation).await {
+                warn!(%e, ?key, "error sending wal contents to plugin");
+            }
+        }
+    }
+
     pub async fn new(
         environment: ProcessingEngineEnvironmentManager,
         catalog: Arc<Catalog>,
         node_id: impl Into<Arc<str>>,
-        write_buffer: Arc<dyn Bufferer>,
-        query_executor: Arc<dyn QueryExecutor>,
+        write_endpoint: Arc<dyn WriteEndpoint>,
+        query_endpoint: Arc<dyn QueryEndpoint>,
         time_provider: Arc<dyn TimeProvider>,
-        sys_event_store: Arc<SysEventStore>,
+    ) -> Result<Arc<Self>, environment::PluginEnvironmentError> {
+        Self::new_with_options(
+            environment,
+            catalog,
+            node_id,
+            write_endpoint,
+            query_endpoint,
+            time_provider,
+            ProcessingEngineManagerOptions::new(),
+        )
+        .await
+    }
+
+    pub async fn new_with_options(
+        environment: ProcessingEngineEnvironmentManager,
+        catalog: Arc<Catalog>,
+        node_id: impl Into<Arc<str>>,
+        write_endpoint: Arc<dyn WriteEndpoint>,
+        query_endpoint: Arc<dyn QueryEndpoint>,
+        time_provider: Arc<dyn TimeProvider>,
+        options: ProcessingEngineManagerOptions,
     ) -> Result<Arc<Self>, environment::PluginEnvironmentError> {
         // if given a plugin dir, try to initialize the virtualenv.
         if environment.plugin_dir.is_some() {
@@ -392,17 +384,48 @@ impl ProcessingEngineManagerImpl {
             Duration::from_secs(10),
         )));
 
+        let node_id = node_id.into();
+        let plugin_trigger_invocation_registry = options.plugin_trigger_invocation_registry;
+        let async_trigger_concurrency_limit = options.async_trigger_concurrency_limit;
+        if async_trigger_concurrency_limit == NonZeroUsize::MAX {
+            info!("async trigger concurrency: unlimited");
+        } else {
+            info!(
+                limit = async_trigger_concurrency_limit.get(),
+                "async trigger concurrency limit configured"
+            );
+        }
+        let plugin_shutdown = CancellationToken::new();
+        let worker = worker::local::make_trigger_worker(worker::local::TriggerWorkerContext {
+            environment_manager: environment.clone(),
+            catalog: Arc::clone(&catalog),
+            node_id: Arc::clone(&node_id),
+            write_endpoint: Arc::clone(&write_endpoint),
+            query_endpoint: Arc::clone(&query_endpoint),
+            time_provider: Arc::clone(&time_provider),
+            cache: Arc::clone(&cache),
+            plugin_shutdown: plugin_shutdown.clone(),
+            plugin_trigger_invocation_registry: plugin_trigger_invocation_registry.clone(),
+        });
+        let scheduler = scheduler::Scheduler::new(Arc::clone(&node_id), {
+            let worker = Arc::clone(&worker);
+            |scheduler| {
+                worker.register_scheduler(scheduler);
+                vec![worker as _]
+            }
+        });
         let pem = Arc::new(Self {
             environment_manager: environment,
             catalog,
-            node_id: node_id.into(),
-            write_buffer,
-            query_executor,
-            sys_event_store,
+            node_id,
+            query_endpoint,
             time_provider,
-            plugin_event_tx: Default::default(),
+            scheduler,
+            worker,
+            async_trigger_concurrency_limit,
+            trigger_registry: Default::default(),
             cache,
-            soft_deleted_trigger_info: Default::default(),
+            plugin_shutdown,
         });
 
         background_catalog_update(Arc::clone(&pem), catalog_sub);
@@ -414,6 +437,38 @@ impl ProcessingEngineManagerImpl {
         Arc::clone(&self.node_id)
     }
 
+    /// Token passed into running plugins; cancel it (via [`Self::shutdown_plugins`])
+    /// to interrupt long-running plugins during graceful shutdown.
+    pub fn plugin_shutdown_token(&self) -> CancellationToken {
+        self.plugin_shutdown.clone()
+    }
+
+    /// Signal all running plugins to abort, so they cannot block graceful shutdown.
+    fn shutdown_plugins(&self) {
+        self.plugin_shutdown.cancel();
+    }
+
+    /// Spawn a task that interrupts running plugins when the server begins shutting
+    /// down. The given [`ShutdownToken`] is obtained from the server's shutdown
+    /// manager; when it fires, all in-flight plugin executions are signalled to abort
+    /// (so a long-running request/schedule plugin cannot block graceful shutdown — see
+    /// influxdb_pro#2444), then the token is marked complete.
+    ///
+    /// Plugins observe the abort signal via the host API (`influxdb3_local.query`,
+    /// `.write_sync`, etc.), which raises `KeyboardInterrupt` — a `BaseException` that a
+    /// plugin's `except Exception` handler cannot swallow. A plugin wedged inside a single
+    /// uninterruptible call cannot observe it, so in-flight request plugins also reply
+    /// immediately on shutdown (see `process_request`) and their abandoned `spawn_blocking`
+    /// thread is released when the server shuts the io runtime down in the background.
+    pub fn shutdown_plugins_on(self: &Arc<Self>, shutdown: ShutdownToken) {
+        let pe = Arc::clone(self);
+        tokio::spawn(async move {
+            shutdown.wait_for_shutdown().await;
+            pe.shutdown_plugins();
+            shutdown.complete();
+        });
+    }
+
     pub async fn validate_plugin_filename<'a>(
         &self,
         name: &'a str,
@@ -423,87 +478,97 @@ impl ProcessingEngineManagerImpl {
     }
 
     pub async fn read_plugin_code(&self, name: &str) -> Result<PluginCode, PluginError> {
-        // if the name starts with gh: then we use the custom repo if set or we need to get it from
-        // the public github repo at https://github.com/influxdata/influxdb3_plugins/tree/main
-        if name.starts_with("gh:") {
-            let plugin_path = name.strip_prefix("gh:").unwrap();
-            let plugin_repo =
-                self.environment_manager.plugin_repo.as_deref().unwrap_or(
-                    "https://raw.githubusercontent.com/influxdata/influxdb3_plugins/main/",
-                );
+        read_plugin_code(&self.environment_manager, name).await
+    }
+}
 
-            // combine the repo and path, adjusting for ending / if needed
-            let url = if plugin_repo.ends_with('/') {
-                format!("{plugin_repo}{plugin_path}")
-            } else {
-                format!("{plugin_repo}/{plugin_path}")
-            };
-
-            let resp = reqwest::get(&url)
-                .await
-                .context("error getting plugin from repository")?;
-
-            // verify the response is a success
-            if !resp.status().is_success() {
-                return Err(PluginError::FetchingFromRepository(resp.status(), url));
-            }
-
-            let resp_body = resp
-                .text()
-                .await
-                .context("error reading plugin from repository")?;
-            return Ok(PluginCode::Github(Arc::from(resp_body)));
+pub(crate) async fn read_plugin_code(
+    environment_manager: &ProcessingEngineEnvironmentManager,
+    name: &str,
+) -> Result<PluginCode, PluginError> {
+    // if the name starts with gh: then we use the custom repo if set or we need to get it from
+    // the public github repo at https://github.com/influxdata/influxdb3_plugins/tree/main
+    if name.starts_with("gh:") {
+        if environment_manager.plugin_dir_only {
+            return Err(PluginError::PluginInstallationDisabled);
         }
 
-        // otherwise we assume it is a local file or directory
-        let plugin_dir = self
-            .environment_manager
-            .plugin_dir
-            .clone()
-            .ok_or(PluginError::NoPluginDir)?;
+        let plugin_path = name.strip_prefix("gh:").unwrap();
+        let plugin_repo = environment_manager
+            .plugin_repo
+            .as_deref()
+            .unwrap_or("https://raw.githubusercontent.com/influxdata/influxdb3_plugins/main/");
 
-        let plugin_name = name.trim_end_matches('/');
+        // combine the repo and path, adjusting for ending / if needed
+        let url = if plugin_repo.ends_with('/') {
+            format!("{plugin_repo}{plugin_path}")
+        } else {
+            format!("{plugin_repo}/{plugin_path}")
+        };
 
-        // Validate path stays within plugin directory (prevents path traversal via .., absolute paths, symlinks)
-        let plugin_path = validate_path_within_plugin_dir(&plugin_dir, plugin_name)?;
+        let resp = reqwest::get(&url)
+            .await
+            .context("error getting plugin from repository")?;
 
-        if !plugin_path.exists() {
+        // verify the response is a success
+        if !resp.status().is_success() {
+            return Err(PluginError::FetchingFromRepository(resp.status(), url));
+        }
+
+        let resp_body = resp
+            .text()
+            .await
+            .context("error reading plugin from repository")?;
+        return Ok(PluginCode::Github(Arc::from(resp_body)));
+    }
+
+    // otherwise we assume it is a local file or directory
+    let plugin_dir = environment_manager
+        .plugin_dir
+        .clone()
+        .ok_or(PluginError::NoPluginDir)?;
+
+    let plugin_name = name.trim_end_matches('/');
+
+    // Validate path stays within plugin directory (prevents path traversal via .., absolute paths, symlinks)
+    let plugin_path = validate_path_within_plugin_dir(&plugin_dir, plugin_name)?;
+
+    if !plugin_path.exists() {
+        return Err(PluginError::ReadPluginError(IoError::new(
+            ErrorKind::NotFound,
+            format!("Plugin not found: {}", plugin_path.display()),
+        )));
+    }
+
+    if plugin_path.is_dir() {
+        let entry_point = plugin_path.join(INIT_PY);
+        if !entry_point.exists() {
             return Err(PluginError::ReadPluginError(IoError::new(
                 ErrorKind::NotFound,
-                format!("Plugin not found: {}", plugin_path.display()),
+                format!(
+                    "Multi-file plugin directory must contain {}: {}",
+                    INIT_PY,
+                    plugin_path.display()
+                ),
             )));
         }
 
-        if plugin_path.is_dir() {
-            let entry_point = plugin_path.join(INIT_PY);
-            if !entry_point.exists() {
-                return Err(PluginError::ReadPluginError(IoError::new(
-                    ErrorKind::NotFound,
-                    format!(
-                        "Multi-file plugin directory must contain {}: {}",
-                        INIT_PY,
-                        plugin_path.display()
-                    ),
-                )));
-            }
+        let code = async_fs::read_to_string(&entry_point).await?;
 
-            let code = async_fs::read_to_string(&entry_point).await?;
-
-            return Ok(PluginCode::LocalDirectory(LocalPluginDirectory {
-                plugin_root: plugin_path,
-                entry_point,
-                last_read_and_code: Mutex::new((SystemTime::now(), Arc::from(code))),
-            }));
-        }
-
-        // Single file plugin
-        let code = async_fs::read_to_string(&plugin_path).await?;
-
-        Ok(PluginCode::Local(LocalPlugin {
-            plugin_path,
+        return Ok(PluginCode::LocalDirectory(LocalPluginDirectory {
+            plugin_root: plugin_path,
+            entry_point,
             last_read_and_code: Mutex::new((SystemTime::now(), Arc::from(code))),
-        }))
+        }));
     }
+
+    // Single file plugin
+    let code = async_fs::read_to_string(&plugin_path).await?;
+
+    Ok(PluginCode::Local(LocalPlugin {
+        plugin_path,
+        last_read_and_code: Mutex::new((SystemTime::now(), Arc::from(code))),
+    }))
 }
 
 #[derive(Debug)]
@@ -522,7 +587,7 @@ impl PluginCode {
         }
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(crate) fn is_directory(&self) -> bool {
         matches!(self, PluginCode::LocalDirectory(_))
     }
@@ -535,7 +600,6 @@ impl PluginCode {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct LocalPlugin {
     plugin_path: PathBuf,
@@ -646,98 +710,106 @@ impl LocalPluginDirectory {
 }
 
 impl ProcessingEngineManagerImpl {
-    // TODO(trevor): should this be id-based and not use names?
     async fn run_trigger(
         self: Arc<Self>,
-        db_name: &str,
-        trigger_name: &str,
+        db_id: DbId,
+        trigger_id: TriggerId,
     ) -> Result<(), ProcessingEngineError> {
-        debug!(db_name, trigger_name, "starting trigger");
-
         {
             let db_schema = self
                 .catalog
-                .db_schema(db_name)
-                .ok_or_else(|| ProcessingEngineError::DatabaseNotFound(db_name.to_string()))?;
+                .db_schema_by_id(&db_id)
+                .ok_or_else(|| ProcessingEngineError::DatabaseNotFound(db_id.to_string()))?;
+            let db_name = Arc::clone(&db_schema.name);
             let trigger = db_schema
                 .processing_engine_triggers
-                .get_by_name(trigger_name)
-                .clone()
-                .ok_or_else(|| CatalogError::ProcessingEngineTriggerNotFound {
-                    database_name: db_name.to_string(),
-                    trigger_name: trigger_name.to_string(),
-                })?;
+                .get_by_id(&trigger_id)
+                .ok_or(ProcessingEngineError::TriggerNotFound { db_id, trigger_id })?;
+            debug!(%db_name, trigger_name = trigger.trigger_name.as_ref(), "starting trigger");
 
-            if trigger.node_id != self.node_id {
+            // OSS does not support multi-node; only run triggers whose node
+            // specification targets every node.
+            if !matches!(trigger.node_spec, NodeSpec::All) {
                 error!(
-                    "Not running trigger {}, as it is configured for node id {}. Multi-node not supported in core.",
-                    trigger_name, trigger.node_id
+                    trigger_name = trigger.trigger_name.as_ref(),
+                    "not running trigger with an enterprise node specification"
+                );
+                return Ok(());
+            }
+            if self.environment_manager.plugin_dir.is_none() {
+                info!(
+                    trigger_name = trigger.trigger_name.as_ref(),
+                    node_id = self.node_id.as_ref(),
+                    "not running trigger because no plugin directory is configured"
                 );
                 return Ok(());
             }
 
-            // Cancellation token used to abandon an in-flight scheduled plugin run
-            // when the trigger is stopped. Only scheduled triggers register it with
-            // the plugin channels; other plugin types ignore it.
-            let cancel = CancellationToken::new();
-            let plugin_context = PluginContext {
-                write_buffer: Arc::clone(&self.write_buffer),
-                query_executor: Arc::clone(&self.query_executor),
-                sys_event_store: Arc::clone(&self.sys_event_store),
-                manager: Arc::clone(&self),
-                cancel: cancel.clone(),
+            // Per-trigger scheduler cancellation token, a child of the node-wide
+            // `plugin_shutdown` token: cancelled on full node shutdown (via the
+            // parent) or on its own when this trigger is disabled/force-deleted.
+            // The scheduler uses it to stop queueing and to drop in-flight worker
+            // attempts; the worker owns any attempt-local plugin cancellation.
+            let cancel = self.plugin_shutdown.child_token();
+            let key = scheduler::TriggerKey { db_id, trigger_id };
+            let scheduler_config = scheduler::SchedulerConfig::new(
+                TRIGGER_QUEUE_SIZE,
+                trigger.trigger_settings.run_async,
+                self.async_trigger_concurrency_limit,
+            );
+            let auto_disable = {
+                let manager = Arc::clone(&self);
+                let trigger = Arc::clone(&trigger);
+                Arc::new(move || {
+                    let manager = Arc::clone(&manager);
+                    let trigger = Arc::clone(&trigger);
+                    Box::pin(async move { manager.disable_trigger_from_scheduler(trigger).await })
+                        as scheduler::AutoDisableFuture
+                }) as scheduler::AutoDisable
             };
-            let plugin_code = Arc::new(self.read_plugin_code(&trigger.plugin_filename).await?);
+            self.scheduler
+                .register_trigger(scheduler::TriggerRegistration {
+                    key,
+                    trigger_definition: Arc::clone(&trigger),
+                    cancel: cancel.clone(),
+                    config: scheduler_config,
+                    auto_disable,
+                })
+                .await;
+
             match trigger.trigger.plugin_type() {
                 PluginType::WalRows => {
-                    let rec = self
-                        .plugin_event_tx
-                        .write()
-                        .await
-                        .add_wal_trigger(db_name.to_string(), trigger_name.to_string());
-
-                    plugins::run_wal_contents_plugin(
-                        db_name.to_string(),
-                        plugin_code,
-                        trigger,
-                        plugin_context,
-                        rec,
-                    )
-                }
-                PluginType::Schedule => {
-                    let rec = self.plugin_event_tx.write().await.add_schedule_trigger(
-                        db_name.to_string(),
-                        trigger_name.to_string(),
-                        cancel.clone(),
+                    let filter = match &trigger.trigger {
+                        TriggerSpecificationDefinition::AllTablesWalWrite => {
+                            WalRouteFilter::AllTables
+                        }
+                        TriggerSpecificationDefinition::SingleTableWalWrite { table_name } => {
+                            WalRouteFilter::SingleTable(table_name.clone())
+                        }
+                        _ => unreachable!(),
+                    };
+                    self.trigger_registry.write().await.add_wal_trigger(
+                        key,
+                        Arc::clone(&trigger.database_name),
+                        filter,
                     );
-
-                    plugins::run_schedule_plugin(
-                        db_name.to_string(),
-                        plugin_code,
-                        trigger,
-                        Arc::clone(&self.time_provider),
-                        plugin_context,
-                        rec,
-                    )?
                 }
+                PluginType::Schedule => plugins::run_schedule_event_source(
+                    Arc::clone(&trigger),
+                    Arc::clone(&self.time_provider),
+                    self.scheduler.clone(),
+                    key,
+                    cancel,
+                )?,
                 PluginType::Request => {
                     let TriggerSpecificationDefinition::RequestPath { path } = &trigger.trigger
                     else {
                         unreachable!()
                     };
-                    let rec = self
-                        .plugin_event_tx
+                    self.trigger_registry
                         .write()
                         .await
-                        .add_request_trigger(path.to_string());
-
-                    plugins::run_request_plugin(
-                        db_name.to_string(),
-                        plugin_code,
-                        trigger,
-                        plugin_context,
-                        rec,
-                    )
+                        .add_request_trigger(key, path.to_string());
                 }
             }
         }
@@ -745,64 +817,45 @@ impl ProcessingEngineManagerImpl {
         Ok(())
     }
 
-    // TODO(trevor): should this be id-based and not use names?
+    pub(crate) async fn disable_trigger_from_scheduler(
+        &self,
+        trigger_definition: Arc<influxdb3_catalog::catalog::TriggerDefinition>,
+    ) -> bool {
+        if let Err(error) = self
+            .catalog
+            .disable_processing_engine_trigger(
+                trigger_definition.database_name.as_ref(),
+                trigger_definition.trigger_name.as_ref(),
+            )
+            .await
+        {
+            warn!(%error, ?trigger_definition, "failed to persist trigger auto-disable");
+            return false;
+        }
+        true
+    }
+
     async fn stop_trigger(
         &self,
-        db_name: &str,
-        trigger_name: &str,
+        db_id: DbId,
+        trigger_id: TriggerId,
     ) -> Result<(), ProcessingEngineError> {
-        let db_schema = self
-            .catalog
-            .db_schema(db_name)
-            .ok_or_else(|| ProcessingEngineError::DatabaseNotFound(db_name.to_string()))?;
-        let trigger = db_schema
-            .processing_engine_triggers
-            .get_by_name(trigger_name)
-            .ok_or_else(|| CatalogError::ProcessingEngineTriggerNotFound {
-                database_name: db_name.to_string(),
-                trigger_name: trigger_name.to_string(),
-            })?;
-
-        let Some(shutdown_rx) = self
-            .plugin_event_tx
-            .write()
-            .await
-            .send_shutdown(
-                db_name.to_string(),
-                trigger_name.to_string(),
-                &trigger.trigger,
-            )
-            .await?
-        else {
-            return Ok(());
-        };
-
-        if shutdown_rx.await.is_err() {
-            warn!(
-                "shutdown trigger receiver dropped, may have received multiple shutdown requests"
-            );
-        } else {
-            self.plugin_event_tx.write().await.remove_trigger(
-                db_name.to_string(),
-                trigger_name.to_string(),
-                &trigger.trigger,
-            );
-        }
-        self.cache
-            .lock()
-            .drop_trigger_cache(db_name.to_string(), trigger_name.to_string());
+        let key = scheduler::TriggerKey { db_id, trigger_id };
+        self.scheduler.shutdown_trigger(key).await;
+        self.trigger_registry.write().await.remove_trigger(key);
+        self.cache.lock().drop_trigger_cache(db_id, trigger_id);
+        self.worker.forget_trigger(key);
 
         Ok(())
     }
 
     pub async fn start_triggers(self: Arc<Self>) {
-        let triggers = self.catalog.active_triggers();
-        for (db_name, trigger_name) in triggers {
-            if let Err(error) = Arc::clone(&self).run_trigger(&db_name, &trigger_name).await {
+        for (db_id, trigger_id) in self.catalog.active_triggers() {
+            if let Err(error) = Arc::clone(&self).run_trigger(db_id, trigger_id).await {
                 error!(
                     ?error,
-                    db_name = %db_name,
-                    trigger_name = %trigger_name,
+                    ?db_id,
+                    ?trigger_id,
                     "failed to start trigger at boot; continuing in degraded state"
                 );
             }
@@ -815,11 +868,11 @@ impl ProcessingEngineManagerImpl {
     pub async fn dry_run_wal_plugin(
         &self,
         request: WalPluginTestRequest,
-        query_executor: Arc<dyn QueryExecutor>,
     ) -> Result<WalPluginTestResponse, plugins::PluginError> {
         {
             let catalog = Arc::clone(&self.catalog);
             let now = self.time_provider.now();
+            let query_endpoint = Arc::clone(&self.query_endpoint);
 
             let code = self.read_plugin_code(&request.filename).await?;
             let cache = Arc::clone(&self.cache);
@@ -829,8 +882,7 @@ impl ProcessingEngineManagerImpl {
                 plugins::run_dry_run_wal_plugin(
                     now,
                     catalog,
-                    query_executor,
-                    Arc::new(plugins::DryRunBufferer::new()),
+                    query_endpoint,
                     code_string,
                     cache,
                     request,
@@ -850,11 +902,11 @@ impl ProcessingEngineManagerImpl {
     pub async fn test_schedule_plugin(
         &self,
         request: SchedulePluginTestRequest,
-        query_executor: Arc<dyn QueryExecutor>,
     ) -> Result<SchedulePluginTestResponse, PluginError> {
         {
             let catalog = Arc::clone(&self.catalog);
             let now = self.time_provider.now();
+            let query_endpoint = Arc::clone(&self.query_endpoint);
 
             let code = self.read_plugin_code(&request.filename).await?;
             let code_string = code.code().to_string();
@@ -864,8 +916,7 @@ impl ProcessingEngineManagerImpl {
                 plugins::run_dry_run_schedule_plugin(
                     now,
                     catalog,
-                    query_executor,
-                    Arc::new(plugins::DryRunBufferer::new()),
+                    query_endpoint,
                     code_string,
                     cache,
                     request,
@@ -892,18 +943,16 @@ impl ProcessingEngineManagerImpl {
     ) -> Result<Response, ProcessingEngineError> {
         // oneshot channel for the response
         let (tx, rx) = oneshot::channel();
-        let request = Request {
-            query_params,
-            headers: request_headers,
-            body: request_body,
-            response_tx: tx,
-        };
+        let payload =
+            scheduler::RequestPayload::new(query_params, request_headers, request_body, tx);
 
-        self.plugin_event_tx
-            .write()
-            .await
-            .send_request(trigger_path, request)
-            .await?;
+        let invocation = {
+            let trigger_registry = self.trigger_registry.read().await;
+            trigger_registry.request_invocation(trigger_path, payload)?
+        };
+        if self.scheduler.enqueue(invocation).await.is_err() {
+            return Err(ProcessingEngineError::RequestTriggerNotFound);
+        }
 
         rx.await.map_err(|e| {
             error!(error = %e, "error receiving response from plugin");
@@ -999,6 +1048,12 @@ impl ProcessingEngineManagerImpl {
         plugin_filename: &str,
         content: &str,
     ) -> Result<(), ProcessingEngineError> {
+        if self.environment_manager.plugin_dir_only {
+            return Err(ProcessingEngineError::PluginError(
+                PluginError::PluginInstallationDisabled,
+            ));
+        }
+
         let plugin_dir = self
             .environment_manager
             .plugin_dir
@@ -1030,6 +1085,12 @@ impl ProcessingEngineManagerImpl {
         plugin_name: &str,
         content: &str,
     ) -> Result<String, ProcessingEngineError> {
+        if self.environment_manager.plugin_dir_only {
+            return Err(ProcessingEngineError::PluginError(
+                PluginError::PluginInstallationDisabled,
+            ));
+        }
+
         for db_schema in self.catalog.list_db_schema() {
             if let Some(trigger) = db_schema
                 .processing_engine_triggers
@@ -1065,12 +1126,61 @@ impl ProcessingEngineManagerImpl {
         ))
     }
 
+    /// Re-fetch a trigger's plugin, then drop the plugin the trigger holds, so that its next run
+    /// loads the new code. A failed fetch leaves the trigger untouched.
+    ///
+    /// Nothing is written to the catalog: Core is one node, and announcing an enabled trigger
+    /// again would register it a second time, because `run_trigger` is not idempotent here.
+    pub async fn refresh_plugin(
+        &self,
+        db: &str,
+        trigger_name: &str,
+        plugin_filename: &str,
+    ) -> Result<(), ProcessingEngineError> {
+        let (db_id, trigger) = self
+            .catalog
+            .db_schema(db)
+            .and_then(|schema| {
+                let trigger = schema
+                    .processing_engine_triggers
+                    .get_by_name(trigger_name)?;
+                Some((schema.id, trigger))
+            })
+            .ok_or_else(|| {
+                influxdb3_catalog::CatalogError::NotFound(format!(
+                    "trigger '{trigger_name}' in database '{db}'"
+                ))
+            })?;
+        if trigger.plugin_filename != plugin_filename {
+            return Err(
+                influxdb3_catalog::CatalogError::invalid_configuration(format!(
+                    "trigger '{trigger_name}' runs plugin '{}', not '{plugin_filename}'",
+                    trigger.plugin_filename
+                ))
+                .into(),
+            );
+        }
+        self.read_plugin_code(plugin_filename).await?;
+
+        self.worker.forget_trigger(scheduler::TriggerKey {
+            db_id,
+            trigger_id: trigger.trigger_id,
+        });
+        Ok(())
+    }
+
     /// Replace an entire plugin directory atomically with new files.
     pub async fn replace_plugin_directory(
         self: &Arc<Self>,
         plugin_name: &str,
         files: Vec<(String, String)>, // Vec of (relative_path, content)
     ) -> Result<String, ProcessingEngineError> {
+        if self.environment_manager.plugin_dir_only {
+            return Err(ProcessingEngineError::PluginError(
+                PluginError::PluginInstallationDisabled,
+            ));
+        }
+
         // Find the trigger to get the plugin filename
         let (db_name, plugin_filename) = {
             let mut result = None;
@@ -1206,58 +1316,6 @@ impl ProcessingEngineManagerImpl {
     }
 }
 
-#[async_trait::async_trait]
-impl WalFileNotifier for ProcessingEngineManagerImpl {
-    async fn notify(&self, write: Arc<WalContents>) {
-        let plugin_channels = self.plugin_event_tx.read().await;
-        plugin_channels.send_wal_contents(write).await;
-    }
-
-    async fn notify_and_snapshot(
-        &self,
-        write: Arc<WalContents>,
-        snapshot_details: SnapshotDetails,
-    ) -> Receiver<SnapshotDetails> {
-        let plugin_channels = self.plugin_event_tx.read().await;
-        plugin_channels.send_wal_contents(write).await;
-
-        // configure a reciever that we immediately close
-        let (tx, rx) = oneshot::channel();
-        tx.send(snapshot_details).ok();
-        rx
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) enum WalEvent {
-    WriteWalContents(Arc<WalContents>),
-    Shutdown(oneshot::Sender<()>),
-}
-
-#[allow(dead_code)]
-pub(crate) enum ScheduleEvent {
-    Shutdown(oneshot::Sender<()>),
-}
-
-#[allow(dead_code)]
-pub(crate) enum RequestEvent {
-    Request(Request),
-    Shutdown(oneshot::Sender<()>),
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) struct Request {
-    pub query_params: HashMap<String, String>,
-    pub headers: HashMap<String, String>,
-    pub body: Bytes,
-    pub response_tx: oneshot::Sender<Response>,
-}
-
 #[derive(Debug)]
 pub struct PluginFileInfo {
     pub plugin_name: Arc<str>,
@@ -1267,207 +1325,100 @@ pub struct PluginFileInfo {
     pub last_modified_millis: i64,
 }
 
-fn request_trigger_paths(catalog: &Catalog, db_id: &DbId) -> Option<Vec<String>> {
-    let db_schema = catalog.db_schema_by_id(db_id)?;
-    Some(
-        db_schema
-            .processing_engine_triggers
-            .resource_iter()
-            .filter_map(|trigger| {
-                if let TriggerSpecificationDefinition::RequestPath { path } = &trigger.trigger {
-                    Some(path.clone())
-                } else {
-                    None
-                }
-            })
-            .collect(),
-    )
-}
-
 fn background_catalog_update(
     processing_engine_manager: Arc<ProcessingEngineManagerImpl>,
     mut subscription: CatalogUpdateReceiver,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(catalog_update) = subscription.recv().await {
-            for batch in catalog_update.batches() {
-                match batch {
-                    CatalogBatch::Database(batch) => {
-                        for op in batch.ops.iter() {
-                            let processing_engine_manager = Arc::clone(&processing_engine_manager);
-                            match op {
-                                DatabaseCatalogOp::CreateTrigger(TriggerDefinition {
-                                    trigger_name,
-                                    database_name,
-                                    disabled,
-                                    ..
-                                }) => {
-                                    if !disabled
-                                        && let Err(error) = processing_engine_manager
-                                            .run_trigger(database_name, trigger_name)
-                                            .await
-                                    {
-                                        error!(?error, "failed to run the created trigger");
-                                    }
-                                }
-                                DatabaseCatalogOp::EnableTrigger(TriggerIdentifier {
-                                    db_name,
-                                    trigger_name,
-                                    ..
-                                }) => {
-                                    if let Err(error) = processing_engine_manager
-                                        .run_trigger(db_name, trigger_name)
-                                        .await
-                                    {
-                                        error!(?error, "failed to run the trigger");
-                                    }
-                                }
-                                DatabaseCatalogOp::DeleteTrigger(DeleteTriggerLog {
-                                    trigger_name,
-                                    force: true,
-                                    ..
-                                }) => {
-                                    if let Err(error) = processing_engine_manager
-                                        .stop_trigger(&batch.database_name, trigger_name)
-                                        .await
-                                    {
-                                        error!(?error, "failed to disable the trigger");
-                                    }
-                                }
-                                DatabaseCatalogOp::DisableTrigger(TriggerIdentifier {
-                                    db_name,
-                                    trigger_name,
-                                    ..
-                                }) => {
-                                    if let Err(error) = processing_engine_manager
-                                        .stop_trigger(db_name, trigger_name)
-                                        .await
-                                    {
-                                        error!(?error, "failed to disable the trigger");
-                                    }
-                                }
-                                DatabaseCatalogOp::SoftDeleteDatabase(SoftDeleteDatabaseLog {
-                                    database_id,
-                                    database_name,
-                                    hard_deletion_time,
-                                    ..
-                                }) => {
-                                    info!(
-                                        %database_name,
-                                        "database soft deleted, disabling all triggers"
-                                    );
-                                    let request_paths = request_trigger_paths(
-                                        &processing_engine_manager.catalog,
-                                        database_id,
-                                    )
-                                    .unwrap_or_else(|| {
-                                        warn!(
-                                            ?database_id,
-                                            "database schema not found when collecting \
-                                             request trigger paths; request triggers \
-                                             may not be cleaned up"
-                                        );
-                                        Vec::new()
-                                    });
-                                    if hard_deletion_time.is_some() {
-                                        // Store info for the subsequent hard delete
-                                        // handler, which cannot resolve the original
-                                        // name from the catalog (the db is renamed on
-                                        // soft delete and may be fully removed on hard
-                                        // delete before the event reaches us).
-                                        processing_engine_manager
-                                            .soft_deleted_trigger_info
-                                            .write()
-                                            .await
-                                            .insert(
-                                                *database_id,
-                                                (database_name.to_string(), request_paths.clone()),
-                                            );
-                                    }
-                                    let shutdown_rxs = processing_engine_manager
-                                        .plugin_event_tx
-                                        .write()
-                                        .await
-                                        .shutdown_all_for_db(database_name, &request_paths)
-                                        .await;
-                                    for rx in shutdown_rxs {
-                                        if rx.await.is_err() {
-                                            warn!(
-                                                %database_name,
-                                                "shutdown receiver dropped during \
-                                                 database soft delete"
-                                            );
-                                        }
-                                    }
-                                    if hard_deletion_time.is_none() {
-                                        // No hard delete will follow, so do
-                                        // full cleanup now.
-                                        processing_engine_manager
-                                            .plugin_event_tx
-                                            .write()
-                                            .await
-                                            .remove_all_for_db(database_name, &request_paths);
-                                        processing_engine_manager
-                                            .cache
-                                            .lock()
-                                            .drop_all_trigger_caches_for_db(database_name);
-                                    }
-                                }
-                                _ => (),
-                            }
+            for event in catalog_update.events() {
+                let processing_engine_manager = Arc::clone(&processing_engine_manager);
+                match event {
+                    CatalogEvent::TriggerCreated { db_id, trigger_id } => {
+                        // Only run if the trigger was created in the enabled state.
+                        if let Some(db_schema) =
+                            processing_engine_manager.catalog.db_schema_by_id(db_id)
+                            && let Some(trigger) =
+                                db_schema.processing_engine_triggers.get_by_id(trigger_id)
+                            && !trigger.disabled
+                            && let Err(error) = Arc::clone(&processing_engine_manager)
+                                .run_trigger(*db_id, *trigger_id)
+                                .await
+                        {
+                            error!(?error, "failed to run the created trigger");
                         }
                     }
-                    CatalogBatch::Delete(batch) => {
-                        for op in batch.ops.iter() {
-                            let processing_engine_manager = Arc::clone(&processing_engine_manager);
-                            if let DeleteOp::DeleteDatabase(db_id) = op {
-                                // Use info stored during soft delete — the catalog may
-                                // have already renamed or removed the database by this
-                                // point.
-                                let Some((database_name, request_paths)) =
-                                    processing_engine_manager
-                                        .soft_deleted_trigger_info
-                                        .write()
-                                        .await
-                                        .remove(db_id)
-                                else {
-                                    warn!(
-                                        ?db_id,
-                                        "no soft delete info found for hard delete, \
-                                         triggers may have already been cleaned up"
-                                    );
-                                    continue;
-                                };
-                                info!(
-                                    %database_name,
-                                    "database hard deleted, removing all triggers"
-                                );
-                                let shutdown_rxs = processing_engine_manager
-                                    .plugin_event_tx
-                                    .write()
-                                    .await
-                                    .shutdown_all_for_db(&database_name, &request_paths)
-                                    .await;
-                                for rx in shutdown_rxs {
-                                    if rx.await.is_err() {
-                                        warn!(
-                                            %database_name,
-                                            "shutdown receiver dropped during \
-                                             database hard delete"
-                                        );
-                                    }
-                                }
-                                processing_engine_manager
-                                    .plugin_event_tx
-                                    .write()
-                                    .await
-                                    .remove_all_for_db(&database_name, &request_paths);
-                                processing_engine_manager
-                                    .cache
-                                    .lock()
-                                    .drop_all_trigger_caches_for_db(&database_name);
-                            }
+                    CatalogEvent::TriggerEnabled { db_id, trigger_id } => {
+                        if let Err(error) = Arc::clone(&processing_engine_manager)
+                            .run_trigger(*db_id, *trigger_id)
+                            .await
+                        {
+                            error!(?error, "failed to run the trigger");
                         }
+                    }
+                    CatalogEvent::TriggerDeleted {
+                        db_id,
+                        trigger_id,
+                        force: true,
+                    } => {
+                        if let Err(error) = processing_engine_manager
+                            .stop_trigger(*db_id, *trigger_id)
+                            .await
+                        {
+                            error!(?error, "failed to stop the deleted trigger");
+                        }
+                    }
+                    CatalogEvent::TriggerDisabled { db_id, trigger_id } => {
+                        if let Err(error) = processing_engine_manager
+                            .stop_trigger(*db_id, *trigger_id)
+                            .await
+                        {
+                            error!(?error, "failed to disable the trigger");
+                        }
+                    }
+                    CatalogEvent::DatabaseSoftDeleted { db_id } => {
+                        info!(?db_id, "database soft deleted, disabling all triggers");
+                        // If a hard delete is scheduled, defer full cleanup to the
+                        // hard-delete handler; otherwise tear everything down now.
+                        let hard_delete_pending = processing_engine_manager
+                            .catalog
+                            .db_schema_by_id(db_id)
+                            .is_some_and(|db| db.hard_delete_time.is_some());
+                        processing_engine_manager
+                            .scheduler
+                            .shutdown_triggers_for_db(*db_id)
+                            .await;
+                        // must run after scheduler shutdown
+                        processing_engine_manager.worker.forget_all_for_db(*db_id);
+                        if !hard_delete_pending {
+                            processing_engine_manager
+                                .trigger_registry
+                                .write()
+                                .await
+                                .remove_all_for_db(*db_id);
+                            processing_engine_manager
+                                .cache
+                                .lock()
+                                .drop_all_trigger_caches_for_db(*db_id);
+                        }
+                    }
+                    CatalogEvent::DatabaseHardDeleted { db_id } => {
+                        info!(?db_id, "database hard deleted, removing all triggers");
+                        processing_engine_manager
+                            .scheduler
+                            .shutdown_triggers_for_db(*db_id)
+                            .await;
+                        // must run after scheduler shutdown
+                        processing_engine_manager.worker.forget_all_for_db(*db_id);
+                        processing_engine_manager
+                            .trigger_registry
+                            .write()
+                            .await
+                            .remove_all_for_db(*db_id);
+                        processing_engine_manager
+                            .cache
+                            .lock()
+                            .drop_all_trigger_caches_for_db(*db_id);
                     }
                     _ => (),
                 }

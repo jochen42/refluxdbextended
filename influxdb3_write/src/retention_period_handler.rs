@@ -22,7 +22,7 @@ pub struct RetentionPeriodHandler {
     catalog: Arc<Catalog>,
     time_provider: Arc<dyn TimeProvider>,
     check_interval: Duration,
-    node_id: String,
+    node_id: Arc<str>,
 }
 
 impl RetentionPeriodHandler {
@@ -32,7 +32,7 @@ impl RetentionPeriodHandler {
         catalog: Arc<Catalog>,
         time_provider: Arc<dyn TimeProvider>,
         check_interval: Duration,
-        node_id: String,
+        node_id: Arc<str>,
     ) -> Self {
         Self {
             table_index_cache,
@@ -85,8 +85,8 @@ impl RetentionPeriodHandler {
         );
 
         // Process each database and table with a retention policy
-        for ((db_id, table_id), cutoff_time_ns) in cutoff_map {
-            self.enforce_retention_for_table(db_id, table_id, cutoff_time_ns)
+        for ((db_id, table_id), cutoff_time) in cutoff_map {
+            self.enforce_retention_for_table(db_id, table_id, cutoff_time.timestamp_nanos())
                 .await;
         }
     }
@@ -134,7 +134,7 @@ impl RetentionPeriodHandler {
 
         match self
             .table_index_cache
-            .purge_expired(&self.node_id, db_id, table_id, cutoff_time_ns)
+            .purge_expired(Arc::clone(&self.node_id), db_id, table_id, cutoff_time_ns)
             .await
         {
             Ok(()) => {

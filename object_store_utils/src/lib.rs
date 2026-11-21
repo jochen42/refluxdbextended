@@ -12,6 +12,12 @@ pub use adaptive_get::{
     AdaptiveGetExt, DEFAULT_GET_CHUNK_SIZE, MAX_CHUNKS_PER_BATCH, SINGLE_GET_THRESHOLD,
 };
 
+mod object_store_health;
+pub use object_store_health::{ErrorCategory, ObjectStoreHealth};
+
+mod observed_object_store;
+pub use observed_object_store::ObservedObjectStore;
+
 mod self_verifying_create;
 pub use self_verifying_create::{
     CONFLICT_METRIC_NAME, NonceCheck, PUT_NONCE_METADATA_KEY, PutNonce, SELF_WRITE_METRIC_NAME,

@@ -2,14 +2,20 @@ use super::*;
 use clap::Parser;
 use iox_time::{MockProvider, Time};
 use object_store::ObjectStore;
-use std::{str::FromStr, sync::Mutex};
+use std::{
+    str::FromStr,
+    sync::{Mutex, OnceLock},
+};
 use tempfile::TempDir;
 
 /// The current object store store configurations.
 enum StoreConfigs {
     Base(ObjectStoreConfig),
-    Source(SourceObjectStoreConfig),
-    Sink(SinkObjectStoreConfig),
+}
+
+fn tls_env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 impl StoreConfigs {
@@ -20,27 +26,15 @@ impl StoreConfigs {
     fn object_store_inner(&self) -> Result<Arc<dyn ObjectStore>, ParseError> {
         match self {
             Self::Base(o) => o.make_object_store(),
-            Self::Source(o) => o.make_object_store(),
-            Self::Sink(o) => o.make_object_store(),
         }
     }
 }
 
 #[test]
 fn explicitly_set_object_store_to_memory() {
-    let configs = vec![
-        StoreConfigs::Base(
-            ObjectStoreConfig::try_parse_from(["server", "--object-store", "memory"]).unwrap(),
-        ),
-        StoreConfigs::Source(
-            SourceObjectStoreConfig::try_parse_from(["server", "--source-object-store", "memory"])
-                .unwrap(),
-        ),
-        StoreConfigs::Sink(
-            SinkObjectStoreConfig::try_parse_from(["server", "--sink-object-store", "memory"])
-                .unwrap(),
-        ),
-    ];
+    let configs = vec![StoreConfigs::Base(
+        ObjectStoreConfig::try_parse_from(["server", "--object-store", "memory"]).unwrap(),
+    )];
     for config in configs {
         let object_store = config.make_object_store().unwrap();
         assert_eq!(&object_store.to_string(), "InMemory")
@@ -48,60 +42,22 @@ fn explicitly_set_object_store_to_memory() {
 }
 
 #[test]
-fn default_url_signer_is_none() {
-    let config = ObjectStoreConfig::try_parse_from(["server", "--object-store", "memory"]).unwrap();
-
-    let signer = make_presigned_url_signer(&config).unwrap();
-    assert!(signer.is_none(), "Expected None, got {signer:?}");
-}
-
-#[test]
 #[cfg(feature = "aws")]
 fn valid_s3_config() {
-    let configs = vec![
-        StoreConfigs::Base(
-            ObjectStoreConfig::try_parse_from([
-                "server",
-                "--object-store",
-                "s3",
-                "--bucket",
-                "mybucket",
-                "--aws-access-key-id",
-                "NotARealAWSAccessKey",
-                "--aws-secret-access-key",
-                "NotARealAWSSecretAccessKey",
-            ])
-            .unwrap(),
-        ),
-        StoreConfigs::Source(
-            SourceObjectStoreConfig::try_parse_from([
-                "server",
-                "--source-object-store",
-                "s3",
-                "--source-bucket",
-                "mybucket",
-                "--source-aws-access-key-id",
-                "NotARealAWSAccessKey",
-                "--source-aws-secret-access-key",
-                "NotARealAWSSecretAccessKey",
-            ])
-            .unwrap(),
-        ),
-        StoreConfigs::Sink(
-            SinkObjectStoreConfig::try_parse_from([
-                "server",
-                "--sink-object-store",
-                "s3",
-                "--sink-bucket",
-                "mybucket",
-                "--sink-aws-access-key-id",
-                "NotARealAWSAccessKey",
-                "--sink-aws-secret-access-key",
-                "NotARealAWSSecretAccessKey",
-            ])
-            .unwrap(),
-        ),
-    ];
+    let configs = vec![StoreConfigs::Base(
+        ObjectStoreConfig::try_parse_from([
+            "server",
+            "--object-store",
+            "s3",
+            "--bucket",
+            "mybucket",
+            "--aws-access-key-id",
+            "NotARealAWSAccessKey",
+            "--aws-secret-access-key",
+            "NotARealAWSSecretAccessKey",
+        ])
+        .unwrap(),
+    )];
 
     for config in configs {
         let object_store = config.make_object_store().unwrap();
@@ -130,15 +86,6 @@ fn valid_s3_endpoint_url() {
 fn invalid_s3_endpoint_url_fails_clap_parsing() {
     let result = ObjectStoreConfig::try_parse_from(["server", "--aws-endpoint", "whatever.com"]);
     assert!(result.is_err(), "{result:?}");
-    let result = SourceObjectStoreConfig::try_parse_from([
-        "server",
-        "--source-aws-endpoint",
-        "whatever.com",
-    ]);
-    assert!(result.is_err(), "{result:?}");
-    let result =
-        SinkObjectStoreConfig::try_parse_from(["server", "--sink-aws-endpoint", "whatever.com"]);
-    assert!(result.is_err(), "{result:?}");
 }
 
 #[test]
@@ -158,48 +105,6 @@ fn s3_config_missing_params() {
 }
 
 #[test]
-#[cfg(feature = "aws")]
-fn valid_s3_url_signer() {
-    let config = ObjectStoreConfig::try_parse_from([
-        "server",
-        "--object-store",
-        "s3",
-        "--bucket",
-        "mybucket",
-        "--aws-access-key-id",
-        "NotARealAWSAccessKey",
-        "--aws-secret-access-key",
-        "NotARealAWSSecretAccessKey",
-    ])
-    .unwrap();
-
-    assert!(make_presigned_url_signer(&config).unwrap().is_some());
-
-    // Even with the aws feature on, object stores (other than local files) shouldn't create a
-    // signer.
-    let config = ObjectStoreConfig::try_parse_from(["server", "--object-store", "memory"]).unwrap();
-
-    let signer = make_presigned_url_signer(&config).unwrap();
-    assert!(signer.is_none(), "Expected None, got {signer:?}");
-}
-
-#[test]
-#[cfg(feature = "aws")]
-fn s3_url_signer_config_missing_params() {
-    let mut config = ObjectStoreConfig::try_parse_from(["server", "--object-store", "s3"]).unwrap();
-
-    // clean out eventual leaks via env variables
-    config.bucket = None;
-
-    let err = make_presigned_url_signer(&config).unwrap_err().to_string();
-
-    assert_eq!(
-        err,
-        "Error configuring Amazon S3: Generic S3 error: Missing bucket name"
-    );
-}
-
-#[test]
 #[cfg(feature = "gcp")]
 fn valid_google_config() {
     use std::io::Write;
@@ -210,44 +115,18 @@ fn valid_google_config() {
     writeln!(file, "{FAKE_KEY}").unwrap();
     let path = file.path().to_str().expect("file path should exist");
 
-    let configs = vec![
-        StoreConfigs::Base(
-            ObjectStoreConfig::try_parse_from([
-                "server",
-                "--object-store",
-                "google",
-                "--bucket",
-                "mybucket",
-                "--google-service-account",
-                path,
-            ])
-            .unwrap(),
-        ),
-        StoreConfigs::Source(
-            SourceObjectStoreConfig::try_parse_from([
-                "server",
-                "--source-object-store",
-                "google",
-                "--source-bucket",
-                "mybucket",
-                "--source-google-service-account",
-                path,
-            ])
-            .unwrap(),
-        ),
-        StoreConfigs::Sink(
-            SinkObjectStoreConfig::try_parse_from([
-                "server",
-                "--sink-object-store",
-                "google",
-                "--sink-bucket",
-                "mybucket",
-                "--sink-google-service-account",
-                path,
-            ])
-            .unwrap(),
-        ),
-    ];
+    let configs = vec![StoreConfigs::Base(
+        ObjectStoreConfig::try_parse_from([
+            "server",
+            "--object-store",
+            "google",
+            "--bucket",
+            "mybucket",
+            "--google-service-account",
+            path,
+        ])
+        .unwrap(),
+    )];
 
     for config in configs {
         let object_store = config.make_object_store().unwrap();
@@ -337,47 +216,6 @@ fn valid_file_config() {
     )
 }
 
-#[tokio::test]
-async fn local_url_signer() {
-    let root = TempDir::new().unwrap();
-    let root_path = root.path().to_str().unwrap();
-    let parquet_file_path = "1/2/something.parquet";
-
-    let signer = make_presigned_url_signer(
-        &ObjectStoreConfig::try_parse_from([
-            "server",
-            "--object-store",
-            "file",
-            "--data-dir",
-            root_path,
-        ])
-        .unwrap(),
-    )
-    .unwrap()
-    .unwrap();
-
-    let object_store_parquet_file_path = Path::parse(parquet_file_path).unwrap();
-    let upload_url = signer
-        .signed_url(
-            http::Method::PUT,
-            &object_store_parquet_file_path,
-            Duration::from_secs(100),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        upload_url.as_str(),
-        &format!(
-            "file://{}",
-            std::fs::canonicalize(root.path())
-                .unwrap()
-                .join(parquet_file_path)
-                .display()
-        )
-    );
-}
-
 #[test]
 fn endpoint() {
     assert_eq!(
@@ -450,7 +288,7 @@ async fn validate_aws_credential_reloader() {
         AwsCredentialReloader::new_test(path.clone(), initial_file_credentials, time_provider);
 
     // validate the current reloader credentials are still equal to the initial credentials
-    assert_eq!(reloader.current.read().await.as_ref(), &initial_credentials);
+    assert_eq!(reloader.current.read().as_ref(), &initial_credentials);
 
     reloader.spawn_background_updates();
 
@@ -461,7 +299,7 @@ async fn validate_aws_credential_reloader() {
 
     // validate the current reloader credentials haven't changed -- nothing was written to disk
     // yet so the initial credentials written to disk should be the same
-    assert_eq!(reloader.current.read().await.as_ref(), &initial_credentials);
+    assert_eq!(reloader.current.read().as_ref(), &initial_credentials);
 
     // write to the credentials file
     std::fs::write(&path, next_file_credentials_serialized).expect("must succeed writing");
@@ -469,10 +307,23 @@ async fn validate_aws_credential_reloader() {
     // set the duration to five seconds past the default interval reloader interval so we
     // prompt another check
     mock_provider.set(next_expiry + Duration::from_secs(5));
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // verify the credentials have been updated in the reloader
-    assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
+    // verify the credentials get updated in the reloader. The mock-time
+    // advance wakes the background task, but it still needs real scheduler
+    // time to run its check, so poll with a deadline instead of asserting
+    // after a fixed sleep (#5531).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if reloader.current.read().as_ref() == &next_credentials {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "credentials were not reloaded within 10s; current: {:?}",
+            reloader.current.read()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[derive(Debug)]
@@ -654,7 +505,7 @@ async fn validate_reauthing_object_store() {
                 .replace(reauthable_fn());
 
             // verify the initial credentials are still set
-            assert_eq!(reloader.current.read().await.as_ref(), &initial_credentials);
+            assert_eq!(reloader.current.read().as_ref(), &initial_credentials);
 
             // write to the credentials file so we can verify it gets updated
             std::fs::write(&path, next_file_credentials_serialized.clone()).expect("must succeed writing");
@@ -666,7 +517,7 @@ async fn validate_reauthing_object_store() {
                 .expect("must succeed");
 
             // verify the next credentials have been loaded
-            assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
+            assert_eq!(reloader.current.read().as_ref(), &next_credentials);
 
             // ============================================================
             // Test non-re-authable error
@@ -684,7 +535,7 @@ async fn validate_reauthing_object_store() {
                 .replace(not_reauthable_fn());
 
             // verify the credentials are unchanged
-            assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
+            assert_eq!(reloader.current.read().as_ref(), &next_credentials);
 
             // validate that we get an error
             $expression
@@ -692,7 +543,7 @@ async fn validate_reauthing_object_store() {
                 .expect_err("must error");
 
             // reset the credentials to the initial state for the next test
-            *reloader.current.write().await = Arc::new(initial_file_credentials.clone().into());
+            *reloader.current.write() = Arc::new(initial_file_credentials.clone().into());
 
             // ============================================================
             // Test Generic error with ExpiredToken
@@ -705,7 +556,7 @@ async fn validate_reauthing_object_store() {
                 .replace(generic_expired_token_fn());
 
             // Verify initial credentials are set
-            assert_eq!(reloader.current.read().await.as_ref(), &initial_credentials);
+            assert_eq!(reloader.current.read().as_ref(), &initial_credentials);
 
             // Write new credentials to file
             std::fs::write(&path, next_file_credentials_serialized.clone())
@@ -717,7 +568,7 @@ async fn validate_reauthing_object_store() {
                 .expect("must succeed after reauth");
 
             // Verify credentials were reloaded
-            assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
+            assert_eq!(reloader.current.read().as_ref(), &next_credentials);
 
             // ============================================================
             // Test Generic error without ExpiredToken (should return Err)
@@ -744,10 +595,10 @@ async fn validate_reauthing_object_store() {
                 .expect_err("must return an error");
 
             // The error gets consumed by the first call, so we might get success or error
-            assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
+            assert_eq!(reloader.current.read().as_ref(), &next_credentials);
 
             // reset the credentials to the initial state for the next test
-            *reloader.current.write().await = Arc::new(initial_file_credentials.clone().into());
+            *reloader.current.write() = Arc::new(initial_file_credentials.clone().into());
         }
     }
 
@@ -790,7 +641,7 @@ async fn validate_reauthing_object_store() {
         .replace(reauthable_fn());
 
     // verify the initial credentials are still set
-    assert_eq!(reloader.current.read().await.as_ref(), &initial_credentials);
+    assert_eq!(reloader.current.read().as_ref(), &initial_credentials);
 
     // write to the credentials file so we can verify it gets updated
     std::fs::write(&path, next_file_credentials_serialized.clone()).expect("must succeed writing");
@@ -808,7 +659,7 @@ async fn validate_reauthing_object_store() {
         .expect("must delete");
 
     // verify the next credentials have been loaded
-    assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
+    assert_eq!(reloader.current.read().as_ref(), &next_credentials);
 
     // write to the credentials file so we can verify it doesn't get updated
     std::fs::write(&path, initial_file_credentials_serialized.clone())
@@ -823,7 +674,7 @@ async fn validate_reauthing_object_store() {
         .replace(not_reauthable_fn());
 
     // verify the credentials are unchanged
-    assert_eq!(reloader.current.read().await.as_ref(), &next_credentials);
+    assert_eq!(reloader.current.read().as_ref(), &next_credentials);
 
     // validate that copy still transparently works
     reloading_object_store
@@ -832,11 +683,13 @@ async fn validate_reauthing_object_store() {
         .expect_err("must error");
 
     // reset the credentials to the initial state for the next test
-    *reloader.current.write().await = Arc::new(initial_file_credentials.clone().into());
+    *reloader.current.write() = Arc::new(initial_file_credentials.clone().into());
 }
 
 #[test]
 fn test_tls_cli_arguments() {
+    let _guard = tls_env_lock().lock().unwrap();
+
     // Test parsing TLS allow insecure flag
     let config = ObjectStoreConfig::try_parse_from([
         "server",
@@ -955,6 +808,8 @@ fn test_tls_configuration_with_different_stores() {
 #[test]
 fn test_tls_environment_variables() {
     use std::env;
+
+    let _guard = tls_env_lock().lock().unwrap();
 
     unsafe {
         // Test environment variable for allow-insecure

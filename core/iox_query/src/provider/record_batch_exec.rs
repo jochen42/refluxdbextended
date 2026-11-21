@@ -19,13 +19,17 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream, Statistics,
         expressions::{Column, PhysicalSortExpr},
-        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
+        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
     },
     scalar::ScalarValue,
 };
 use itertools::Itertools;
 use schema::sort::SortKey;
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    sync::Arc,
+};
 use tracing::trace;
 
 /// Implements the DataFusion physical plan interface for [`RecordBatch`]es with automatic projection and NULL-column creation.
@@ -189,6 +193,15 @@ impl ExecutionPlan for RecordBatchesExec {
 
         let chunk = &self.chunks[partition];
 
+        // SLL `bytes_scanned` source: emit a per-partition count for any
+        // chunk that reports on-disk bytes (in-memory chunks return 0).
+        let bytes = chunk.bytes_scanned();
+        if bytes > 0 {
+            MetricBuilder::new(&self.metrics)
+                .counter("bytes_scanned", partition)
+                .add(bytes as usize);
+        }
+
         let stream = match chunk.data() {
             crate::QueryChunkData::RecordBatches(stream) => stream,
             crate::QueryChunkData::Parquet(_) => {
@@ -249,12 +262,46 @@ impl DisplayAs for RecordBatchesExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "RecordBatchesExec: chunks={}", self.chunks.len(),)?;
+                write!(f, "RecordBatchesExec: chunks={}", self.chunks.len())?;
+                if let Some(breakdown) = self.chunk_type_breakdown() {
+                    write!(f, " [{breakdown}]")?;
+                }
                 if !self.schema.fields().is_empty() {
                     write!(f, ", projection={}", ProjectSchemaDisplay(&self.schema))?;
                 }
                 Ok(())
             }
         }
+    }
+}
+
+impl RecordBatchesExec {
+    /// Per-`chunk_type` count formatted as `Window=2, Buffer=1`. Returns
+    /// `None` when there are no chunks.
+    ///
+    /// `chunk_type()` strings have a trailing `Chunk` suffix stripped for
+    /// readability (e.g. `WindowChunk` -> `Window`); other strings are kept
+    /// verbatim.
+    fn chunk_type_breakdown(&self) -> Option<String> {
+        if self.chunks.is_empty() {
+            return None;
+        }
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for chunk in &self.chunks {
+            *counts.entry(chunk.chunk_type()).or_insert(0) += 1;
+        }
+        Some(
+            counts
+                .iter()
+                .map(|(ty, n)| {
+                    let short = ty
+                        .strip_suffix("Chunk")
+                        .map(str::trim_end)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(ty);
+                    format!("{short}={n}")
+                })
+                .join(", "),
+        )
     }
 }

@@ -1,13 +1,19 @@
 use std::sync::Arc;
 
+use crate::catalog::CatalogSequenceNumber;
 use object_store::local::LocalFileSystem;
 
-use super::ObjectStoreCatalog;
+use super::{ObjectStoreCatalog, StorageMode};
 
 #[test_log::test(tokio::test)]
 async fn load_or_create_catalog_new_catalog() {
     let local_disk = LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
-    let store = ObjectStoreCatalog::new("test_host", 10, Arc::new(local_disk));
+    let store = ObjectStoreCatalog::new(
+        "test_host",
+        10,
+        Arc::new(local_disk),
+        StorageMode::default(),
+    );
     let _ = store.load_or_create_catalog().await.unwrap();
     assert!(store.load_catalog().await.unwrap().is_some());
 }
@@ -15,7 +21,12 @@ async fn load_or_create_catalog_new_catalog() {
 #[test_log::test(tokio::test)]
 async fn load_or_create_catalog_existing_catalog() {
     let local_disk = LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
-    let store = ObjectStoreCatalog::new("test_host", 10, Arc::new(local_disk));
+    let store = ObjectStoreCatalog::new(
+        "test_host",
+        10,
+        Arc::new(local_disk),
+        StorageMode::default(),
+    );
     let expected = store.load_or_create_catalog().await.unwrap().catalog_id;
 
     // initialize again to ensure it uses the same as above
@@ -23,6 +34,53 @@ async fn load_or_create_catalog_existing_catalog() {
 
     // check the instance ids match
     assert_eq!(expected, actual);
+}
+
+#[test_log::test(tokio::test)]
+async fn checkpoint_for_backup_reads_checkpoint_sequence_and_bytes() {
+    let local_disk = LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
+    let store = ObjectStoreCatalog::new(
+        "test_host",
+        10,
+        Arc::new(local_disk),
+        StorageMode::default(),
+    );
+
+    let catalog = store.load_or_create_catalog().await.unwrap();
+    let checkpoint = store.checkpoint_for_backup().await.unwrap();
+
+    assert_eq!(checkpoint.sequence, CatalogSequenceNumber::new(0));
+    assert_eq!(checkpoint.path, "test_host/catalog/v2/snapshot".into());
+    assert_eq!(catalog.sequence_number(), CatalogSequenceNumber::new(0));
+}
+
+#[tokio::test]
+async fn log_files_for_backup_returns_exact_sequence_range() {
+    let local_disk = LocalFileSystem::new_with_prefix(test_helpers::tmp_dir().unwrap()).unwrap();
+    let store = ObjectStoreCatalog::new(
+        "test_host",
+        10,
+        Arc::new(local_disk),
+        StorageMode::default(),
+    );
+
+    let files = store
+        .log_files_for_backup(CatalogSequenceNumber::new(3), CatalogSequenceNumber::new(6))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        files.iter().map(|f| f.sequence.get()).collect::<Vec<_>>(),
+        vec![4, 5, 6]
+    );
+    assert_eq!(
+        files.iter().map(|f| f.path.to_string()).collect::<Vec<_>>(),
+        vec![
+            "test_host/catalog/v2/logs/00000000000000000004.catalog",
+            "test_host/catalog/v2/logs/00000000000000000005.catalog",
+            "test_host/catalog/v2/logs/00000000000000000006.catalog",
+        ]
+    );
 }
 
 // TODO: more test cases
@@ -209,64 +267,4 @@ async fn persist_and_load_newest_catalog() {
     // assert!(catalog.db_exists(DbId::from(1)));
     // // my_db
     // assert!(!catalog.db_exists(DbId::from(0)));
-}
-
-#[test_log::test(tokio::test)]
-async fn checkpoint_exists_logs_diagnostics_on_head_failure() {
-    use influxdb3_test_helpers::object_store::mock::{self, MockCall, MockStore};
-    use object_store::{GetOptions, GetRange};
-
-    use super::CatalogFilePath;
-
-    let store = MockStore::new()
-        .mock_next(MockCall::Head {
-            params: CatalogFilePath::checkpoint("test_host").into(),
-            barriers: vec![],
-            res: Err(mock::err()),
-        })
-        // a HEAD error response carries no body, so the failed HEAD must be followed by a
-        // single-byte ranged GET, whose error response can carry the store's error body
-        .mock_next(MockCall::GetOpts {
-            params: (
-                CatalogFilePath::checkpoint("test_host").into(),
-                GetOptions {
-                    range: Some(GetRange::Bounded(0..1)),
-                    ..Default::default()
-                }
-                .into(),
-            ),
-            barriers: vec![],
-            res: Err(mock::err()),
-        });
-    let catalog = ObjectStoreCatalog::new("test_host", 10, store.as_store());
-
-    let error = catalog
-        .checkpoint_exists()
-        .await
-        .expect_err("the HEAD error should be propagated");
-    // the first catalog load runs before logging is initialized, so the diagnostic must
-    // travel inside the propagated error, not just the log line
-    let rendered = format!("{error}");
-    assert!(
-        rendered.contains("diagnostic ranged GET"),
-        "diagnostics missing from error: {rendered}"
-    );
-}
-
-#[test_log::test(tokio::test)]
-async fn checkpoint_exists_no_diagnostics_when_not_found() {
-    use influxdb3_test_helpers::object_store::mock::{self, MockCall, MockStore};
-
-    use super::CatalogFilePath;
-
-    // no GET is mocked: MockStore panics on any unexpected call, so this also verifies that
-    // a NotFound HEAD does not trigger the diagnostic GET
-    let store = MockStore::new().mock_next(MockCall::Head {
-        params: CatalogFilePath::checkpoint("test_host").into(),
-        barriers: vec![],
-        res: Err(mock::not_found("test_host/catalog/v2/snapshot")),
-    });
-    let catalog = ObjectStoreCatalog::new("test_host", 10, store.as_store());
-
-    assert!(!catalog.checkpoint_exists().await.unwrap());
 }

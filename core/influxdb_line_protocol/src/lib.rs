@@ -98,6 +98,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     ops::Deref,
+    sync::Arc,
 };
 
 /// Maximum byte length for string components in line protocol
@@ -561,6 +562,15 @@ impl PartialEq<&str> for EscapedStr<'_> {
 impl PartialEq<String> for EscapedStr<'_> {
     fn eq(&self, other: &String) -> bool {
         self.as_str() == other
+    }
+}
+
+impl From<EscapedStr<'_>> for Arc<str> {
+    fn from(value: EscapedStr<'_>) -> Self {
+        match value {
+            EscapedStr::CopiedValue(s) => Self::from(s),
+            EscapedStr::SingleSlice(s) => Self::from(s),
+        }
     }
 }
 
@@ -2332,7 +2342,7 @@ her"#,
         assert_eq!(vals.len(), 2);
         assert!(vals[0].is_err());
         assert_eq!(
-            format!("{:?}", &vals[0]),
+            format!("{:?}", vals[0]),
             "Err(CannotParseEntireLine { trailing_content: \".22,jkl=4\" })"
         );
 

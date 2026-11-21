@@ -10,14 +10,58 @@ use crate::{ChunkFilter, DatabaseTables};
 use crate::{ParquetFile, PersistedSnapshot, PersistedSnapshotCheckpoint};
 use hashbrown::{HashMap, HashSet};
 use influxdb3_catalog::catalog::Catalog;
-use influxdb3_id::TableId;
 use influxdb3_id::{DbId, SerdeVecMap};
+use influxdb3_id::{ParquetFileId, TableId};
 use influxdb3_telemetry::ParquetMetrics;
 use observability_deps::tracing::{debug, trace};
 use parking_lot::RwLock;
 
 type DatabaseToTables = HashMap<DbId, TableToFiles>;
 type TableToFiles = HashMap<TableId, Vec<ParquetFile>>;
+
+/// Put parquet files in descending min_time order.
+pub fn sort_by_min_time_desc(files: &mut [ParquetFile]) {
+    files.sort_by_key(|f| std::cmp::Reverse(f.min_time));
+}
+
+/// Put gen1 files in the order they were persisted. The query path assigns chunk order in this
+/// order, so a later file wins deduplication over an earlier one with the same chunk time.
+pub fn sort_by_persist_order(files: &mut [ParquetFile]) {
+    files.sort_by_key(|f| f.id);
+}
+
+/// Totals for the files taken out of a table's file list by [`remove_files_by_id`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemovedFiles {
+    pub(crate) count: u64,
+    pub(crate) size_bytes: u64,
+    pub(crate) row_count: u64,
+}
+
+/// Remove every file whose id is in `ids` from `files`.
+///
+/// One pass over `files` regardless of how many ids are given. Order does not
+/// matter (readers sort on the way out), so `swap_remove` from the back is
+/// used rather than `retain`: the element swapped into a gap has already been
+/// tested.
+pub(crate) fn remove_files_by_id(
+    files: &mut Vec<ParquetFile>,
+    ids: &HashSet<ParquetFileId>,
+) -> RemovedFiles {
+    let mut removed = RemovedFiles::default();
+    if ids.is_empty() {
+        return removed;
+    }
+    for i in (0..files.len()).rev() {
+        if ids.contains(&files[i].id) {
+            let file = files.swap_remove(i);
+            removed.count += 1;
+            removed.size_bytes += file.size_bytes;
+            removed.row_count += file.row_count;
+        }
+    }
+    removed
+}
 
 #[derive(Debug, Default)]
 pub struct PersistedFiles {
@@ -270,6 +314,19 @@ impl PersistedFiles {
         self.inner.write().tombstone_evicted(paths);
     }
 
+    /// One past the largest id among the loaded files, if any are loaded.
+    pub fn next_file_id(&self) -> Option<ParquetFileId> {
+        let inner = self.inner.read();
+        inner
+            .files
+            .values()
+            .flat_map(|tables| tables.values())
+            .flatten()
+            .map(|file| file.id.as_u64())
+            .max()
+            .map(|id| ParquetFileId::from(id + 1))
+    }
+
     /// Get the list of files for a given database and table, always return in descending order of min_time
     pub fn get_files(&self, db_id: DbId, table_id: TableId) -> Vec<ParquetFile> {
         self.get_files_filtered(db_id, table_id, &ChunkFilter::default())
@@ -284,20 +341,32 @@ impl PersistedFiles {
         table_id: TableId,
         filter: &ChunkFilter<'_>,
     ) -> Vec<ParquetFile> {
+        let mut files = self.get_files_filtered_unsorted(db_id, table_id, filter);
+        sort_by_min_time_desc(&mut files);
+        files
+    }
+
+    /// Get the list of files for a given database and table, using the provided filter to filter
+    /// results, in whatever order the index holds them.
+    pub fn get_files_filtered_unsorted(
+        &self,
+        db_id: DbId,
+        table_id: TableId,
+        filter: &ChunkFilter<'_>,
+    ) -> Vec<ParquetFile> {
         let inner = self.inner.read();
-        let mut files = inner
+        inner
             .files
             .get(&db_id)
             .and_then(|tables| tables.get(&table_id))
-            .cloned()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|file| filter.test_time_stamp_min_max(file.min_time, file.max_time))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
-            .into_iter()
-            .filter(|file| filter.test_time_stamp_min_max(file.min_time, file.max_time))
-            .collect::<Vec<_>>();
-
-        files.sort_by_key(|f| std::cmp::Reverse(f.min_time));
-
-        files
     }
 
     /// Remove files that are marked for deletion or that violate their retention period.
@@ -306,7 +375,7 @@ impl PersistedFiles {
         catalog: Arc<Catalog>,
     ) -> SerdeVecMap<DbId, DatabaseTables> {
         let mut removed: SerdeVecMap<DbId, DatabaseTables> = SerdeVecMap::new();
-        let mut removed_paths: HashSet<String> = HashSet::new();
+        let mut removed_paths: HashSet<Arc<str>> = HashSet::new();
         let mut size = 0;
         let mut row_count = 0;
 
@@ -327,7 +396,7 @@ impl PersistedFiles {
                     .entry(table_id)
                     .or_default()
                     .push(file.clone());
-                removed_paths.insert(file.path.clone());
+                removed_paths.insert(Arc::clone(&file.path));
             };
 
             let guard = self.inner.read();
@@ -378,7 +447,7 @@ impl PersistedFiles {
                 for file in files {
                     // remove files if their max time (aka newest timestamp) is less than (aka older
                     // than) the cutoff timestamp for the retention period
-                    if file.max_time < cutoff {
+                    if file.max_time < cutoff.timestamp_nanos() {
                         queue_for_removal(db_id, table_id, file);
                     }
                 }
