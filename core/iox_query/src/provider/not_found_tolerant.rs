@@ -343,8 +343,10 @@ mod tests {
 
     #[test]
     fn optimizer_helpers_see_through_wrapper() {
-        let parquet: Arc<dyn FileSource> =
-            Arc::new(ParquetSource::new(TableParquetOptions::default()));
+        let table_schema = TableSchema::new(Arc::new(arrow::datatypes::Schema::empty()), vec![]);
+        let parquet: Arc<dyn FileSource> = Arc::new(
+            ParquetSource::new(table_schema).with_table_parquet_options(TableParquetOptions::default()),
+        );
         let wrapped: Arc<dyn FileSource> =
             Arc::new(NotFoundTolerantSource::new(Arc::clone(&parquet)));
 

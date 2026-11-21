@@ -232,15 +232,31 @@ impl IoxAuthorizer for TokenAuthenticatorAndAuthorizer {
                                 authz::Action::Delete => DatabaseActions::DELETE,
                             };
 
-                            let res = self
+                            let subject = Subject::Token(token_id);
+                            let mut res = self
                                 .authorize_action(
-                                    Some(&Subject::Token(token_id)),
+                                    Some(&subject),
                                     AccessRequest::MaybeDatabase(
                                         db_id,
                                         DatabaseActions::from(action_bits),
                                     ),
                                 )
                                 .await;
+                            // Fork: a read grant also covers describing the
+                            // database (it already reveals that it exists), so
+                            // `db:<name>:read` tokens see their databases in
+                            // v1 SHOW DATABASES.
+                            if res.is_err() && matches!(action, authz::Action::Describe) {
+                                res = self
+                                    .authorize_action(
+                                        Some(&subject),
+                                        AccessRequest::MaybeDatabase(
+                                            db_id,
+                                            DatabaseActions::from(DatabaseActions::READ),
+                                        ),
+                                    )
+                                    .await;
+                            }
 
                             match res {
                                 Ok(()) => {

@@ -391,7 +391,7 @@ mod tests {
         // un-persisted (seq > high_water) — exactly the silent data-loss case
         // add_file now warns about. Here we lock the eviction semantics: only
         // the most recent `max_files` survive.
-        let catalog = Arc::new(Catalog::new_in_memory("t").await.unwrap());
+        let catalog = Catalog::new_in_memory("t").await.unwrap();
         let mut tail = WriterTail::new();
         // high_water = 0 → every file is un-persisted, so each eviction is the
         // hole-punching case.
@@ -412,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn empty_writer_list_tick_is_noop() {
         let store = Arc::new(InMemory::new());
-        let catalog = Arc::new(Catalog::new_in_memory("t").await.unwrap());
+        let catalog = Catalog::new_in_memory("t").await.unwrap();
         let tail = WalTailBuffer::new(store, catalog, vec![], 16);
         let applied = tail.tick().await.unwrap();
         assert_eq!(applied, 0);
@@ -467,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn coalesces_tail_chunks_per_partition() {
-        let catalog = Arc::new(Catalog::new_in_memory("t").await.unwrap());
+        let catalog = Catalog::new_in_memory("t").await.unwrap();
         let writer = TestWriter::new_with_catalog(Arc::clone(&catalog));
         // All rows fall in the same gen1 partition (tiny, close timestamps).
         let batch = writer
@@ -491,7 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn time_prunes_non_overlapping_tail_files() {
-        let catalog = Arc::new(Catalog::new_in_memory("t").await.unwrap());
+        let catalog = Catalog::new_in_memory("t").await.unwrap();
         let writer = TestWriter::new_with_catalog(Arc::clone(&catalog));
         // Data at t=1000ns.
         let batch = writer
@@ -560,7 +560,7 @@ mod tests {
         use iox_query::frontend::reorg::ReorgPlanner;
         use schema::sort::SortKeyBuilder;
 
-        let catalog = Arc::new(Catalog::new_in_memory("t").await.unwrap());
+        let catalog = Catalog::new_in_memory("t").await.unwrap();
         let writer = TestWriter::new_with_catalog(Arc::clone(&catalog));
         let batch = writer
             .write_lp_to_write_batch("cpu,host=a usage=1i 1000", 0)

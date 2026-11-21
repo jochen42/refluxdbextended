@@ -628,7 +628,7 @@ mod tests {
             TableId::from(0),
             ParquetFile {
                 id: ParquetFileId::new(),
-                path: file_path.to_string(),
+                path: file_path.into(),
                 size_bytes: 10,
                 row_count: 1,
                 chunk_time: 0,
@@ -688,7 +688,7 @@ mod tests {
                     .iter()
                     .flat_map(|(_, t)| t.tables.iter())
                     .flat_map(|(_, fs)| fs.iter())
-                    .map(|f| f.path.clone())
+                    .map(|f| f.path.to_string())
             })
             .collect();
         assert!(paths.contains("a/1.parquet"));

@@ -327,7 +327,9 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::{
         datasource::{
-            object_store::ObjectStoreUrl, physical_plan::FileGroup, table_schema::TableSchema,
+            object_store::ObjectStoreUrl,
+            physical_plan::{FileGroup, ParquetSource},
+            table_schema::TableSchema,
         },
         parquet::arrow::ArrowWriter,
         physical_plan::SendableRecordBatchStream,

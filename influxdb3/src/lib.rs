@@ -41,7 +41,6 @@ pub mod commands {
     // Local (not shared)
     pub mod create;
     pub mod delete;
-    pub mod migrate;
     pub mod serve;
     pub mod show;
     pub mod update;
@@ -161,8 +160,6 @@ enum Command {
     Update(commands::update::Config),
     /// Perform a set of writes to a running InfluxDB 3 Core server
     Write(commands::write::Config),
-    /// Migrate on-disk state for multi-node deployments
-    Migrate(commands::migrate::Config),
 }
 
 impl Command {
@@ -598,12 +595,6 @@ fn non_serve_main(
                 if let Err(e) = commands::write::command(config).await {
                     eprintln!("Write command failed: {e}");
                     exit_client_command_failure()
-                }
-            }
-            Some(Command::Migrate(config)) => {
-                if let Err(e) = commands::migrate::command(config).await {
-                    eprintln!("Migrate command failed: {e}");
-                    std::process::exit(ReturnCode::Failure as _)
                 }
             }
         }

@@ -340,7 +340,8 @@ async fn test_authorizer_iox_authorization_describe_success() {
 }
 
 #[test_log::test(tokio::test)]
-async fn test_authorizer_iox_authorization_describe_failed() {
+// Fork: a read grant also covers Describe (upstream requires DESCRIBE).
+async fn test_authorizer_iox_authorization_describe_allowed_by_read() {
     let time_provider = MockProvider::new(Time::from_timestamp_nanos(0));
 
     let token = "sample-token";
@@ -348,6 +349,34 @@ async fn test_authorizer_iox_authorization_describe_failed() {
     let authenticator = TokenAuthenticator::new(Arc::new(token_provider), Arc::new(time_provider));
     let catalog_provider = MockCatalogProviderWithAccess {
         allowed_access: DatabaseActions::READ,
+        db_id: Some(DbId::new(1)),
+    };
+    let authorizer = TokenAuthenticatorAndAuthorizer::new(
+        Arc::new(authenticator),
+        Arc::new(catalog_provider) as _,
+    );
+
+    let perms = &[IoxPermission::ResourceAction(
+        Resource::Database(authz::Target::ResourceName("some-db".to_owned())),
+        authz::Action::Describe,
+    )];
+
+    let authorization = authorizer
+        .authorize(Some(token.as_bytes().to_vec()), perms)
+        .await;
+
+    assert_eq!(authorization.unwrap().permissions(), perms);
+}
+
+#[test_log::test(tokio::test)]
+async fn test_authorizer_iox_authorization_describe_failed() {
+    let time_provider = MockProvider::new(Time::from_timestamp_nanos(0));
+
+    let token = "sample-token";
+    let token_provider = MockTokenProvider::new(token, false);
+    let authenticator = TokenAuthenticator::new(Arc::new(token_provider), Arc::new(time_provider));
+    let catalog_provider = MockCatalogProviderWithAccess {
+        allowed_access: DatabaseActions::WRITE,
         db_id: Some(DbId::new(1)),
     };
     let authorizer = TokenAuthenticatorAndAuthorizer::new(

@@ -248,7 +248,7 @@ mod tests {
     fn file(id: u64, path: &str) -> ParquetFile {
         ParquetFile {
             id: ParquetFileId::from(id),
-            path: path.to_string(),
+            path: path.into(),
             size_bytes: 1,
             row_count: 1,
             chunk_time: 0,
@@ -385,7 +385,7 @@ mod tests {
             // Long interval: the boot-time pass must flip the flag well before
             // any periodic pass, so this proves the flip is at boot.
             interval: std::time::Duration::from_secs(3600),
-            shutdown: shutdown_mgr.register(),
+            shutdown: shutdown_mgr.register("test"),
             metric_registry: Arc::new(metric::Registry::new()),
             first_pass_ready: Some(Arc::clone(&ready)),
         });

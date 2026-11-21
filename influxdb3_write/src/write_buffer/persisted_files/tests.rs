@@ -92,7 +92,7 @@ fn test_duplicate_refs_collapse_and_removal_drops_all_copies() {
     let path = "main-writer-0/dbs/3/1/2025-12-20/11-00/0000017361.parquet";
     let file = ParquetFile {
         id: ParquetFileId::from(7),
-        path: path.to_owned(),
+        path: path.into(),
         size_bytes: 50_000,
         row_count: 10,
         chunk_time: 10,
@@ -146,7 +146,7 @@ fn test_removed_files_match_by_path_across_node_id_collision() {
     let colliding_id = ParquetFileId::from(239);
     let compactor_output = ParquetFile {
         id: colliding_id,
-        path: "main-compactor-0/dbs/db-31/t-0/gen4/2025-04-24/00-00/out.parquet".to_owned(),
+        path: "main-compactor-0/dbs/db-31/t-0/gen4/2025-04-24/00-00/out.parquet".into(),
         size_bytes: 100,
         row_count: 10,
         chunk_time: 0,
@@ -155,7 +155,7 @@ fn test_removed_files_match_by_path_across_node_id_collision() {
     };
     let gen1_input = ParquetFile {
         id: colliding_id,
-        path: "main-writer-0/dbs/31/0/2025-04-24/22-25/0000000359.parquet".to_owned(),
+        path: "main-writer-0/dbs/31/0/2025-04-24/22-25/0000000359.parquet".into(),
         size_bytes: 50,
         row_count: 5,
         chunk_time: 0,
@@ -195,7 +195,7 @@ fn test_removed_files_match_by_path_at_runtime() {
     let colliding_id = ParquetFileId::from(3);
     let compactor_output = ParquetFile {
         id: colliding_id,
-        path: "main-compactor-0/dbs/db-2/t-1/gen2/2026-06-11/20-00/out.parquet".to_owned(),
+        path: "main-compactor-0/dbs/db-2/t-1/gen2/2026-06-11/20-00/out.parquet".into(),
         size_bytes: 100,
         row_count: 10,
         chunk_time: 0,
@@ -204,7 +204,7 @@ fn test_removed_files_match_by_path_at_runtime() {
     };
     let gen1_input = ParquetFile {
         id: colliding_id,
-        path: "main-writer-0/dbs/2/1/2026-06-11/20-18/0000000120.parquet".to_owned(),
+        path: "main-writer-0/dbs/2/1/2026-06-11/20-18/0000000120.parquet".into(),
         size_bytes: 50,
         row_count: 5,
         chunk_time: 0,
@@ -247,7 +247,7 @@ fn test_removed_files_match_by_path_at_runtime() {
 fn test_tombstone_suppresses_reordered_readd() {
     let gen1 = ParquetFile {
         id: ParquetFileId::from(1),
-        path: "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".to_owned(),
+        path: "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".into(),
         size_bytes: 50,
         row_count: 5,
         chunk_time: 0,
@@ -300,7 +300,7 @@ fn test_eviction_tombstone_survives_gc_and_suppresses_readd() {
     let gen1 = ParquetFile {
         id: ParquetFileId::from(1),
         // file stem encodes wal_seq 1800
-        path: "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".to_owned(),
+        path: "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".into(),
         size_bytes: 50,
         row_count: 5,
         chunk_time: 0,
@@ -311,7 +311,7 @@ fn test_eviction_tombstone_survives_gc_and_suppresses_readd() {
     let persisted = PersistedFiles::new(None);
 
     // Validator confirmed the object gone and evicted it -> durable tombstone.
-    persisted.tombstone_evicted_paths([gen1.path.clone()]);
+    persisted.tombstone_evicted_paths([gen1.path.to_string()]);
     assert_eq!(persisted.tombstone_count(), 1);
 
     // High-water GC far past the file's own wal_seq (1800) must NOT drop it; a
@@ -343,7 +343,7 @@ fn test_eviction_tombstone_survives_gc_and_suppresses_readd() {
 fn test_tombstone_gc_by_high_water() {
     let gen1 = ParquetFile {
         id: ParquetFileId::from(1),
-        path: "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".to_owned(),
+        path: "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".into(),
         size_bytes: 50,
         row_count: 5,
         chunk_time: 0,
@@ -385,7 +385,7 @@ fn test_tombstone_gc_by_high_water() {
 fn test_in_order_removal_leaves_no_tombstone() {
     let gen1 = ParquetFile {
         id: ParquetFileId::from(1),
-        path: "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".to_owned(),
+        path: "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".into(),
         size_bytes: 50,
         row_count: 5,
         chunk_time: 0,
@@ -425,7 +425,7 @@ fn test_seed_tombstones_suppresses_readd() {
     let path = "main-writer-0/dbs/24/2/2026-01-10/09-00/0000001800.parquet".to_owned();
     let gen1 = ParquetFile {
         id: ParquetFileId::from(1),
-        path: path.clone(),
+        path: path.as_str().into(),
         size_bytes: 50,
         row_count: 5,
         chunk_time: 0,
@@ -455,7 +455,7 @@ fn test_compaction_tombstone_suppresses_reordered_readd() {
         id: ParquetFileId::from(1),
         path: "main-compactor-0/dbs/0169c974-24/1e94c01c-2/gen2/2025-12-28/00-00/\
                019ec5ca-d4d7-7ce3-9fd2-dd40ebd3d7eb.parquet"
-            .to_owned(),
+            .into(),
         size_bytes: 50,
         row_count: 5,
         chunk_time: 0,
@@ -1014,6 +1014,11 @@ fn test_remove_files_by_id_non_contiguous() {
     assert_eq!(3, files.len());
 }
 
+/// Fold one snapshot with a fresh tombstone set (upstream's two-argument fold).
+fn fold(snapshot: &PersistedSnapshot, files: &mut DatabaseToTables) -> SnapshotFoldDelta {
+    update_persisted_files_with_snapshot(snapshot, files, &mut HashMap::new(), None)
+}
+
 #[test]
 fn test_removed_files_drop_previously_merged_files() {
     let parquet_files = build_parquet_files("file_", 5);
@@ -1029,13 +1034,18 @@ fn test_removed_files_drop_previously_merged_files() {
         .extend(parquet_files.iter().step_by(2).cloned());
     let mut files: DatabaseToTables = HashMap::new();
 
-    let added = update_persisted_files_with_snapshot(true, &adding, &mut files);
-    let removed = update_persisted_files_with_snapshot(true, &removing, &mut files);
+    let added = fold(&adding, &mut files);
+    let removed = fold(&removing, &mut files);
 
-    assert_eq!((5, 0, 0), added);
-    // The file count is left out: it does not count these removals yet (#6088).
-    let (_, removed_size, removed_row_count) = removed;
-    assert_eq!((150_000, 30), (removed_size, removed_row_count));
+    assert_eq!(5, added.added_count);
+    assert_eq!(
+        (3, 150_000, 30),
+        (
+            removed.removed_count,
+            removed.removed_size_bytes,
+            removed.removed_row_count
+        )
+    );
     let mut remaining: Vec<ParquetFileId> = files[&DbId::from(0)][&TableId::from(0)]
         .iter()
         .map(|f| f.id)
@@ -1060,10 +1070,17 @@ fn test_removed_files_for_unmerged_ids_change_nothing() {
     let removing = build_snapshot_removing(DbId::from(0), TableId::from(0), 2);
     let mut files: DatabaseToTables = HashMap::new();
 
-    let added = update_persisted_files_with_snapshot(true, &adding, &mut files);
-    let removed = update_persisted_files_with_snapshot(true, &removing, &mut files);
+    let added = fold(&adding, &mut files);
+    let removed = fold(&removing, &mut files);
 
-    assert_eq!((3, 0, 0), added);
-    assert_eq!((0, 0, 0), removed);
+    assert_eq!(3, added.added_count);
+    assert_eq!(
+        (0, 0, 0),
+        (
+            removed.removed_count,
+            removed.removed_size_bytes,
+            removed.removed_row_count
+        )
+    );
     assert_eq!(3, files[&DbId::from(0)][&TableId::from(0)].len());
 }

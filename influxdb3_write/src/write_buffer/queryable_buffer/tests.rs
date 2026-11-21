@@ -628,6 +628,8 @@ async fn snapshot_handoff_keeps_sibling_chunks_queryable() {
             metric_registry: Arc::clone(&metrics),
             mem_pool_size: 1024 * 1024 * 1024,
             per_query_mem_pool_config: PerQueryMemoryPoolConfig::Disabled,
+            disk_manager_mode: iox_query::exec::DiskManagerMode::Disabled,
+            disk_spill_max_bytes: None,
             heap_memory_limit: None,
         },
         DedicatedExecutor::new_testing(),
@@ -670,6 +672,7 @@ async fn snapshot_handoff_keeps_sibling_chunks_queryable() {
         persisted_files: Arc::new(PersistedFiles::new(None)),
         parquet_cache: None,
         parquet_snapshot_concurrency_limit: NonZeroUsize::new(2).unwrap(),
+        shared_inventory: None,
     });
 
     let writer = TestWriter::new_with_catalog(Arc::clone(&catalog));

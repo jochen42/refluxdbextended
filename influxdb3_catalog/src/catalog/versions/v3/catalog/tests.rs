@@ -3895,6 +3895,41 @@ mod cluster_config {
         );
     }
 
+    /// Fork: per-level durations need not be multiples of the level below
+    /// (the fork's 1h/1d/7d/30d ladder), and each level stays set-once.
+    #[tokio::test]
+    async fn set_generation_duration_allows_unaligned_ladder() {
+        let catalog = TestCatalog::new().catalog();
+        let day = 24 * 60 * 60;
+        let ladder = [60, 3600, day, 7 * day, 30 * day];
+        for (level, secs) in (1u8..).zip(ladder) {
+            catalog
+                .set_generation_duration(level, Duration::from_secs(secs))
+                .await
+                .unwrap();
+        }
+        for (level, secs) in (1u8..).zip(ladder) {
+            assert_eq!(
+                catalog.get_generation_duration(level),
+                Some(Duration::from_secs(secs))
+            );
+        }
+
+        let err = catalog
+            .set_generation_duration(5, Duration::from_secs(30 * day))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, CatalogError::NoCatalogChange { .. }), "got {err:?}");
+        let err = catalog
+            .set_generation_duration(5, Duration::from_secs(90 * day))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CatalogError::CannotChangeGenerationDuration { level: 5, .. }),
+            "got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn set_all_generation_durations_aligned_multi_level() {
         let catalog = TestCatalog::new().catalog();

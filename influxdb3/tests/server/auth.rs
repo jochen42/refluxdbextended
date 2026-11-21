@@ -692,8 +692,8 @@ async fn read_only_token_is_enforced() {
         .send()
         .await
         .unwrap();
-    // The v2 API reports authorization failures as 401, matching InfluxDB v2.
-    assert_eq!(v2.status(), StatusCode::UNAUTHORIZED);
+    // Upstream 3.11+ answers a v2 write the token may not perform with 403.
+    assert_eq!(v2.status(), StatusCode::FORBIDDEN);
     let v1 = client
         .post(format!("{base}/write"))
         .query(&[("db", "foo")])

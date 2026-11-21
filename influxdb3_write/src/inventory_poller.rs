@@ -387,7 +387,7 @@ mod tests {
             TableId::from(0),
             ParquetFile {
                 id: ParquetFileId::new(),
-                path: file_path.to_string(),
+                path: file_path.into(),
                 size_bytes: 10,
                 row_count: 1,
                 chunk_time: 0,
@@ -454,7 +454,7 @@ mod tests {
         );
 
         let shutdown_mgr = ShutdownManager::new_testing();
-        let token = shutdown_mgr.register();
+        let token = shutdown_mgr.register("test");
         let handle = spawn(InventoryPollerArgs {
             inventory: inv.clone(),
             persisted_files: Arc::clone(&persisted),
@@ -496,7 +496,7 @@ mod tests {
         let object_store = Arc::new(InMemory::new());
         let inv = SharedInventory::new(object_store.clone());
         let persisted = Arc::new(PersistedFiles::new(None));
-        let catalog = Arc::new(Catalog::new_in_memory("test").await.unwrap());
+        let catalog = Catalog::new_in_memory("test").await.unwrap();
         let ready = Arc::new(AtomicBool::new(false));
         let shutdown_mgr = ShutdownManager::new_testing();
 
@@ -509,7 +509,7 @@ mod tests {
             interval: Duration::from_secs(3600),
             initial_wal_watermarks: HashMap::new(),
             initial_compaction_watermark: None,
-            shutdown: shutdown_mgr.register(),
+            shutdown: shutdown_mgr.register("test"),
             wal_tail: None,
             metric_registry: Arc::new(metric::Registry::default()),
             first_tick_ready: Some(Arc::clone(&ready)),
@@ -541,7 +541,7 @@ mod tests {
         let object_store = Arc::new(InMemory::new());
         let inv = SharedInventory::new(object_store.clone());
         let persisted = Arc::new(PersistedFiles::new(None));
-        let catalog = Arc::new(Catalog::new_in_memory("test").await.unwrap());
+        let catalog = Catalog::new_in_memory("test").await.unwrap();
         let shutdown_mgr = ShutdownManager::new_testing();
         let tp = Arc::new(iox_time::SystemProvider::new());
 
@@ -553,7 +553,7 @@ mod tests {
             interval: Duration::from_secs(3600),
             initial_wal_watermarks: HashMap::new(),
             initial_compaction_watermark: Some("019ec000".to_string()),
-            shutdown: shutdown_mgr.register(),
+            shutdown: shutdown_mgr.register("test"),
             wal_tail: None,
             metric_registry: Arc::new(metric::Registry::default()),
             first_tick_ready: None,
@@ -592,7 +592,7 @@ mod tests {
         let object_store = Arc::new(InMemory::new());
         let inv = SharedInventory::new(object_store.clone());
         let persisted = Arc::new(PersistedFiles::new(None));
-        let catalog = Arc::new(Catalog::new_in_memory("test").await.unwrap());
+        let catalog = Catalog::new_in_memory("test").await.unwrap();
         let watermarks = InventoryWatermarks::shared(HashMap::new(), None);
         let shutdown_mgr = ShutdownManager::new_testing();
 
@@ -607,7 +607,7 @@ mod tests {
             interval: Duration::from_millis(20),
             initial_wal_watermarks: HashMap::new(),
             initial_compaction_watermark: None,
-            shutdown: shutdown_mgr.register(),
+            shutdown: shutdown_mgr.register("test"),
             wal_tail: None,
             metric_registry: Arc::new(metric::Registry::default()),
             first_tick_ready: None,

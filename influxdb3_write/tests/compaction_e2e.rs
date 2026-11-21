@@ -6,7 +6,7 @@
 //! assert on its exact value. Running this in its own test binary gives it a
 //! fresh process and avoids cross-test interference.
 
-use data_types::NamespaceName;
+use influxdb3_types::DatabaseName;
 use futures_util::StreamExt;
 use influxdb3_cache::distinct_cache::DistinctCacheProvider;
 use influxdb3_cache::last_cache::LastCacheProvider;
@@ -74,7 +74,7 @@ async fn compaction_publishes_and_replaces_files() {
         snapshotted_wal_files_to_keep: 10,
         query_file_limit: None,
         n_snapshots_to_load_on_start: std::num::NonZeroU64::new(1).unwrap(),
-        shutdown: ShutdownManager::new_testing().register(),
+        shutdown: ShutdownManager::new_testing().register("test"),
         wal_replay_concurrency_limit: 1,
         parquet_snapshot_concurrency_limit: std::num::NonZeroUsize::new(1).unwrap(),
         shared_inventory: None,
@@ -91,7 +91,7 @@ async fn compaction_publishes_and_replaces_files() {
         let lp = format!("{table_name} value={i} {ts}");
         write_buffer
             .write_lp(
-                NamespaceName::new(db_name).unwrap(),
+                DatabaseName::new(db_name).unwrap(),
                 &lp,
                 iox_time::Time::from_timestamp_nanos(0),
                 false,
@@ -158,7 +158,7 @@ async fn compaction_publishes_and_replaces_files() {
         compaction_executor,
         Arc::clone(&object_store),
         Arc::clone(&time_provider),
-        ShutdownManager::new_testing().register(),
+        ShutdownManager::new_testing().register("test"),
         Arc::clone(&metric_registry),
     );
 
@@ -179,7 +179,7 @@ async fn compaction_publishes_and_replaces_files() {
         "rows should be preserved"
     );
 
-    let out_path = ObjPath::from(result.compacted_files[0].path.clone());
+    let out_path = ObjPath::from(result.compacted_files[0].path.as_ref());
     let head = object_store
         .head(&out_path)
         .await
@@ -258,7 +258,7 @@ async fn compaction_publishes_and_replaces_files() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     for old in &input_paths {
-        let path = ObjPath::from(old.clone());
+        let path = ObjPath::from(old.as_ref());
         assert!(
             object_store.head(&path).await.is_err(),
             "input parquet {} should have been deleted",

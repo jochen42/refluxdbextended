@@ -2929,6 +2929,24 @@ impl Catalog {
             .await
     }
 
+    /// Fork: set the duration of one compaction generation `level`, set-once.
+    ///
+    /// Unlike [`Self::set_all_generation_durations`] this does not require each
+    /// level to be an exact multiple of the one below: the fork's compactor
+    /// floors each output to its target window and dedups overlaps, so ladders
+    /// such as `1h, 1d, 7d, 30d` stay valid. Re-issuing the existing value is a
+    /// `NoCatalogChange` no-op; a different value is
+    /// `CannotChangeGenerationDuration`.
+    pub async fn set_generation_duration(
+        self: &Arc<Self>,
+        level: u8,
+        duration: Duration,
+    ) -> Result<()> {
+        info!(level, duration_ns = duration.as_nanos(), "set generation duration");
+        self.update::<SetGenerationDurationOp>(SetGenerationDurationArgs { level, duration })
+            .await
+    }
+
     /// Set every generation duration in a single atomic batch.
     /// `durations[i]` configures level `i + 1`. Re-issuing identical
     /// durations is a no-op; mismatched levels surface

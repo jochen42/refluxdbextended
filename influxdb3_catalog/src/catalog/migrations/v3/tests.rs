@@ -37,7 +37,7 @@ use crate::log::versions::v4::{
     TriggerSettings, TriggerSpecificationDefinition,
 };
 use crate::snapshot::versions::v4::{
-    ActionsSnapshot, CatalogSnapshot, ColumnDefinitionSnapshot, ColumnSetSnapshot,
+    ActionsSnapshot, CatalogSnapshot, ColumnDefinitionSnapshot, ColumnSetSnapshot, CrudActionsSnapshot,
     DatabaseActionsSnapshot, DatabaseSnapshot, DistinctCacheSnapshot, FieldColumnSnapshot,
     FieldDataType, FieldFamilySnapshot, GenerationConfigSnapshot, LastCacheSnapshot, NodeSnapshot,
     NodeStateSnapshot, PermissionSnapshot, ProcessingEngineTriggerSnapshot, RepositorySnapshot,
@@ -1284,8 +1284,59 @@ fn resource_scoped_token_emits_create_resource_scoped_token() {
         perm.resource_identifier,
         WireResourceIdent::Database(vec![7])
     );
-    assert_eq!(perm.actions, WireActions::Database(0b11));
+    // 0b11 is the fork's v2 READ|WRITE; v3 records use upstream's bits.
+    assert_eq!(
+        perm.actions,
+        WireActions::Database(influxdb3_authz::DatabaseActions::READ | influxdb3_authz::DatabaseActions::WRITE)
+    );
     assert!(perm.resource_names.is_empty());
+}
+
+/// A fork v2 read-only token (db READ = 1) must stay read-only in v3 rather
+/// than turn into upstream's CREATE (= 1).
+#[test]
+fn fork_read_only_token_stays_read_only() {
+    use influxdb3_authz::{CrudActions, DatabaseActions};
+    let permissions = vec![
+        PermissionSnapshot {
+            resource_type: ResourceTypeSnapshot::Database,
+            resource_identifier: ResourceIdentifierSnapshot::Database(vec![DbId::new(7)]),
+            actions: ActionsSnapshot::Database(DatabaseActionsSnapshot(1)),
+            resource_names: None,
+        },
+        PermissionSnapshot {
+            resource_type: ResourceTypeSnapshot::Database,
+            resource_identifier: ResourceIdentifierSnapshot::Wildcard,
+            actions: ActionsSnapshot::Database(DatabaseActionsSnapshot(0b100)),
+            resource_names: None,
+        },
+        PermissionSnapshot {
+            resource_type: ResourceTypeSnapshot::Token,
+            resource_identifier: ResourceIdentifierSnapshot::Wildcard,
+            actions: ActionsSnapshot::Token(CrudActionsSnapshot(0b1111)),
+            resource_names: None,
+        },
+    ];
+    let mut snap = empty_snapshot(1);
+    snap.tokens.repo.insert(
+        TokenId::from(2),
+        resource_scoped_token(2, "ro", permissions),
+    );
+
+    let batch = synthesize_records(&snap);
+    let token = CreateResourceScopedToken::decode(&batch.as_slice()[0].data)
+        .expect("decode CreateResourceScopedToken");
+    let actions: Vec<_> = token.permissions.iter().map(|p| p.actions.clone()).collect();
+    assert_eq!(
+        actions,
+        vec![
+            WireActions::Database(DatabaseActions::READ),
+            WireActions::Database(DatabaseActions::CREATE),
+            WireActions::Token(
+                CrudActions::READ | CrudActions::UPDATE | CrudActions::CREATE | CrudActions::DELETE
+            ),
+        ]
+    );
 }
 
 #[test]

@@ -272,7 +272,7 @@ Examples:
                                                    [env: INFLUXDB3_QUERY_FILE_LIMIT=]
 
 {}
-  --max-http-request-size <SIZE>                 Maximum size of HTTP requests [default: 1073741824]
+  --max-http-request-size <SIZE>                 Maximum size of HTTP requests [default: 1gb]
                                                    [env: INFLUXDB3_MAX_HTTP_REQUEST_SIZE=]
 
 {}

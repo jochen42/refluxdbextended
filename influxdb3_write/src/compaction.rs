@@ -1586,7 +1586,7 @@ mod tests {
     fn chunk_files_for_jobs_bounds_job_size_oldest_first() {
         let file = |id: u64, min_time: i64| ParquetFile {
             id: crate::ParquetFileId::from(id),
-            path: format!("gen1/{id}.parquet"),
+            path: format!("gen1/{id}.parquet").into(),
             size_bytes: 1,
             row_count: 1,
             chunk_time: min_time,
@@ -1702,9 +1702,9 @@ mod tests {
         let _ = (Arc::clone(&store), Arc::clone(&time_provider));
         // Minimal catalog/persister/executor stubs. The fields we exercise in
         // `acquire_claim` are only `object_store`, `time_provider`, `config`.
-        let catalog = Arc::new(futures::executor::block_on(async {
+        let catalog = futures::executor::block_on(async {
             Catalog::new_in_memory("test").await.unwrap()
-        }));
+        });
         let persister = Arc::new(crate::persister::Persister::new(
             Arc::clone(&store),
             "test-host",
@@ -1739,7 +1739,7 @@ mod tests {
                 snapshotted_wal_files_to_keep: 10,
                 query_file_limit: None,
                 n_snapshots_to_load_on_start: std::num::NonZeroU64::new(1).unwrap(),
-                shutdown: ShutdownManager::new_testing().register(),
+                shutdown: ShutdownManager::new_testing().register("test"),
                 wal_replay_concurrency_limit: 1,
                 parquet_snapshot_concurrency_limit: std::num::NonZeroUsize::new(1).unwrap(),
                 shared_inventory: None,
@@ -1757,7 +1757,7 @@ mod tests {
             Arc::new(Executor::new_testing()),
             store,
             time_provider,
-            ShutdownManager::new_testing().register(),
+            ShutdownManager::new_testing().register("test"),
             Arc::new(metric::Registry::default()),
         )
     }

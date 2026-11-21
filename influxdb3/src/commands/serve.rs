@@ -250,9 +250,10 @@ const MIN_REPLAY_PRELOAD_CONCURRENCY: usize = 10; // the min number of files tha
 
 // Core catalog limits. The shared catalog crate's `CatalogLimits` defaults are
 // Enterprise's; Core defines its own here so the two binaries can diverge.
-const CORE_NUM_DBS_LIMIT: usize = 5;
-const CORE_NUM_TABLES_LIMIT: usize = 2000;
-const CORE_NUM_COLUMNS_PER_TABLE_LIMIT: usize = 500;
+// Fork: unlimited (upstream Core: 5 databases, 2000 tables, 500 columns).
+const CORE_NUM_DBS_LIMIT: usize = usize::MAX;
+const CORE_NUM_TABLES_LIMIT: usize = usize::MAX;
+const CORE_NUM_COLUMNS_PER_TABLE_LIMIT: usize = usize::MAX;
 fn wal_replay_concurrency_limit_default() -> String {
     std::cmp::max(num_cpus::get(), MIN_REPLAY_PRELOAD_CONCURRENCY).to_string()
 }
@@ -1260,11 +1261,9 @@ impl FromStr for ParquetCachePrunePercent {
 /// `--gen5-duration`) in the catalog and return the ladder the compactor runs
 /// with, read back from the catalog.
 ///
-/// The catalog, not the flags, is the source of truth: levels are set once
-/// per catalog in one atomic batch, a flag that disagrees with an existing
-/// level only warns, and every restart compacts with the same ladder. Each
-/// level must be an exact multiple of the one below (e.g. 1m, 1h, 1d, 7d,
-/// 28d) so coarser generations align on finer boundaries.
+/// The catalog, not the flags, is the source of truth: each level is set once
+/// per catalog, a flag that disagrees with an existing level only warns, and
+/// every restart compacts with the same ladder.
 async fn register_generation_durations(
     catalog: &Arc<Catalog>,
     gen1: Duration,
@@ -1287,29 +1286,25 @@ async fn register_generation_durations(
         }
     }
 
-    match catalog.set_all_generation_durations(&ladder).await {
-        Ok(()) | Err(CatalogError::AlreadyExists) => {}
-        Err(CatalogError::CannotChangeGenerationDuration {
-            level,
-            existing,
-            attempted,
-        }) => {
-            warn!(
+    for (level, duration) in (1u8..).zip(ladder) {
+        match catalog.set_generation_duration(level, duration).await {
+            Ok(())
+            | Err(CatalogError::AlreadyExists)
+            | Err(CatalogError::NoCatalogChange { .. }) => {}
+            Err(CatalogError::CannotChangeGenerationDuration {
                 level,
-                ?existing,
-                ?attempted,
-                "cannot change a generation duration after it has been set; compacting with \
-                the catalog's ladder"
-            );
-        }
-        Err(e) => {
-            error!(
-                ?ladder,
-                %e,
-                "invalid generation durations: each level must be an exact multiple of the \
-                one below"
-            );
-            return Err(e.into());
+                existing,
+                attempted,
+            }) => {
+                warn!(
+                    level,
+                    ?existing,
+                    ?attempted,
+                    "cannot change a generation duration after it has been set; compacting \
+                    with the catalog's value"
+                );
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 

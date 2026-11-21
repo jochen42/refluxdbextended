@@ -15,16 +15,14 @@ async fn test_retention_handler_no_policies() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
     let registry = Arc::new(Registry::default());
-    let catalog = Arc::new(
-        Catalog::new(
-            "test_host".to_string(),
-            Arc::clone(&object_store),
-            Arc::clone(&time_provider) as _,
-            Arc::clone(&registry),
-        )
-        .await
-        .unwrap(),
-    );
+    let catalog = Catalog::new(
+        "test_host".to_string(),
+        Arc::clone(&object_store),
+        Arc::clone(&time_provider) as _,
+        Arc::clone(&registry),
+    )
+    .await
+    .unwrap();
 
     let table_index_cache = TableIndexCache::new(
         "test_host".to_string(),
@@ -50,16 +48,14 @@ async fn test_retention_handler_shutdown() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
     let registry = Arc::new(Registry::default());
-    let catalog = Arc::new(
-        Catalog::new(
-            "test_host".to_string(),
-            Arc::clone(&object_store),
-            Arc::clone(&time_provider) as _,
-            Arc::clone(&registry),
-        )
-        .await
-        .unwrap(),
-    );
+    let catalog = Catalog::new(
+        "test_host".to_string(),
+        Arc::clone(&object_store),
+        Arc::clone(&time_provider) as _,
+        Arc::clone(&registry),
+    )
+    .await
+    .unwrap();
 
     let table_index_cache = TableIndexCache::new(
         "test_host".to_string(),
@@ -98,16 +94,14 @@ async fn test_retention_handler_syncs_table_indices_without_policies() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let time_provider = Arc::new(MockProvider::new(Time::from_timestamp_nanos(0)));
     let registry = Arc::new(Registry::default());
-    let catalog = Arc::new(
-        Catalog::new(
-            "test_host".to_string(),
-            Arc::clone(&object_store),
-            Arc::clone(&time_provider) as _,
-            Arc::clone(&registry),
-        )
-        .await
-        .unwrap(),
-    );
+    let catalog = Catalog::new(
+        "test_host".to_string(),
+        Arc::clone(&object_store),
+        Arc::clone(&time_provider) as _,
+        Arc::clone(&registry),
+    )
+    .await
+    .unwrap();
 
     let table_index_cache = TableIndexCache::new(
         "test_host".to_string(),
@@ -125,7 +119,7 @@ async fn test_retention_handler_syncs_table_indices_without_policies() {
         table_id,
         vec![ParquetFile {
             id: ParquetFileId::from(0),
-            path: "test_file_0.parquet".to_string(),
+            path: "test_file_0.parquet".into(),
             size_bytes: 1000,
             row_count: 100,
             chunk_time: 0,
@@ -137,7 +131,7 @@ async fn test_retention_handler_syncs_table_indices_without_policies() {
     databases.insert(db_id, DatabaseTables { tables });
     let seq = SnapshotSequenceNumber::new(1);
     let snapshot = PersistedSnapshotVersion::V1(PersistedSnapshot {
-        node_id: "test_host".to_string(),
+        node_id: "test_host".into(),
         next_file_id: ParquetFileId::from(1),
         snapshot_sequence_number: seq,
         wal_file_sequence_number: WalFileSequenceNumber::new(1),
@@ -163,7 +157,7 @@ async fn test_retention_handler_syncs_table_indices_without_policies() {
         catalog,
         Arc::clone(&time_provider) as _,
         Duration::from_secs(30),
-        "test_host".to_string(),
+        "test_host".into(),
     );
     handler.check_and_enforce_retention().await;
 
