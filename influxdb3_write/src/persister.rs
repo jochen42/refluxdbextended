@@ -407,7 +407,7 @@ impl Persister {
         compaction_id: &str,
         persisted_snapshot: &PersistedSnapshot,
     ) -> Result<()> {
-        let path = CompactionInfoFilePath::new(self.node_identifier_prefix.as_str(), compaction_id);
+        let path = CompactionInfoFilePath::new(self.node_identifier_prefix.as_ref(), compaction_id);
         let json = serde_json::to_vec_pretty(persisted_snapshot)?;
         self.object_store
             .put_adaptive(path.as_ref(), json.into())

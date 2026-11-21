@@ -570,7 +570,7 @@ impl CompactionService {
             .iter()
             .flat_map(|(_, db)| db.tables.iter())
             .flat_map(|(_, files)| files.iter())
-            .map(|f| f.path.as_str())
+            .map(|f| f.path.as_ref())
             .collect();
         // Candidates: files a still-foldable WAL manifest lists but `merged`
         // lacks. A candidate is EITHER compaction-deleted (tombstone it) OR
@@ -587,13 +587,13 @@ impl CompactionService {
                     for (_, db) in snap.databases.iter() {
                         for (_, files) in db.tables.iter() {
                             for f in files {
-                                if !merged_paths.contains(f.path.as_str()) {
+                                if !merged_paths.contains(f.path.as_ref()) {
                                     if let Some(p) =
                                         f.path.split('/').next().filter(|p| !p.is_empty())
                                     {
                                         prefixes.insert(p.to_string());
                                     }
-                                    candidates.push((f.path.clone(), wal_seq));
+                                    candidates.push((f.path.to_string(), wal_seq));
                                 }
                             }
                         }
@@ -645,7 +645,7 @@ impl CompactionService {
                 .iter()
                 .flat_map(|(_, db)| db.tables.iter())
                 .flat_map(|(_, files)| files.iter())
-                .map(|f| f.path.as_str())
+                .map(|f| f.path.as_ref())
                 .collect();
             let prefixes: std::collections::HashSet<String> = live
                 .iter()
@@ -1076,7 +1076,7 @@ impl CompactionService {
 
         Ok(Some(ParquetFile {
             id: ParquetFileId::new(),
-            path: path.to_string(),
+            path: Arc::from(path.as_ref()),
             size_bytes,
             row_count,
             chunk_time,
@@ -1182,7 +1182,7 @@ impl CompactionService {
         let publish_ms = self.time_provider.now().timestamp_millis();
         let compaction_id = compaction_id.to_string();
         let old_paths: Vec<ObjPath> =
-            old_files.iter().map(|f| ObjPath::from(f.path.clone())).collect();
+            old_files.iter().map(|f| ObjPath::from(f.path.as_ref())).collect();
         let object_store = Arc::clone(&self.object_store);
         let deletes = self.metrics.input_deletes.clone();
         // Retained-overhang gauges: how much gen{N-1} the cold-gate is holding.

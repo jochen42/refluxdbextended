@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 
 use metric::{Metric, Registry, U64Counter, U64Gauge};
 

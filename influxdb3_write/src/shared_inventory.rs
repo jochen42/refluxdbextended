@@ -390,7 +390,7 @@ impl SharedInventory {
         // re-fetching anything we already saw.
         let mut wal_watermarks = since_per_node;
         for s in &wal_snapshots {
-            let entry = wal_watermarks.entry(s.node_id.clone()).or_insert(0);
+            let entry = wal_watermarks.entry(s.node_id.to_string()).or_insert(0);
             let seq = s.snapshot_sequence_number.as_u64();
             if seq > *entry {
                 *entry = seq;

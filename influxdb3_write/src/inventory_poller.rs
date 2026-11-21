@@ -286,9 +286,10 @@ async fn tick(
     // NOT_FOUND, so passing a sentinel high value just pulls everything new.
     let before_seq = catalog.sequence_number().get();
     match catalog
-        .update_to_sequence_number(influxdb3_catalog::catalog::CatalogSequenceNumber::new(
-            u64::MAX - 1,
-        ))
+        .update_to_sequence_number(
+            influxdb3_catalog::catalog::CatalogSequenceNumber::new(u64::MAX - 1),
+            None,
+        )
         .await
     {
         Ok(()) => {
@@ -320,7 +321,7 @@ async fn tick(
         let seq = s.snapshot_sequence_number.as_u64();
         let wal_seq = s.wal_file_sequence_number.as_u64();
         persisted_files.add_persisted_snapshot_files(s);
-        let entry = wal_cursors.entry(node.clone()).or_insert(0);
+        let entry = wal_cursors.entry(node.to_string()).or_insert(0);
         if seq > *entry {
             *entry = seq;
         }

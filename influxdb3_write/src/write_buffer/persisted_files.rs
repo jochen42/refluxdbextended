@@ -227,16 +227,17 @@ impl PersistedFiles {
             return;
         };
 
-        let paths_to_remove: HashSet<&String> = files_to_remove.iter().map(|f| &f.path).collect();
+        let paths_to_remove: HashSet<&str> =
+            files_to_remove.iter().map(|f| f.path.as_ref()).collect();
 
         let (actually_removed_count, actually_removed_size, actually_removed_rows) = files
             .iter()
-            .filter(|f| paths_to_remove.contains(&f.path))
+            .filter(|f| paths_to_remove.contains(f.path.as_ref()))
             .fold((0u64, 0u64, 0u64), |(c, s, r), f| {
                 (c + 1, s + f.size_bytes, r + f.row_count)
             });
 
-        files.retain(|file| !paths_to_remove.contains(&file.path));
+        files.retain(|file| !paths_to_remove.contains(file.path.as_ref()));
 
         inner.parquet_files_size_mb -= as_mb(actually_removed_size);
         inner.parquet_files_row_count = inner
@@ -886,17 +887,17 @@ fn update_persisted_files_with_snapshot(
                     let table_files = db_tables
                         .entry(*table_id)
                         .or_insert_with(|| Vec::with_capacity(new_parquet_files.len()));
-                    let mut seen_paths: HashSet<String> =
-                        table_files.iter().map(|f| f.path.clone()).collect();
+                    let mut seen_paths: HashSet<Arc<str>> =
+                        table_files.iter().map(|f| Arc::clone(&f.path)).collect();
                     for file in new_parquet_files {
                         // Suppress a re-add of a file a prior fold already saw
                         // removed (removal-before-add reorder). Without this the
                         // add resurrects a compaction-deleted gen1 file → a
                         // phantom ref that 404s at query time.
-                        if tombstones.contains_key(&file.path) {
+                        if tombstones.contains_key(file.path.as_ref()) {
                             continue;
                         }
-                        if seen_paths.insert(file.path.clone()) {
+                        if seen_paths.insert(Arc::clone(&file.path)) {
                             delta.added_count += 1;
                             delta.added_size_bytes += file.size_bytes;
                             delta.added_row_count += file.row_count;
@@ -923,19 +924,19 @@ fn update_persisted_files_with_snapshot(
                 .for_each(|(table_id, remove_parquet_files)| {
                     let remove_paths: HashSet<&str> = remove_parquet_files
                         .iter()
-                        .map(|f| f.path.as_str())
+                        .map(|f| f.path.as_ref())
                         .collect();
 
                     // Which targets are actually present right now? Captured
                     // before the retain so we can tell "removed" (was present)
                     // from "absent" (reordered ahead of its add) afterwards.
-                    let present_targets: HashSet<String> = db_to_tables
+                    let present_targets: HashSet<Arc<str>> = db_to_tables
                         .get(db_id)
                         .and_then(|t| t.get(table_id))
                         .map(|fs| {
                             fs.iter()
-                                .filter(|f| remove_paths.contains(f.path.as_str()))
-                                .map(|f| f.path.clone())
+                                .filter(|f| remove_paths.contains(f.path.as_ref()))
+                                .map(|f| Arc::clone(&f.path))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -945,7 +946,7 @@ fn update_persisted_files_with_snapshot(
                         .and_then(|t| t.get_mut(table_id))
                     {
                         table_files.retain(|f| {
-                            if remove_paths.contains(f.path.as_str()) {
+                            if remove_paths.contains(f.path.as_ref()) {
                                 delta.removed_count += 1;
                                 delta.removed_size_bytes += f.size_bytes;
                                 delta.removed_row_count += f.row_count;
@@ -974,7 +975,7 @@ fn update_persisted_files_with_snapshot(
                             })
                         };
                         if let Some(gc) = gc {
-                            tombstones.insert(f.path.clone(), gc);
+                            tombstones.insert(f.path.to_string(), gc);
                         }
                     }
                 });

@@ -176,7 +176,7 @@ pub async fn validate_once(
             match existing.get(prefix) {
                 Some(Some(paths)) => {
                     summary.checked += 1;
-                    if !paths.contains(&file.path) {
+                    if !paths.contains(file.path.as_ref()) {
                         warn!(
                             path = %file.path,
                             ?db_id,
@@ -200,7 +200,7 @@ pub async fn validate_once(
             // this the phantom resurrects and is re-evicted every pass — the
             // 469K-eviction churn.
             persisted_files
-                .tombstone_evicted_paths(missing.into_iter().map(|f| f.path));
+                .tombstone_evicted_paths(missing.into_iter().map(|f| f.path.to_string()));
         }
     }
 

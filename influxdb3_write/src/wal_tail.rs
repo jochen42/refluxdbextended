@@ -302,15 +302,27 @@ impl WalTailBuffer {
                     .map_err(|e| {
                         DataFusionError::Execution(format!("wal tail batches: {e}"))
                     })?;
-                for (chunk_time, (ts_min_max, batches)) in partitioned {
-                    if batches.is_empty() {
-                        continue;
+                for (chunk_time, buffered) in partitioned {
+                    // Frozen (snapshotting) batches before live ones, matching
+                    // the writer's rank: a later overwrite in the live part must
+                    // win dedup against the frozen copy of the same row.
+                    let parts = [
+                        (buffered.snapshotting, buffered.snapshotting_min_max),
+                        (buffered.live, buffered.live_min_max),
+                    ];
+                    for (batches, ts_min_max) in parts {
+                        let Some(ts_min_max) = ts_min_max else {
+                            continue;
+                        };
+                        if batches.is_empty() {
+                            continue;
+                        }
+                        let entry = by_partition
+                            .entry(chunk_time)
+                            .or_insert_with(|| (ts_min_max, Vec::new()));
+                        entry.0 = entry.0.union(&ts_min_max);
+                        entry.1.extend(batches);
                     }
-                    let entry = by_partition
-                        .entry(chunk_time)
-                        .or_insert_with(|| (ts_min_max, Vec::new()));
-                    entry.0 = entry.0.union(&ts_min_max);
-                    entry.1.extend(batches);
                 }
             }
         }

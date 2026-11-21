@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use data_types::NamespaceName;
+use influxdb3_types::DatabaseName;
 use datafusion::catalog::Session;
 use datafusion::common::DataFusionError;
 use influxdb3_cache::distinct_cache::DistinctCacheProvider;
@@ -59,7 +59,7 @@ impl CompositeWriteBuffer {
 impl Bufferer for CompositeWriteBuffer {
     async fn write_lp(
         &self,
-        database: NamespaceName<'static>,
+        database: DatabaseName,
         lp: &str,
         ingest_time: Time,
         accept_partial: bool,
