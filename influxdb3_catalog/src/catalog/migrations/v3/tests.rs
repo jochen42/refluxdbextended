@@ -1973,7 +1973,7 @@ mod runner {
 /// Offline rehearsal on a real catalog copy. Prints each token's v2
 /// permissions next to the permissions in the synthesized v3 record (no
 /// hashes). Run with
-/// `REHEARSAL_CATALOG_ROOT=<dir holding _catalog/> [REHEARSAL_TOKEN_OVERRIDES=<spec>] cargo test -p influxdb3_catalog rehearsal_token_permissions -- --ignored --nocapture`.
+/// `REHEARSAL_CATALOG_ROOT=<dir holding the prefix> [REHEARSAL_CATALOG_PREFIX=<prefix, default _catalog>] [REHEARSAL_TOKEN_OVERRIDES=<spec>] cargo test -p influxdb3_catalog rehearsal_token_permissions -- --ignored --nocapture`.
 #[tokio::test]
 #[ignore = "needs REHEARSAL_CATALOG_ROOT"]
 async fn rehearsal_token_permissions() {
@@ -1985,7 +1985,10 @@ async fn rehearsal_token_permissions() {
     let root = std::env::var("REHEARSAL_CATALOG_ROOT").expect("REHEARSAL_CATALOG_ROOT");
     let store: Arc<dyn ObjectStore> =
         Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root).unwrap());
-    let prefix: Arc<str> = Arc::from("_catalog");
+    // `_catalog` for a shared catalog, the node id for a single `--mode all` node.
+    let prefix: Arc<str> = Arc::from(
+        std::env::var("REHEARSAL_CATALOG_PREFIX").unwrap_or_else(|_| "_catalog".to_string()),
+    );
     let v2_store = ostore::v2::ObjectStoreCatalog::new(
         Arc::clone(&prefix),
         u64::MAX,
