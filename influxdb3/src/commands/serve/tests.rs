@@ -135,11 +135,37 @@ fn test_explicitly_set_new_size_spelling_wins_over_legacy() {
 // wired: the legacy env names bind directly to the hidden legacy args
 // rather than being copied onto the new names by an ENV_ALIASES pass.
 //
-// This test mutates the process environment. nextest's process-per-test
-// execution isolates it; the vars are cleared before and after each case
-// regardless so a plain `cargo test` run is left clean.
+// This test mutates the process environment. Under plain `cargo test` that
+// races with every other test in this binary that parses `Config` (for
+// example a bare `INFLUXDB3_FILE_CACHE_SIZE=500` makes them fail), so the
+// test re-runs itself in a child process that runs only this test. nextest
+// already runs one process per test; the re-exec is harmless there.
 #[test]
 fn test_size_option_env_vars_mirror_cli_behavior() {
+    const CHILD: &str = "INFLUXDB3_SERVE_ENV_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let full = concat!(
+            module_path!(),
+            "::test_size_option_env_vars_mirror_cli_behavior"
+        );
+        let name = full.split_once("::").map_or(full, |(_, rest)| rest);
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("spawn isolated test process");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "isolated run of {name} failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    size_option_env_vars_mirror_cli_behavior();
+}
+
+fn size_option_env_vars_mirror_cli_behavior() {
     use clap::{CommandFactory as _, FromArgMatches as _, Parser as _, parser::ValueSource};
     use std::collections::HashMap;
 
