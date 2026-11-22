@@ -1,0 +1,9 @@
+[11:48:42] phase 0: starting minio + writer + querier
+[11:48:50] phase 1: writing one LP row
+[11:48:51] phase 2: polling querier (deadline=3s)
+[11:48:52] row visible after 0.636s
+[11:48:52] phase 3: killing writer; querier should still see the row from cached state
+[11:48:53] post-writer-kill query still returns 1 (resilience OK)
+[11:48:53] done — freshness OK in 0.636s (deadline 3s)
+[11:48:53] capturing container logs
+[11:48:53] tearing down stack

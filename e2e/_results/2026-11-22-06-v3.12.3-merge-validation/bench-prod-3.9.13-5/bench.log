@@ -1,0 +1,156 @@
+[11:48:54] phase 0: starting writer + querier (no compactor)
+[11:49:02] phase 1: generating data (hours=24 hosts=200 points-per-host=5000 batch-size=1000)
+ 8ab1992027df Pulling fs layer 0B
+ b90627b8f429 Pulling fs layer 0B
+ 6d356b48c1c5 Pulling fs layer 0B
+ 9cee687b648e Pulling fs layer 0B
+ b90627b8f429 Already exists 0B
+ 8ab1992027df Download complete 0B
+ 6d356b48c1c5 Download complete 0B
+ 9cee687b648e Downloading 1.049MB
+ 6d356b48c1c5 Extracting 1B
+ 9cee687b648e Downloading 5.243MB
+ 6d356b48c1c5 Pull complete 0B
+ 9cee687b648e Downloading 9.437MB
+ 2256d60705b2 Download complete 0B
+ 9cee687b648e Downloading 12.58MB
+ 8f33bda100ff Download complete 0B
+ 9cee687b648e Download complete 0B
+ 9cee687b648e Extracting 1B
+ 9cee687b648e Extracting 1B
+ 8ab1992027df Pull complete 0B
+ 9cee687b648e Pull complete 0B
+plan: 200 hosts × 5000 points = 1000000 total points over 24h (start=1795261747180628670 end=1795348147180628670) parallel=4
+  progress: 20000/1000000 (2.0%) at 4221 points/s
+  progress: 40000/1000000 (4.0%) at 4098 points/s
+  progress: 60000/1000000 (6.0%) at 4071 points/s
+  progress: 80000/1000000 (8.0%) at 4049 points/s
+  progress: 100000/1000000 (10.0%) at 4043 points/s
+  progress: 120000/1000000 (12.0%) at 4034 points/s
+  progress: 140000/1000000 (14.0%) at 4031 points/s
+  progress: 160000/1000000 (16.0%) at 4025 points/s
+  progress: 180000/1000000 (18.0%) at 4024 points/s
+  progress: 200000/1000000 (20.0%) at 4020 points/s
+  progress: 220000/1000000 (22.0%) at 4019 points/s
+  progress: 240000/1000000 (24.0%) at 4016 points/s
+  progress: 260000/1000000 (26.0%) at 4017 points/s
+  progress: 280000/1000000 (28.0%) at 4014 points/s
+  progress: 300000/1000000 (30.0%) at 4014 points/s
+  progress: 320000/1000000 (32.0%) at 4013 points/s
+  progress: 340000/1000000 (34.0%) at 4013 points/s
+  progress: 360000/1000000 (36.0%) at 4011 points/s
+  progress: 380000/1000000 (38.0%) at 4011 points/s
+  progress: 400000/1000000 (40.0%) at 4010 points/s
+  progress: 420000/1000000 (42.0%) at 4010 points/s
+  progress: 440000/1000000 (44.0%) at 4009 points/s
+  progress: 460000/1000000 (46.0%) at 4009 points/s
+  progress: 480000/1000000 (48.0%) at 4008 points/s
+  progress: 500000/1000000 (50.0%) at 4008 points/s
+  progress: 520000/1000000 (52.0%) at 4008 points/s
+  progress: 540000/1000000 (54.0%) at 4008 points/s
+  progress: 560000/1000000 (56.0%) at 4007 points/s
+  progress: 580000/1000000 (58.0%) at 4007 points/s
+  progress: 600000/1000000 (60.0%) at 4007 points/s
+  progress: 620000/1000000 (62.0%) at 4007 points/s
+  progress: 640000/1000000 (64.0%) at 4006 points/s
+  progress: 660000/1000000 (66.0%) at 4006 points/s
+  progress: 680000/1000000 (68.0%) at 4006 points/s
+  progress: 700000/1000000 (70.0%) at 4006 points/s
+  progress: 720000/1000000 (72.0%) at 4006 points/s
+  progress: 740000/1000000 (74.0%) at 4006 points/s
+  progress: 760000/1000000 (76.0%) at 4005 points/s
+  progress: 780000/1000000 (78.0%) at 4005 points/s
+  progress: 800000/1000000 (80.0%) at 4005 points/s
+  progress: 820000/1000000 (82.0%) at 4005 points/s
+  progress: 840000/1000000 (84.0%) at 4005 points/s
+  progress: 860000/1000000 (86.0%) at 4005 points/s
+  progress: 880000/1000000 (88.0%) at 4005 points/s
+  progress: 900000/1000000 (90.0%) at 4005 points/s
+  progress: 920000/1000000 (92.0%) at 4004 points/s
+  progress: 940000/1000000 (94.0%) at 4005 points/s
+  progress: 960000/1000000 (96.0%) at 4004 points/s
+  progress: 980000/1000000 (98.0%) at 4004 points/s
+  progress: 1000000/1000000 (100.0%) at 4004 points/s
+done: wrote 1000000 points in 249.7s (4004 points/s)
+[11:53:17] phase 1b: waiting for writer to flush WAL + publish inventory
+[11:55:17] phase 2: benchmarking uncompacted dataset
+benchmarking 4 queries × 5 runs (tag=uncompacted)
+  full_scan: warming...
+    run 1/5: 16.778s (185 bytes)
+    run 2/5: 15.757s (184 bytes)
+    run 3/5: 14.943s (184 bytes)
+    run 4/5: 15.707s (184 bytes)
+    run 5/5: 15.488s (183 bytes)
+  high_card_filter: warming...
+    run 1/5: 15.243s (1360 bytes)
+    run 2/5: 14.380s (1360 bytes)
+    run 3/5: 14.246s (1360 bytes)
+    run 4/5: 14.112s (1360 bytes)
+    run 5/5: 14.279s (1360 bytes)
+  hour_buckets: warming...
+    run 1/5: 14.160s (1328 bytes)
+    run 2/5: 13.775s (1331 bytes)
+    run 3/5: 14.380s (1327 bytes)
+    run 4/5: 16.153s (1331 bytes)
+    run 5/5: 15.826s (1332 bytes)
+  narrow_window: warming...
+    run 1/5: 14.601s (171 bytes)
+    run 2/5: 14.472s (171 bytes)
+    run 3/5: 14.545s (169 bytes)
+    run 4/5: 14.296s (169 bytes)
+    run 5/5: 14.828s (169 bytes)
+wrote results/uncompacted.json
+[12:01:20] uncompacted parquet object count (best effort):        0
+unknown
+[12:01:20] phase 3: starting compactor; will poll for settle
+[12:01:22] compactor cycles observed so far: 0
+[12:01:32] compactor cycles observed so far: 0
+[12:01:42] compactor cycles observed so far: 0
+[12:01:52] compactor cycles observed so far: 4
+[12:02:02] compactor cycles observed so far: 222
+[12:02:12] compactor cycles observed so far: 289
+[12:02:22] compactor cycles observed so far: 290
+[12:02:32] compactor cycles observed so far: 290
+[12:02:42] compactor cycles observed so far: 290
+[12:02:53] compactor cycles observed so far: 290
+[12:02:53] compactor appears settled (30s without new cycles)
+[12:02:58] phase 4: benchmarking compacted dataset
+benchmarking 4 queries × 5 runs (tag=compacted)
+  full_scan: warming...
+    run 1/5: 0.056s (184 bytes)
+    run 2/5: 0.053s (185 bytes)
+    run 3/5: 0.011s (186 bytes)
+    run 4/5: 0.009s (186 bytes)
+    run 5/5: 0.013s (185 bytes)
+  high_card_filter: warming...
+    run 1/5: 0.022s (1360 bytes)
+    run 2/5: 0.022s (1360 bytes)
+    run 3/5: 0.020s (1360 bytes)
+    run 4/5: 0.020s (1360 bytes)
+    run 5/5: 0.021s (1360 bytes)
+  hour_buckets: warming...
+    run 1/5: 0.020s (1334 bytes)
+    run 2/5: 0.023s (1334 bytes)
+    run 3/5: 0.019s (1334 bytes)
+    run 4/5: 0.018s (1339 bytes)
+    run 5/5: 0.018s (1332 bytes)
+  narrow_window: warming...
+    run 1/5: 0.020s (171 bytes)
+    run 2/5: 0.020s (172 bytes)
+    run 3/5: 0.020s (171 bytes)
+    run 4/5: 0.019s (172 bytes)
+    run 5/5: 0.020s (171 bytes)
+wrote results/compacted.json
+[12:03:01] phase 5: rendering comparison
+
+query                     uncompacted (s)    compacted (s)    speedup
+----------------------------------------------------------------------
+full_scan                          15.707            0.013   1245.35x
+high_card_filter                   14.279            0.021    691.65x
+hour_buckets                       14.380            0.019    754.44x
+narrow_window                      14.545            0.020    741.30x
+
+runs per query: 5
+[12:03:01] done — full results in e2e/results/{uncompacted,compacted}.json
+[12:03:01] capturing container logs
+[12:03:02] tearing down stack

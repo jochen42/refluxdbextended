@@ -1,0 +1,136 @@
+[12:03:04] phase 0: starting writer + querier (no compactor)
+[12:03:14] phase 1: generating data (hours=24 hosts=200 points-per-host=5000 batch-size=1000)
+plan: 200 hosts × 5000 points = 1000000 total points over 24h (start=1795262596585359633 end=1795348996585359633) parallel=4
+  progress: 20000/1000000 (2.0%) at 4028 points/s
+  progress: 40000/1000000 (4.0%) at 4009 points/s
+  progress: 60000/1000000 (6.0%) at 4004 points/s
+  progress: 80000/1000000 (8.0%) at 4000 points/s
+  progress: 100000/1000000 (10.0%) at 4005 points/s
+  progress: 120000/1000000 (12.0%) at 4002 points/s
+  progress: 140000/1000000 (14.0%) at 4004 points/s
+  progress: 160000/1000000 (16.0%) at 4001 points/s
+  progress: 180000/1000000 (18.0%) at 4002 points/s
+  progress: 200000/1000000 (20.0%) at 4002 points/s
+  progress: 220000/1000000 (22.0%) at 4002 points/s
+  progress: 240000/1000000 (24.0%) at 4001 points/s
+  progress: 260000/1000000 (26.0%) at 4002 points/s
+  progress: 280000/1000000 (28.0%) at 4000 points/s
+  progress: 300000/1000000 (30.0%) at 4002 points/s
+  progress: 320000/1000000 (32.0%) at 4001 points/s
+  progress: 340000/1000000 (34.0%) at 4001 points/s
+  progress: 360000/1000000 (36.0%) at 4001 points/s
+  progress: 380000/1000000 (38.0%) at 4002 points/s
+  progress: 400000/1000000 (40.0%) at 4000 points/s
+  progress: 420000/1000000 (42.0%) at 4001 points/s
+  progress: 440000/1000000 (44.0%) at 4000 points/s
+  progress: 460000/1000000 (46.0%) at 4001 points/s
+  progress: 480000/1000000 (48.0%) at 4000 points/s
+  progress: 500000/1000000 (50.0%) at 4001 points/s
+  progress: 520000/1000000 (52.0%) at 4000 points/s
+  progress: 540000/1000000 (54.0%) at 4001 points/s
+  progress: 560000/1000000 (56.0%) at 4001 points/s
+  progress: 580000/1000000 (58.0%) at 4001 points/s
+  progress: 600000/1000000 (60.0%) at 4000 points/s
+  progress: 620000/1000000 (62.0%) at 4001 points/s
+  progress: 640000/1000000 (64.0%) at 4001 points/s
+  progress: 660000/1000000 (66.0%) at 4001 points/s
+  progress: 680000/1000000 (68.0%) at 4000 points/s
+  progress: 700000/1000000 (70.0%) at 4001 points/s
+  progress: 720000/1000000 (72.0%) at 4000 points/s
+  progress: 740000/1000000 (74.0%) at 4001 points/s
+  progress: 760000/1000000 (76.0%) at 4000 points/s
+  progress: 780000/1000000 (78.0%) at 4001 points/s
+  progress: 800000/1000000 (80.0%) at 4000 points/s
+  progress: 820000/1000000 (82.0%) at 4001 points/s
+  progress: 840000/1000000 (84.0%) at 4000 points/s
+  progress: 860000/1000000 (86.0%) at 4001 points/s
+  progress: 880000/1000000 (88.0%) at 4000 points/s
+  progress: 900000/1000000 (90.0%) at 4000 points/s
+  progress: 920000/1000000 (92.0%) at 4000 points/s
+  progress: 940000/1000000 (94.0%) at 4000 points/s
+  progress: 960000/1000000 (96.0%) at 4000 points/s
+  progress: 980000/1000000 (98.0%) at 4001 points/s
+  progress: 1000000/1000000 (100.0%) at 4000 points/s
+done: wrote 1000000 points in 250.0s (4000 points/s)
+[12:07:26] phase 1b: waiting for writer to flush WAL + publish inventory
+[12:09:26] phase 2: benchmarking uncompacted dataset
+benchmarking 4 queries × 5 runs (tag=uncompacted)
+  full_scan: warming...
+    run 1/5: 21.057s (184 bytes)
+    run 2/5: 21.284s (184 bytes)
+    run 3/5: 19.970s (184 bytes)
+    run 4/5: 19.650s (183 bytes)
+    run 5/5: 20.404s (183 bytes)
+  high_card_filter: warming...
+    run 1/5: 20.865s (1360 bytes)
+    run 2/5: 20.689s (1360 bytes)
+    run 3/5: 20.834s (1360 bytes)
+    run 4/5: 20.855s (1360 bytes)
+    run 5/5: 20.703s (1360 bytes)
+  hour_buckets: warming...
+    run 1/5: 25.041s (1323 bytes)
+    run 2/5: 23.381s (1326 bytes)
+    run 3/5: 23.723s (1325 bytes)
+    run 4/5: 23.670s (1325 bytes)
+    run 5/5: 21.794s (1325 bytes)
+  narrow_window: warming...
+    run 1/5: 20.870s (170 bytes)
+    run 2/5: 21.013s (169 bytes)
+    run 3/5: 21.106s (170 bytes)
+    run 4/5: 20.557s (169 bytes)
+    run 5/5: 20.726s (170 bytes)
+wrote results/uncompacted.json
+[12:18:02] uncompacted parquet object count (best effort):        0
+unknown
+[12:18:02] phase 3: starting compactor; will poll for settle
+[12:18:04] compactor cycles observed so far: 0
+[12:18:14] compactor cycles observed so far: 0
+[12:18:24] compactor cycles observed so far: 0
+[12:18:35] compactor cycles observed so far: 7
+[12:18:45] compactor cycles observed so far: 172
+[12:18:55] compactor cycles observed so far: 264
+[12:19:05] compactor cycles observed so far: 290
+[12:19:15] compactor cycles observed so far: 290
+[12:19:25] compactor cycles observed so far: 290
+[12:19:35] compactor cycles observed so far: 290
+[12:19:35] compactor appears settled (30s without new cycles)
+[12:19:40] phase 4: benchmarking compacted dataset
+benchmarking 4 queries × 5 runs (tag=compacted)
+  full_scan: warming...
+    run 1/5: 0.048s (187 bytes)
+    run 2/5: 0.014s (187 bytes)
+    run 3/5: 0.013s (187 bytes)
+    run 4/5: 0.039s (185 bytes)
+    run 5/5: 0.012s (187 bytes)
+  high_card_filter: warming...
+    run 1/5: 0.028s (1360 bytes)
+    run 2/5: 0.027s (1360 bytes)
+    run 3/5: 0.033s (1360 bytes)
+    run 4/5: 0.029s (1360 bytes)
+    run 5/5: 0.029s (1360 bytes)
+  hour_buckets: warming...
+    run 1/5: 0.029s (1319 bytes)
+    run 2/5: 0.029s (1322 bytes)
+    run 3/5: 0.028s (1325 bytes)
+    run 4/5: 0.024s (1319 bytes)
+    run 5/5: 0.029s (1320 bytes)
+  narrow_window: warming...
+    run 1/5: 0.028s (173 bytes)
+    run 2/5: 0.026s (172 bytes)
+    run 3/5: 0.027s (174 bytes)
+    run 4/5: 0.026s (171 bytes)
+    run 5/5: 0.025s (172 bytes)
+wrote results/compacted.json
+[12:19:44] phase 5: rendering comparison
+
+query                     uncompacted (s)    compacted (s)    speedup
+----------------------------------------------------------------------
+full_scan                          20.404            0.014   1488.00x
+high_card_filter                   20.834            0.029    723.18x
+hour_buckets                       23.670            0.029    823.71x
+narrow_window                      20.870            0.026    812.22x
+
+runs per query: 5
+[12:19:44] done — full results in e2e/results/{uncompacted,compacted}.json
+[12:19:44] capturing container logs
+[12:19:45] tearing down stack
