@@ -13,6 +13,7 @@
 #![expect(dead_code)]
 
 mod conversions;
+pub(crate) mod token_overrides;
 
 use std::sync::Arc;
 
@@ -75,6 +76,16 @@ pub(crate) async fn check_and_migrate_v2_to_v3(
     prefix: Arc<str>,
     store: Arc<dyn ObjectStore>,
 ) -> Result<MigrationResult, MigrationError> {
+    check_and_migrate_v2_to_v3_with(prefix, store, token_overrides::registered()).await
+}
+
+/// [`check_and_migrate_v2_to_v3`] with explicit token permission overrides
+/// (see [`token_overrides`]) instead of the ones registered for the process.
+pub(crate) async fn check_and_migrate_v2_to_v3_with(
+    prefix: Arc<str>,
+    store: Arc<dyn ObjectStore>,
+    overrides: &[token_overrides::TokenPermissionOverride],
+) -> Result<MigrationResult, MigrationError> {
     let v3_store = ostore::v3::ObjectStoreCatalog::new(
         Arc::clone(&prefix),
         Arc::clone(&store),
@@ -102,7 +113,9 @@ pub(crate) async fn check_and_migrate_v2_to_v3(
 
     let catalog_uuid = v2_catalog.catalog_uuid;
     let catalog_sequence = v2_catalog.sequence_number();
-    let v2_snapshot = v2_catalog.snapshot();
+    let mut v2_snapshot = v2_catalog.snapshot();
+    token_overrides::apply(&mut v2_snapshot, overrides)
+        .map_err(|e| MigrationError::Unexpected(anyhow::anyhow!(e)))?;
     let batch = synthesize_records(&v2_snapshot);
 
     let mut v3_inner = V3InnerCatalog::new(Arc::clone(&prefix), catalog_uuid);

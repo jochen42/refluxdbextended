@@ -9,7 +9,7 @@
 #      build gen2 files. Record a fingerprint and the token matrix.
 #   2. Stop everything (full stop, as the rollout requires).
 #   3. NEW writer (runs the migration), then NEW compactor, then NEW querier.
-#   4. Assert: same fingerprint, tokens still valid with the same grants,
+#   4. Assert: row count and sum match what was ingested, tokens still valid with the same grants,
 #      new writes visible, compactor keeps working, no ERROR/panic in logs.
 #   5. Start the OLD querier against the migrated bucket and record what it
 #      does (rollback-without-restore check; informational).
@@ -28,6 +28,12 @@ cd "$(dirname "$0")"
 : "${NEW_IMAGE:?set NEW_IMAGE}"
 : "${BUCKET:=influxdb3-upgrade}"
 : "${LOG_FILTER:=info}"
+: "${CHECKPOINT_TOKENS:=1}"
+# Grants the NEW writer restores during the migration (--migration-token-permissions).
+# Default: what the tokens were created with. Set it empty to see what the
+# checkpoint alone leaves (the token matrix then differs on purpose).
+MIGRATION_TOKEN_PERMISSIONS=${MIGRATION_TOKEN_PERMISSIONS-"ro=db:bench:read;roall=db:*:read;rw=db:bench:read,write"}
+export MIGRATION_TOKEN_PERMISSIONS
 export BUCKET LOG_FILTER
 export COMPOSE_FILE=docker-compose.yml:docker-compose.upgrade.yml
 export COMPOSE_PROJECT_NAME=e2e-upgrade
@@ -151,11 +157,22 @@ for t in RO ROALL RW; do [ -n "${!t}" ] || { log "FAIL could not create token $t
 log "tokens created (admin, ro, roall, rw)"
 printf 'ADMIN=%s\nRO=%s\nROALL=%s\nRW=%s\n' "$ADMIN" "$RO" "$ROALL" "$RW" >"$OUT/tokens.env"
 
+# Prod condition: the 3.9 v2 checkpoint (every 100 catalog changes) stores
+# every scoped token's actions as "all". Force one by creating 110 tables one
+# write at a time, so the tokens above go through a checkpoint like prod's.
+if [ "$CHECKPOINT_TOKENS" = 1 ]; then
+    for i in $(seq 1 110); do
+        curl -sf -X POST "$W/api/v3/write_lp?db=other" -H "Authorization: Bearer $ADMIN" \
+            --data-binary "pad_$i v=1i" >/dev/null || { log "FAIL padding write $i"; exit 1; }
+    done
+    log "110 catalog changes written to force a v2 checkpoint"
+fi
+
 # 5 hosts × 4h at 10s spacing = 7200 rows, ending 10 minutes ago, written in
 # 24 batches (one per 10 minutes of data) so the writer persists many gen1 files.
-python3 - "$W" "$ADMIN" <<'PY'
+python3 - "$W" "$ADMIN" "$OUT/fingerprint.expected.csv" <<'PY'
 import sys, time, urllib.request
-base, tok = sys.argv[1], sys.argv[2]
+base, tok, expected = sys.argv[1], sys.argv[2], sys.argv[3]
 end = (int(time.time()) - 600) // 10 * 10
 start = end - 4 * 3600
 ts = list(range(start, end, 10))
@@ -168,6 +185,10 @@ for i in range(0, len(ts), 60):
                                      headers={"Authorization": f"Bearer {tok}"})
         urllib.request.urlopen(req).read()
     time.sleep(1.5)
+with open(expected, "w") as f:  # ground truth for the fingerprint checks
+    f.write("host,n,s\n")
+    for h in range(5):
+        f.write(f"h{h},{len(ts)},{round(sum((t % 997) / 10 + h for t in ts), 3)}\n")
 print("ingested", len(ts) * 5, "rows per db")
 PY
 
@@ -190,6 +211,7 @@ compose stop compactor querier writer
 
 # -- Phase 3: new build, writer first -----------------------------------------
 log "phase 3: NEW=$NEW_IMAGE (writer → compactor → querier)"
+log "migration token permissions: ${MIGRATION_TOKEN_PERMISSIONS:-<none>}"
 use_images "$NEW_IMAGE"
 t0=$(date +%s)
 compose up -d --no-deps --wait writer
@@ -202,7 +224,21 @@ sleep 20
 
 fingerprint "$Q" >"$OUT/fingerprint.new.csv"
 log "new fingerprint: $(tr '\n' ' ' <"$OUT/fingerprint.new.csv")"
-check "fingerprint unchanged" "$(md5 -q "$OUT/fingerprint.old.csv")" "$(md5 -q "$OUT/fingerprint.new.csv")"
+# Compare against what was ingested, not against the old querier: 3.9 queriers
+# can double-count WAL-tail rows (fixed in 930df03263), so the old reading is
+# not a reliable baseline. Old vs new is reported for information.
+fp_matches() { # file  -> "match" or the first differing host
+    python3 - "$OUT/fingerprint.expected.csv" "$1" <<'PY'
+import csv, sys
+exp = {r["host"]: r for r in csv.DictReader(open(sys.argv[1]))}
+got = {r["host"]: r for r in csv.DictReader(open(sys.argv[2]))}
+bad = [h for h in exp if h not in got or int(got[h]["n"]) != int(exp[h]["n"])
+       or abs(float(got[h]["s"]) - float(exp[h]["s"])) > 0.01]
+print("match" if not bad and exp.keys() == got.keys() else f"differs at {bad or sorted(got.keys() ^ exp.keys())}")
+PY
+}
+log "old querier vs ingested: $(fp_matches "$OUT/fingerprint.old.csv") (informational)"
+check "new fingerprint matches ingested data" "match" "$(fp_matches "$OUT/fingerprint.new.csv")"
 diag() { # tag: duplicated timestamps + plan, to tell WAL-tail overlap from parquet overlap
     local d="$OUT/diag.$1"
     sql() { curl -s -G "$Q/api/v3/query_sql" -H "Authorization: Bearer $ADMIN" --data-urlencode db=bench \
@@ -217,6 +253,7 @@ log "diag: dup counts over time: $(grep -h -A3 'dups' "$OUT"/diag.t*s.txt | grep
 token_matrix "$W" "$Q" >"$OUT/tokens.new.txt"
 log "token matrix old → new:"
 paste -d' ' "$OUT/tokens.old.txt" "$OUT/tokens.new.txt" | awk '{split($1,a,"=");split($2,b,"="); printf "  %-22s %s → %s%s\n", a[1], a[2], b[2], (a[2]==b[2]?"":"  (changed)")}' | tee -a "$OUT/report.txt"
+check "token matrix unchanged (15 cases)" "$(md5 -q "$OUT/tokens.old.txt")" "$(md5 -q "$OUT/tokens.new.txt")"
 
 # Freshness on the new stack.
 ts=$(date +%s)000000000

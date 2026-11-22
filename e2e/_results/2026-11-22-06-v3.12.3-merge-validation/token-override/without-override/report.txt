@@ -1,0 +1,42 @@
+[1;36m[15:05:52][0m phase 1: OLD=docker.io/jochen42/refluxdbextended:extended-3.9.13-5
+[1;36m[15:06:02][0m tokens created (admin, ro, roall, rw)
+[1;36m[15:07:51][0m 110 catalog changes written to force a v2 checkpoint
+[1;36m[15:09:04][0m waiting for the old compactor to produce gen2+ files (max 300s)
+[1;36m[15:09:25][0m old fingerprint: host,n,s h0,1495,74126.8 h1,1495,75621.8 h2,1495,77116.8 h3,1495,78611.8 h4,1495,80106.8 
+[1;36m[15:09:26][0m phase 2: full stop
+[1;36m[15:09:27][0m phase 3: NEW=influxdb3-unlocked:e2e-3.12 (writer → compactor → querier)
+[1;36m[15:09:27][0m migration token permissions: <none>
+[1;36m[15:09:29][0m new writer healthy after 2s
+[1;36m[15:09:53][0m new fingerprint: host,n,s h0,1440,71800.3 h1,1440,73240.3 h2,1440,74680.3 h3,1440,76120.3 h4,1440,77560.3 
+[1;36m[15:09:53][0m old querier vs ingested: differs at ['h0', 'h1', 'h2', 'h3', 'h4'] (informational)
+[1;36m[15:09:53][0m PASS new fingerprint matches ingested data (match)
+[1;36m[15:10:53][0m diag: dup counts over time: 0 0 0 0 0 0 
+[1;36m[15:10:57][0m token matrix old → new:
+  ro.query.bench         200 → 200
+  ro.query.other         403 → 403
+  ro.write3.bench        403 → 204  (changed)
+  ro.write1.bench        403 → 204  (changed)
+  ro.cfg                 403 → 403
+  roall.query.bench      200 → 200
+  roall.query.other      200 → 200
+  roall.write3.other     403 → 204  (changed)
+  rw.query.bench         200 → 200
+  rw.write3.bench        204 → 204
+  rw.write3.other        403 → 403
+  rw.write3.newdb        403 → 403
+  admin.query.bench      200 → 200
+  admin.cfg              200 → 200
+  bogus.query.bench      401 → 401
+[1;36m[15:10:57][0m FAIL token matrix unchanged (15 cases): expected f3c4e4feb81ebb032a16bb40765830d0, got ed049c2adbc7f8cf82e383e775728653
+[1;36m[15:10:59][0m PASS new row visible via RO token (yes)
+[1;36m[15:10:59][0m visible after 0.61s
+[1;36m[15:10:59][0m letting the new compactor run 60s
+compactor-1  | 2026-11-22T15:09:29.993596139Z 2026-11-22T15:09:29.993551Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=1 duration_ns=60000000000
+compactor-1  | 2026-11-22T15:09:29.993596972Z 2026-11-22T15:09:29.993555Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=2 duration_ns=3600000000000
+compactor-1  | 2026-11-22T15:09:29.993597514Z 2026-11-22T15:09:29.993559Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=3 duration_ns=86400000000000
+compactor-1  | 2026-11-22T15:09:29.993598055Z 2026-11-22T15:09:29.993560Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=4 duration_ns=604800000000000
+compactor-1  | 2026-11-22T15:09:29.993598514Z 2026-11-22T15:09:29.993561Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=5 duration_ns=2592000000000000
+[1;36m[15:11:59][0m PASS no ERROR/panic lines in new logs (0)
+writer-1  | 2026-11-22T15:09:27.232150512Z 2026-11-22T15:09:27.232107Z  INFO influxdb3_lib::commands::serve: token permission overrides registered for the v2 → v3 migration tokens=0
+writer-1  | 2026-11-22T15:09:27.245803304Z 2026-11-22T15:09:27.245755Z  INFO influxdb3_catalog::catalog::migrations::v3: writing the v3 catalog snapshot
+[1;36m[15:11:59][0m UPGRADE TEST FAILED

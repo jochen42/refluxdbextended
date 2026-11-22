@@ -1973,7 +1973,7 @@ mod runner {
 /// Offline rehearsal on a real catalog copy. Prints each token's v2
 /// permissions next to the permissions in the synthesized v3 record (no
 /// hashes). Run with
-/// `REHEARSAL_CATALOG_ROOT=<dir holding _catalog/> cargo test -p influxdb3_catalog rehearsal_token_permissions -- --ignored --nocapture`.
+/// `REHEARSAL_CATALOG_ROOT=<dir holding _catalog/> [REHEARSAL_TOKEN_OVERRIDES=<spec>] cargo test -p influxdb3_catalog rehearsal_token_permissions -- --ignored --nocapture`.
 #[tokio::test]
 #[ignore = "needs REHEARSAL_CATALOG_ROOT"]
 async fn rehearsal_token_permissions() {
@@ -1996,7 +1996,12 @@ async fn rehearsal_token_permissions() {
         .await
         .unwrap()
         .expect("v2 catalog");
-    let snap = v2.snapshot();
+    let mut snap = v2.snapshot();
+    if let Ok(spec) = std::env::var("REHEARSAL_TOKEN_OVERRIDES") {
+        let overrides = super::token_overrides::parse(&spec).expect("valid overrides");
+        super::token_overrides::apply(&mut snap, &overrides).expect("overrides apply");
+        println!("applied overrides: {spec}");
+    }
     for (id, t) in &snap.tokens.repo {
         println!("v2 token {} {:?} expiry={}", id.get(), t.name, t.expiry);
         for p in &t.permissions {
@@ -2031,4 +2036,186 @@ async fn rehearsal_token_permissions() {
     )
     .expect("apply migrated records");
     println!("applied {} records", batch.as_slice().len());
+}
+
+// ---------------------------------------------------------------------------
+// token permission overrides
+// ---------------------------------------------------------------------------
+
+mod token_permission_overrides {
+    use super::{admin_token, database, empty_snapshot, resource_scoped_token};
+    use crate::catalog::migrations::v3::token_overrides::{apply, parse};
+    use crate::catalog::migrations::v3::{MigrationResult, check_and_migrate_v2_to_v3_with};
+    use crate::catalog::versions::v3::schema::storage::StorageMode as V3StorageMode;
+    use crate::log::versions::v4::StorageMode as V2StorageMode;
+    use crate::object_store::versions as ostore;
+    use crate::snapshot::versions::v4::{
+        ActionsSnapshot, CatalogSnapshot, DatabaseActionsSnapshot, PermissionSnapshot,
+        ResourceIdentifierSnapshot, ResourceTypeSnapshot,
+    };
+    use influxdb3_authz::{Actions, DatabaseActions, Permission, ResourceIdentifier, ResourceType};
+    use influxdb3_id::{DbId, TokenId};
+    use object_store::ObjectStore;
+    use object_store::memory::InMemory;
+    use std::sync::Arc;
+
+    /// A scoped token the way the 3.9 v2 checkpoint stores it: `db:*` with
+    /// every action bit set, whatever it was created with.
+    fn checkpointed_token(id: u64, name: &str) -> crate::snapshot::versions::v4::TokenInfoSnapshot {
+        let mut t = resource_scoped_token(
+            id,
+            name,
+            vec![PermissionSnapshot {
+                resource_type: ResourceTypeSnapshot::Database,
+                resource_identifier: ResourceIdentifierSnapshot::Wildcard,
+                actions: ActionsSnapshot::Database(DatabaseActionsSnapshot(u16::MAX)),
+                resource_names: None,
+            }],
+        );
+        t.hash = format!("hash-{name}").into_bytes();
+        t
+    }
+
+    fn snapshot_with_tokens() -> CatalogSnapshot {
+        let mut snap = empty_snapshot(5);
+        snap.databases
+            .repo
+            .insert(DbId::new(1), database(1, "metrics", None));
+        snap.databases.next_id = DbId::new(2);
+        snap.tokens
+            .repo
+            .insert(TokenId::from(0), admin_token(0, "_admin"));
+        snap.tokens
+            .repo
+            .insert(TokenId::from(1), checkpointed_token(1, "ro"));
+        snap.tokens
+            .repo
+            .insert(TokenId::from(2), checkpointed_token(2, "ingest"));
+        snap.tokens.next_id = TokenId::from(3);
+        snap
+    }
+
+    #[test]
+    fn parse_accepts_wildcard_named_dbs_and_action_lists() {
+        let o = parse(" ro=db:*:read ; ingest=db:a, b:read,write;").unwrap();
+        assert_eq!(o.len(), 2);
+        assert!(parse("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_rejects_malformed_entries() {
+        for bad in [
+            "ro",
+            "=db:*:read",
+            "ro=db:*",
+            "ro=*:*:read",
+            "ro=token:*:read",
+            "ro=db::read",
+            "ro=db:*:admin",
+            "ro=db:*:read;ro=db:*:write",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn apply_rejects_unknown_token_admin_token_and_unknown_db() {
+        for (spec, needle) in [
+            ("nope=db:*:read", "not found in the v2 catalog"),
+            ("_admin=db:*:read", "admin token"),
+            ("ro=db:missing:read", "database \"missing\" not found"),
+        ] {
+            let err = apply(&mut snapshot_with_tokens(), &parse(spec).unwrap()).unwrap_err();
+            assert!(err.contains(needle), "{spec:?}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpointed_token_migrates_with_override_and_keeps_its_hash() {
+        let prefix: Arc<str> = Arc::from("override");
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let v2_store = ostore::v2::ObjectStoreCatalog::new(
+            Arc::clone(&prefix),
+            u64::MAX,
+            Arc::clone(&store),
+            V2StorageMode::default(),
+        );
+        v2_store
+            .persist_catalog_checkpoint(&snapshot_with_tokens())
+            .await
+            .unwrap();
+
+        let overrides = parse("ro=db:*:read;ingest=db:metrics:read,write").unwrap();
+        let result =
+            check_and_migrate_v2_to_v3_with(Arc::clone(&prefix), Arc::clone(&store), &overrides)
+                .await
+                .unwrap();
+        assert_eq!(result, MigrationResult::Migrated);
+
+        let v3 = ostore::v3::ObjectStoreCatalog::new(prefix, store, V3StorageMode::default())
+            .load_catalog()
+            .await
+            .unwrap()
+            .expect("v3 catalog")
+            .inner;
+        let perms = |name: &str| {
+            v3.tokens
+                .hash_to_info(format!("hash-{name}").into_bytes())
+                .unwrap_or_else(|| panic!("token {name} lost its hash"))
+                .permissions
+                .clone()
+        };
+        assert_eq!(
+            perms("ro"),
+            vec![Permission {
+                resource_type: ResourceType::Database,
+                resource_identifier: ResourceIdentifier::Wildcard,
+                actions: Actions::Database(DatabaseActions::from(DatabaseActions::READ)),
+                resource_names: None,
+            }]
+        );
+        let ingest = perms("ingest");
+        assert_eq!(ingest.len(), 1);
+        assert_eq!(
+            ingest[0].resource_identifier,
+            ResourceIdentifier::Database(vec![DbId::new(1)])
+        );
+        assert_eq!(
+            ingest[0].actions,
+            Actions::Database(DatabaseActions::from(
+                DatabaseActions::READ | DatabaseActions::WRITE
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn without_override_checkpointed_token_migrates_as_create_read_write() {
+        let prefix: Arc<str> = Arc::from("no-override");
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        ostore::v2::ObjectStoreCatalog::new(
+            Arc::clone(&prefix),
+            u64::MAX,
+            Arc::clone(&store),
+            V2StorageMode::default(),
+        )
+        .persist_catalog_checkpoint(&snapshot_with_tokens())
+        .await
+        .unwrap();
+        check_and_migrate_v2_to_v3_with(Arc::clone(&prefix), Arc::clone(&store), &[])
+            .await
+            .unwrap();
+        let v3 = ostore::v3::ObjectStoreCatalog::new(prefix, store, V3StorageMode::default())
+            .load_catalog()
+            .await
+            .unwrap()
+            .expect("v3 catalog")
+            .inner;
+        let ro = v3.tokens.hash_to_info(b"hash-ro".to_vec()).unwrap();
+        assert_eq!(
+            ro.permissions[0].actions,
+            Actions::Database(DatabaseActions::from(
+                DatabaseActions::CREATE | DatabaseActions::READ | DatabaseActions::WRITE
+            ))
+        );
+    }
 }

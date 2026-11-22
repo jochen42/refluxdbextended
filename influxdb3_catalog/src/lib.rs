@@ -207,6 +207,7 @@ pub mod snapshot;
 // consolidated.
 pub use influxdb3_wal::SnapshotSequenceNumber;
 
+pub use catalog::migrations::v3::token_overrides::set_migration_token_permissions;
 pub use error::CatalogError;
 pub use repository::{Repository, RepositoryError};
 pub(crate) type Result<T, E = CatalogError> = std::result::Result<T, E>;

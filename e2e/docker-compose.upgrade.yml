@@ -18,6 +18,10 @@ services:
       - --node-id=writer-1
       - --gen1-duration=${GEN1:-1m}
       - --disable-authz=health,ping,metrics
+    environment:
+      # Read only by 3.12+ and only during the v2 → v3 migration; older
+      # builds ignore unknown env vars.
+      INFLUXDB3_MIGRATION_TOKEN_PERMISSIONS: ${MIGRATION_TOKEN_PERMISSIONS:-}
   querier:
     image: ${QUERIER_IMAGE:-influxdb3-unlocked:e2e}
     command:

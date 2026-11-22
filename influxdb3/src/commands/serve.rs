@@ -150,6 +150,9 @@ pub enum Error {
     #[error("failed to initialize catalog: {0}")]
     InitializeCatalog(#[source] CatalogError),
 
+    #[error("invalid --migration-token-permissions: {0}")]
+    MigrationTokenPermissions(String),
+
     #[error("catalog error: {0}")]
     Catalog(#[from] CatalogError),
 
@@ -567,6 +570,20 @@ pub struct Config {
         action
     )]
     pub wal_tail_max_files: usize,
+
+    /// Permissions for scoped tokens, applied once by the v2 → v3 catalog
+    /// migration (first start of 3.12 on a pre-3.12 bucket). The 3.9 catalog
+    /// checkpoint lost the original scopes, so without this every scoped token
+    /// migrates as `create,read,write`. The token string stays the same.
+    /// Format: `<token name>=db:<*|db1,db2>:<read|write|create>[,…]`, entries
+    /// separated by `;`. A missing token or database stops the migration.
+    /// Ignored once the catalog is v3.
+    #[clap(
+        long = "migration-token-permissions",
+        env = "INFLUXDB3_MIGRATION_TOKEN_PERMISSIONS",
+        action
+    )]
+    pub migration_token_permissions: Option<String>,
 
     /// Interval between compaction runs. The compactor will check for files to compact at this interval.
     #[clap(
@@ -1668,6 +1685,11 @@ pub async fn command(mut config: Config, user_params: HashMap<String, String>) -
     let shared_catalog = config
         .shared_catalog
         .unwrap_or(config.mode != NodeMode::All);
+    if let Some(spec) = config.migration_token_permissions.as_deref() {
+        let n = influxdb3_catalog::set_migration_token_permissions(spec)
+            .map_err(Error::MigrationTokenPermissions)?;
+        info!(tokens = n, "token permission overrides registered for the v2 → v3 migration");
+    }
     let catalog = if shared_catalog {
         info!("opening shared catalog at {SHARED_CATALOG_PREFIX}/");
         Catalog::new_shared_with_shutdown(

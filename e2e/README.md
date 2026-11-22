@@ -71,6 +71,13 @@ NEW_IMAGE=influxdb3-unlocked:e2e-3.12 ./run-upgrade-test.sh
 Results land in `results/upgrade/`; `KEEP_STACK=1` leaves the stack running,
 and `SKIP_PHASE4=1` skips step 4.
 
+By default step 1 also writes 110 tables one at a time, which forces a v2
+catalog checkpoint (`CHECKPOINT_TOKENS=0` turns that off). A checkpoint written
+by 3.9 drops the scoped tokens' actions, as it did in prod. The NEW writer then
+restores them through `--migration-token-permissions`; the default spec matches
+the grants the test creates. Run with `MIGRATION_TOKEN_PERMISSIONS=` (empty) to
+see the tokens without the override: the token matrix then fails on purpose.
+
 ## One command
 
 ```bash

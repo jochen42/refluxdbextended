@@ -184,9 +184,24 @@ checkpoint writer (3.9, inherited from upstream Core) stores every database and
 token action set as `u16::MAX`. A scoped token that was folded into a
 checkpoint therefore comes out of the migration as `db:<scope>:create,read,write`,
 whatever it was created with. The prod rehearsal (2026-11-22) found this for
-every non-admin token. Recreate tokens that must be read-only after the
-upgrade. `rehearsal_token_permissions` in `catalog/migrations/v3/tests.rs`
-(ignored) prints what a catalog copy will migrate to.
+every non-admin token.
+
+To restore the intended scope without changing token strings, pass
+`--migration-token-permissions` (env `INFLUXDB3_MIGRATION_TOKEN_PERMISSIONS`)
+to the writer that runs the migration:
+
+```
+INFLUXDB3_MIGRATION_TOKEN_PERMISSIONS='prod-readonly=db:*:read;prod-readonly-2=db:*:read;ai-agents=db:*:read'
+```
+
+Entries are `<token name>=db:<*|db1,db2>:<read|write|create>[,…]`, separated
+by `;`. The override replaces the token's permissions and keeps its hash. It
+applies only in the migration run; on a v3 catalog it is ignored. A malformed
+spec stops startup. An unknown token, an admin token or an unknown database
+stops the migration, so a typo cannot leave a token with more access than
+intended. `rehearsal_token_permissions` in `catalog/migrations/v3/tests.rs`
+(ignored) prints what a catalog copy migrates to, with
+`REHEARSAL_TOKEN_OVERRIDES` set to the same spec.
 
 Scoped tokens are enforced by upstream's `TokenAuthenticatorAndAuthorizer`
 (upstream Core ships it but wires a no-op authorizer). Data-plane handlers ask
