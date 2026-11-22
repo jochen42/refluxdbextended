@@ -179,6 +179,15 @@ create=4`), while v3 uses upstream's (`create=1 … read=16, write=32`).
 `fork_v2_permission_to_wire` remaps them; without it a read-only token would
 come out create-only.
 
+The remap only helps for tokens whose real actions are still on disk. The v2
+checkpoint writer (3.9, inherited from upstream Core) stores every database and
+token action set as `u16::MAX`. A scoped token that was folded into a
+checkpoint therefore comes out of the migration as `db:<scope>:create,read,write`,
+whatever it was created with. The prod rehearsal (2026-11-22) found this for
+every non-admin token. Recreate tokens that must be read-only after the
+upgrade. `rehearsal_token_permissions` in `catalog/migrations/v3/tests.rs`
+(ignored) prints what a catalog copy will migrate to.
+
 Scoped tokens are enforced by upstream's `TokenAuthenticatorAndAuthorizer`
 (upstream Core ships it but wires a no-op authorizer). Data-plane handlers ask
 for `read`/`write` on the target database; a database not yet in the catalog,

@@ -11,6 +11,7 @@ use influxdb3_id::{
 use uuid::Uuid;
 
 use super::synthesize_records;
+use crate::catalog::versions::v2::Snapshot as _;
 use crate::catalog::versions::v2::{
     DeletionScope as V2DeletionScope, FieldFamilyMode as V2FieldFamilyMode,
     FieldFamilyName as V2FieldFamilyName,
@@ -1967,4 +1968,67 @@ mod runner {
         let snap_b = migrate_and_load_snapshot(uuid).await;
         assert_eq!(snap_a, snap_b);
     }
+}
+
+/// Offline rehearsal on a real catalog copy. Prints each token's v2
+/// permissions next to the permissions in the synthesized v3 record (no
+/// hashes). Run with
+/// `REHEARSAL_CATALOG_ROOT=<dir holding _catalog/> cargo test -p influxdb3_catalog rehearsal_token_permissions -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "needs REHEARSAL_CATALOG_ROOT"]
+async fn rehearsal_token_permissions() {
+    use crate::format::records::CreateAdminToken;
+    use crate::object_store::versions as ostore;
+    use crate::serialize::versions as ser;
+    use object_store::ObjectStore;
+
+    let root = std::env::var("REHEARSAL_CATALOG_ROOT").expect("REHEARSAL_CATALOG_ROOT");
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root).unwrap());
+    let prefix: Arc<str> = Arc::from("_catalog");
+    let v2_store = ostore::v2::ObjectStoreCatalog::new(
+        Arc::clone(&prefix),
+        u64::MAX,
+        store,
+        crate::log::versions::v4::StorageMode::default(),
+    );
+    let v2 = ser::v2::load_catalog(Arc::clone(&prefix), &v2_store)
+        .await
+        .unwrap()
+        .expect("v2 catalog");
+    let snap = v2.snapshot();
+    for (id, t) in &snap.tokens.repo {
+        println!("v2 token {} {:?} expiry={}", id.get(), t.name, t.expiry);
+        for p in &t.permissions {
+            println!(
+                "    v2 {:?} {:?} {:?} names={:?}",
+                p.resource_type, p.resource_identifier, p.actions, p.resource_names
+            );
+        }
+    }
+    let batch = synthesize_records(&snap);
+    for r in batch.as_slice() {
+        if r.id() == record_ids::CREATE_ADMIN_TOKEN {
+            let t = CreateAdminToken::decode(&r.data).unwrap();
+            println!("v3 admin token {} {:?}", t.token_id, t.name);
+        } else if r.id() == record_ids::CREATE_RESOURCE_SCOPED_TOKEN {
+            let t = CreateResourceScopedToken::decode(&r.data).unwrap();
+            println!(
+                "v3 scoped token {} {:?} expiry={:?}",
+                t.token_id, t.name, t.expiry
+            );
+            for p in &t.permissions {
+                println!("    v3 {p:?}");
+            }
+        }
+    }
+    let mut v3 = InnerCatalog::new(Arc::clone(&prefix), v2.catalog_uuid);
+    apply_records(
+        batch.as_slice(),
+        &mut v3,
+        v2.sequence_number(),
+        RestorePreload::empty(),
+    )
+    .expect("apply migrated records");
+    println!("applied {} records", batch.as_slice().len());
 }
