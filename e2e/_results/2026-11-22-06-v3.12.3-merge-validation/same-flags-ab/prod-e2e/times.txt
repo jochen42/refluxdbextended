@@ -1,0 +1,8 @@
+query run1 21.137596s
+query run2 21.165399s
+query run3 19.603071s
+explain(plan only) run1 2.305878s
+explain(plan only) run2 2.299890s
+explain(plan only) run3 2.128152s
+explain analyze 21.718016s
+e2e-regress-querier-1 3.132GiB / 11.67GiB
