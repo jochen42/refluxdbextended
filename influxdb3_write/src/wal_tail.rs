@@ -119,10 +119,11 @@ pub struct WalTailBuffer {
     max_files_per_writer: usize,
     state: RwLock<std::collections::HashMap<String, WriterTail>>,
     /// Per-writer high-water of WAL file sequence numbers known to be
-    /// covered by persisted parquet. Tail entries `<= this` are redundant
-    /// with persisted data — the planner would still dedupe correctly but
-    /// it'd waste time materializing record batches we've already got in
-    /// gen1+ parquet.
+    /// covered by persisted parquet. Tail entries `<= this` duplicate
+    /// persisted data and must not be served: the planner dedupes a tail
+    /// chunk and the parquet file holding the same rows in separate groups,
+    /// so both copies reach the query result. Seeded at boot from the loaded
+    /// snapshots, then advanced by the inventory poller.
     persisted_high_water: RwLock<std::collections::HashMap<String, u64>>,
 }
 
@@ -241,6 +242,22 @@ impl WalTailBuffer {
                 };
                 {
                     let mut guard = self.state.write();
+                    // Re-read the high-water under the state lock: the poller
+                    // may have folded the snapshot covering this file while we
+                    // fetched it. Its `evict_up_to` ran before we insert, and a
+                    // later call for the same seq is a no-op, so inserting now
+                    // would keep a persisted file in the tail and double-count
+                    // its rows. `evict_up_to` updates the high-water before it
+                    // takes the state lock, so reading it here closes the race.
+                    let high_water = self
+                        .persisted_high_water
+                        .read()
+                        .get(writer_id)
+                        .copied()
+                        .unwrap_or(0);
+                    if seq.as_u64() <= high_water {
+                        continue;
+                    }
                     let tail = guard
                         .entry(writer_id.clone())
                         .or_insert_with(WriterTail::new);
@@ -400,6 +417,43 @@ mod tests {
         let kept: Vec<u64> = tail.files.keys().map(|k| k.as_u64()).collect();
         assert_eq!(kept, vec![2, 3], "cap must keep the most recent files");
         assert_eq!(tail.cursor().as_u64(), 3);
+    }
+
+    /// A WAL file at or below the persisted high-water must never enter the
+    /// tail: its rows are already in parquet and the planner would count them
+    /// twice. Covers the boot seeding (high-water set before the first tick).
+    #[tokio::test]
+    async fn tick_skips_wal_files_at_or_below_high_water() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for seq in 1..=3u64 {
+            let contents = influxdb3_wal::WalContents {
+                persist_timestamp_ms: 0,
+                min_timestamp_ns: 0,
+                max_timestamp_ns: 0,
+                wal_file_number: WalFileSequenceNumber::new(seq),
+                ops: vec![],
+                snapshot: None,
+            };
+            let bytes = serialize::serialize_to_file_bytes(&contents).unwrap();
+            store
+                .put(
+                    &influxdb3_wal::object_store::wal_path("w1", WalFileSequenceNumber::new(seq)),
+                    bytes.into(),
+                )
+                .await
+                .unwrap();
+        }
+        let catalog = Catalog::new_in_memory("t").await.unwrap();
+        let tail = WalTailBuffer::new(store, catalog, vec!["w1".to_string()], 16);
+        tail.evict_up_to("w1", 2);
+
+        assert_eq!(tail.tick().await.unwrap(), 1);
+        let seqs: Vec<u64> = tail.state.read()["w1"]
+            .files
+            .keys()
+            .map(|k| k.as_u64())
+            .collect();
+        assert_eq!(seqs, vec![3]);
     }
 
     #[tokio::test]

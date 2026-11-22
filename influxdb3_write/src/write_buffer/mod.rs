@@ -186,6 +186,7 @@ pub struct WriteBufferImpl {
     /// Watermarks observed during the initial shared-inventory load so a
     /// downstream poller can resume polling without re-fetching every entry.
     initial_wal_watermarks: std::collections::HashMap<String, u64>,
+    initial_wal_file_watermarks: std::collections::HashMap<String, u64>,
     initial_compaction_watermark: Option<String>,
 }
 
@@ -428,17 +429,22 @@ impl WriteBufferImpl {
         // entries the per-node load already added.
         let mut initial_wal_watermarks: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
+        let mut initial_wal_file_watermarks: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         let mut initial_compaction_watermark: Option<String> = None;
         if let Some(inv) = &shared_inventory {
             match inv.load_full_state().await {
                 Ok(loaded) => {
                     initial_wal_watermarks = loaded.wal_watermarks.clone();
+                    initial_wal_file_watermarks = loaded.wal_file_watermarks.clone();
                     initial_compaction_watermark = loaded.compaction_watermark.clone();
                     // Seed tombstones before folding so a re-listed gen1 file
                     // whose removal sits below the checkpoint high-water is
                     // suppressed rather than resurrected as a phantom ref.
-                    persisted_files
-                        .seed_tombstones(loaded.tombstones.clone(), loaded.compaction_tombstones.clone());
+                    persisted_files.seed_tombstones(
+                        loaded.tombstones.clone(),
+                        loaded.compaction_tombstones.clone(),
+                    );
                     for snapshot in loaded.flatten() {
                         persisted_files.add_persisted_snapshot_files(snapshot);
                     }
@@ -505,6 +511,7 @@ impl WriteBufferImpl {
             metrics: WriteMetrics::new(&metric_registry),
             query_file_limit: query_file_limit.unwrap_or(432),
             initial_wal_watermarks,
+            initial_wal_file_watermarks,
             initial_compaction_watermark,
         });
         Ok(result)
@@ -523,6 +530,13 @@ impl WriteBufferImpl {
     /// entries already folded into `PersistedFiles`.
     pub fn initial_wal_watermarks(&self) -> std::collections::HashMap<String, u64> {
         self.initial_wal_watermarks.clone()
+    }
+
+    /// Highest WAL file sequence per writer covered by the snapshots folded at
+    /// boot. The querier seeds its WAL tail with these so it skips WAL files
+    /// that are already persisted.
+    pub fn initial_wal_file_watermarks(&self) -> std::collections::HashMap<String, u64> {
+        self.initial_wal_file_watermarks.clone()
     }
 
     pub fn initial_compaction_watermark(&self) -> Option<String> {
