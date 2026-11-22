@@ -166,6 +166,13 @@ idempotent and safe when several nodes start at once, but **one-way** — a
 across this upgrade. Stop every node, back up `_catalog/`, start the writer
 first, then the compactor, then the queriers.
 
+Rolling back means restoring that backup. A 3.9 binary started on a migrated
+bucket fails to decode the v3 snapshot ("unrecognized catalog file format")
+and never becomes ready: queries get "server is starting". But `/health` still
+returns 200, so health checks and MIG autohealing stay green. Watch query
+success after a rollback, not `/health`. `e2e/run-upgrade-test.sh` checks
+the upgrade end to end and records this rollback behavior.
+
 The migration carries one fork-specific step: the fork's v2 scoped tokens
 stored their actions with the fork's own bits (db `read=1, write=2,
 create=4`), while v3 uses upstream's (`create=1 … read=16, write=32`).

@@ -1,0 +1,45 @@
+[11:37:16] phase 1: OLD=docker.io/jochen42/refluxdbextended:extended-3.9.13-5
+[11:37:26] tokens created (admin, ro, roall, rw)
+[11:38:38] waiting for the old compactor to produce gen2+ files (max 300s)
+[11:38:59] old fingerprint: host,n,s h0,1440,72505.6 h1,1440,73945.6 h2,1440,75385.6 h3,1440,76825.6 h4,1440,78265.6 
+[11:39:00] phase 2: full stop
+[11:39:01] phase 3: NEW=influxdb3-unlocked:e2e-3.12 (writer → compactor → querier)
+[11:39:04] new writer healthy after 3s
+[11:39:28] new fingerprint: host,n,s h0,1440,72505.6 h1,1440,73945.6 h2,1440,75385.6 h3,1440,76825.6 h4,1440,78265.6 
+[11:39:28] PASS fingerprint unchanged (e23fce65c28bbc7088eb7fa0ec0f2fb7)
+[11:40:28] diag: dup counts over time: 0 0 0 0 0 0 
+[11:40:28] token matrix old → new:
+  ro.query.bench         200 → 200
+  ro.query.other         403 → 403
+  ro.write3.bench        403 → 403
+  ro.write1.bench        403 → 403
+  ro.cfg                 403 → 403
+  roall.query.bench      200 → 200
+  roall.query.other      200 → 200
+  roall.write3.other     403 → 403
+  rw.query.bench         200 → 200
+  rw.write3.bench        204 → 204
+  rw.write3.other        403 → 403
+  rw.write3.newdb        403 → 403
+  admin.query.bench      200 → 200
+  admin.cfg              200 → 200
+  bogus.query.bench      401 → 401
+[11:40:30] PASS new row visible via RO token (yes)
+[11:40:30] visible after 0.62s
+[11:40:30] letting the new compactor run 60s
+compactor-1  | 2026-11-22T11:39:04.454169169Z 2026-11-22T11:39:04.454033Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=1 duration_ns=60000000000
+compactor-1  | 2026-11-22T11:39:04.454352752Z 2026-11-22T11:39:04.454313Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=2 duration_ns=3600000000000
+compactor-1  | 2026-11-22T11:39:04.454354836Z 2026-11-22T11:39:04.454332Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=3 duration_ns=86400000000000
+compactor-1  | 2026-11-22T11:39:04.454355377Z 2026-11-22T11:39:04.454334Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=4 duration_ns=604800000000000
+compactor-1  | 2026-11-22T11:39:04.454355919Z 2026-11-22T11:39:04.454337Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=5 duration_ns=2592000000000000
+[11:41:30] PASS no ERROR/panic lines in new logs (0)
+writer-1  | 2026-11-22T11:39:01.720115543Z 2026-11-22T11:39:01.720051Z  INFO influxdb3_catalog::catalog::migrations::v3: writing the v3 catalog snapshot
+[11:41:30] phase 4: OLD querier against the migrated bucket
+[11:41:31] old querier healthy on migrated bucket: yes
+[11:41:31] old querier sees fresh row: server is starting: catalog load / WAL replay in progress 
+querier-1  | 2026-11-22T11:41:31.198860167Z            0: unexpected error: unrecognized catalog file format: [105, 100, 98, 51, 46, 69, 79, 70, 46, 108]
+querier-1  | 2026-11-22T11:41:31.198860709Z            1: unrecognized catalog file format: [105, 100, 98, 51, 46, 69, 79, 70, 46, 108]
+querier-1  | 2026-11-22T11:41:31.198861417Z     1: failed to deserialize catalog file
+querier-1  | 2026-11-22T11:41:31.198862126Z     2: unexpected error: unrecognized catalog file format: [105, 100, 98, 51, 46, 69, 79, 70, 46, 108]
+querier-1  | 2026-11-22T11:41:31.198862584Z     3: unrecognized catalog file format: [105, 100, 98, 51, 46, 69, 79, 70, 46, 108])
+[11:41:31] UPGRADE TEST PASSED

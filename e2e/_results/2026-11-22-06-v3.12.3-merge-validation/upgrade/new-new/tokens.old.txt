@@ -1,0 +1,15 @@
+ro.query.bench=200
+ro.query.other=403
+ro.write3.bench=403
+ro.write1.bench=403
+ro.cfg=403
+roall.query.bench=200
+roall.query.other=200
+roall.write3.other=403
+rw.query.bench=200
+rw.write3.bench=204
+rw.write3.other=403
+rw.write3.newdb=403
+admin.query.bench=200
+admin.cfg=200
+bogus.query.bench=401

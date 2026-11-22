@@ -1,0 +1,44 @@
+[11:41:32] phase 1: OLD=influxdb3-unlocked:e2e-3.12
+[11:41:42] tokens created (admin, ro, roall, rw)
+[11:42:54] waiting for the old compactor to produce gen2+ files (max 300s)
+[11:43:15] old fingerprint: host,n,s h0,1440,71062.6 h1,1440,72502.6 h2,1440,73942.6 h3,1440,75382.6 h4,1440,76822.6 
+[11:43:16] phase 2: full stop
+[11:43:17] phase 3: NEW=influxdb3-unlocked:e2e-3.12 (writer → compactor → querier)
+[11:43:19] new writer healthy after 2s
+[11:43:43] new fingerprint: host,n,s h0,1440,71062.6 h1,1440,72502.6 h2,1440,73942.6 h3,1440,75382.6 h4,1440,76822.6 
+[11:43:43] PASS fingerprint unchanged (b9eda678608b8e29dd6484af30681ede)
+[11:44:44] diag: dup counts over time: 0 0 0 0 0 0 
+[11:44:44] token matrix old → new:
+  ro.query.bench         200 → 200
+  ro.query.other         403 → 403
+  ro.write3.bench        403 → 403
+  ro.write1.bench        403 → 403
+  ro.cfg                 403 → 403
+  roall.query.bench      200 → 200
+  roall.query.other      200 → 200
+  roall.write3.other     403 → 403
+  rw.query.bench         200 → 200
+  rw.write3.bench        204 → 204
+  rw.write3.other        403 → 403
+  rw.write3.newdb        403 → 403
+  admin.query.bench      200 → 200
+  admin.cfg              200 → 200
+  bogus.query.bench      401 → 401
+[11:44:45] PASS new row visible via RO token (yes)
+[11:44:45] visible after 0.46s
+[11:44:46] letting the new compactor run 60s
+compactor-1  | 2026-11-22T11:41:41.911540672Z 2026-11-22T11:41:41.911262Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=1 duration_ns=60000000000
+compactor-1  | 2026-11-22T11:41:41.911541964Z 2026-11-22T11:41:41.911478Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=2 duration_ns=3600000000000
+compactor-1  | 2026-11-22T11:41:41.912887756Z 2026-11-22T11:41:41.912805Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=3 duration_ns=86400000000000
+compactor-1  | 2026-11-22T11:41:41.917582964Z 2026-11-22T11:41:41.917195Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=4 duration_ns=604800000000000
+compactor-1  | 2026-11-22T11:41:41.919102714Z 2026-11-22T11:41:41.918975Z  INFO influxdb3_catalog::catalog::versions::v3::catalog: set generation duration level=5 duration_ns=2592000000000000
+[11:45:46] PASS no ERROR/panic lines in new logs (0)
+[11:45:46] phase 4: OLD querier against the migrated bucket
+[11:45:46] old querier healthy on migrated bucket: yes
+[11:45:46] old querier sees fresh row: server is starting: catalog load / WAL replay in progress 
+querier-1  | 2026-11-22T11:45:46.713457550Z 2026-11-22T11:45:46.713295Z  INFO influxdb3_write::deleter: Started catalog hard deleter task. delete_grace_period=86400s
+querier-1  | 2026-11-22T11:45:46.713541883Z 2026-11-22T11:45:46.713502Z  INFO influxdb3_processing_engine: async trigger concurrency: unlimited
+querier-1  | 2026-11-22T11:45:46.713592716Z 2026-11-22T11:45:46.713555Z  INFO influxdb3_processing_engine::scheduler: starting processing engine scheduler self.node_id="querier-1" worker_count=1
+querier-1  | 2026-11-22T11:45:46.713653175Z 2026-11-22T11:45:46.713612Z  INFO influxdb3_lib::commands::serve: setting up server with authz disabled for paths paths_without_authz=["/health", "/api/v1/health", "/ping", "/metrics"]
+querier-1  | 2026-11-22T11:45:46.713700425Z 2026-11-22T11:45:46.713652Z  INFO influxdb3_server: startup time: 42ms address=0.0.0.0:8181
+[11:45:46] UPGRADE TEST PASSED

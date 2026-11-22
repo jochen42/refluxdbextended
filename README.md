@@ -175,7 +175,7 @@ every token acts as admin. This fork enforces them:
 | All other `/api/v3/configure/*`, plugins, `/api/v3/engine/*` | admin token |
 | `/health`, `/ping`, `/metrics` | any valid token |
 
-Denied requests return 403. The v2 write API returns 401, matching InfluxDB v2.
+Denied requests return 403, on every write API including v2.
 
 Health check:
 

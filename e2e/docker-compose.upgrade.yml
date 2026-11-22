@@ -1,0 +1,47 @@
+# In-place upgrade overlay: auth on (prod-like), and one image per role so a
+# bucket written by the old build can be handed to the new build.
+#
+# Used by run-upgrade-test.sh:
+#
+#   export COMPOSE_FILE=docker-compose.yml:docker-compose.upgrade.yml
+#   WRITER_IMAGE=... QUERIER_IMAGE=... COMPACTOR_IMAGE=... docker compose up -d
+#
+# `--disable-authz health,ping,metrics` matches prod and keeps the compose
+# health checks working without a token.
+services:
+  writer:
+    image: ${WRITER_IMAGE:-influxdb3-unlocked:e2e}
+    command:
+      - serve
+      - --object-store=s3
+      - --mode=writer
+      - --node-id=writer-1
+      - --gen1-duration=${GEN1:-1m}
+      - --disable-authz=health,ping,metrics
+  querier:
+    image: ${QUERIER_IMAGE:-influxdb3-unlocked:e2e}
+    command:
+      - serve
+      - --object-store=s3
+      - --mode=querier
+      - --node-id=querier-1
+      - --query-file-limit=${QUERY_FILE_LIMIT:-100000}
+      - --disable-authz=health,ping,metrics
+  compactor:
+    image: ${COMPACTOR_IMAGE:-influxdb3-unlocked:e2e}
+    command:
+      - serve
+      - --object-store=s3
+      - --mode=compactor
+      - --node-id=compactor-1
+      - --gen1-duration=${GEN1:-1m}
+      - --gen2-duration=${GEN2:-1h}
+      - --gen3-duration=${GEN3:-1d}
+      - --gen4-duration=${GEN4:-7d}
+      - --gen5-duration=${GEN5:-30d}
+      - --compaction-interval=${COMPACTION_INTERVAL:-10s}
+      - --min-files-for-compaction=${MIN_FILES:-2}
+      - --max-compaction-files=${MAX_FILES:-500}
+      - --compaction-delete-grace=0s
+      - --compactor-lease-ttl=30s
+      - --disable-authz=health,ping,metrics

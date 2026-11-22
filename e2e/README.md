@@ -43,6 +43,34 @@ QUERIER_IMAGE=docker.io/jochen42/refluxdbextended:3.9.3 ./run-freshness-test.sh 
 WRITER_IMAGE=docker.io/jochen42/refluxdbextended:3.9.3  ./run-freshness-test.sh   # old writer, new querier
 ```
 
+## In-place upgrade (catalog migration check)
+
+`run-upgrade-test.sh` hands a bucket written by one build to another, with auth
+on (`docker-compose.upgrade.yml`). It is the check for upgrades that change
+on-disk formats, such as the one-way catalog v2 → v3 migration in 3.12:
+
+```bash
+OLD_IMAGE=docker.io/jochen42/refluxdbextended:extended-3.9.13-5 \
+NEW_IMAGE=influxdb3-unlocked:e2e-3.12 ./run-upgrade-test.sh
+```
+
+1. The OLD writer, compactor and querier ingest 4 h of data into two databases.
+   The test creates an admin token and three scoped tokens (`db:bench:read`,
+   `db:*:read`, `db:bench:read,write`), and waits for gen2 files.
+2. Full stop. Then the NEW writer starts (it migrates the catalog), then the
+   NEW compactor, then the NEW querier.
+3. Assertions:
+   - the same per-host row count and sum as before (no lost or duplicated rows)
+   - no duplicate timestamps over 60 s
+   - every token gives the same HTTP status as before (15 cases)
+   - a new row is visible through the read-only token
+   - no unexpected ERROR or panic lines
+4. The OLD querier is started on the migrated bucket. This records what a
+   rollback without a restore does (informational).
+
+Results land in `results/upgrade/`; `KEEP_STACK=1` leaves the stack running,
+and `SKIP_PHASE4=1` skips step 4.
+
 ## One command
 
 ```bash
