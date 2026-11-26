@@ -192,6 +192,14 @@ with open(expected, "w") as f:  # ground truth for the fingerprint checks
 print("ingested", len(ts) * 5, "rows per db")
 PY
 
+diag() { # tag: duplicated timestamps + plan, to tell WAL-tail overlap from parquet overlap
+    local d="$OUT/diag.$1"
+    sql() { curl -s -G "$Q/api/v3/query_sql" -H "Authorization: Bearer $ADMIN" --data-urlencode db=bench \
+        --data-urlencode format=pretty --data-urlencode "q=$1"; }
+    { date -u; sql "SELECT host, COUNT(*) n FROM sensors GROUP BY host ORDER BY host"
+      sql "SELECT MIN(time) mn, MAX(time) mx, COUNT(*) dups FROM (SELECT time FROM sensors WHERE host='h0' GROUP BY time HAVING COUNT(*)>1)"
+      sql "EXPLAIN ANALYZE SELECT host, COUNT(*) FROM sensors GROUP BY host"; } >"$d.txt" 2>&1
+}
 log "waiting for the old compactor to produce gen2+ files (max 300s)"
 for _ in $(seq 1 60); do
     bucket_listing "$OUT/bucket.old.txt"
@@ -202,6 +210,10 @@ sleep 20 # let the querier fold the latest inventory
 token_matrix "$W" "$Q" >"$OUT/tokens.old.txt"
 fingerprint "$Q" >"$OUT/fingerprint.old.csv"
 log "old fingerprint: $(tr '\n' ' ' <"$OUT/fingerprint.old.csv")"
+if [ "${PHASE1_DIAG:-0}" = 1 ]; then
+    for i in 0 1 2 3 4 5; do diag "p1.t$((i*10))s"; sleep 10; done
+    log "phase 1 diag: dup counts over time: $(grep -h -A3 'dups' "$OUT"/diag.p1.t*s.txt | grep -oE '\| [0-9]+ +\|$' | tr -d '| ' | tr '\n' ' ')"
+fi
 bucket_listing "$OUT/bucket.old.txt"
 dump_logs old
 
@@ -239,16 +251,8 @@ PY
 }
 log "old querier vs ingested: $(fp_matches "$OUT/fingerprint.old.csv") (informational)"
 check "new fingerprint matches ingested data" "match" "$(fp_matches "$OUT/fingerprint.new.csv")"
-diag() { # tag: duplicated timestamps + plan, to tell WAL-tail overlap from parquet overlap
-    local d="$OUT/diag.$1"
-    sql() { curl -s -G "$Q/api/v3/query_sql" -H "Authorization: Bearer $ADMIN" --data-urlencode db=bench \
-        --data-urlencode format=pretty --data-urlencode "q=$1"; }
-    { date -u; sql "SELECT host, COUNT(*) n FROM sensors GROUP BY host ORDER BY host"
-      sql "SELECT MIN(time) mn, MAX(time) mx, COUNT(*) dups FROM (SELECT time FROM sensors WHERE host='h0' GROUP BY time HAVING COUNT(*)>1)"
-      sql "EXPLAIN ANALYZE SELECT host, COUNT(*) FROM sensors GROUP BY host"; } >"$d.txt" 2>&1
-}
 for i in 0 1 2 3 4 5; do diag "t$((i*10))s"; sleep 10; done
-log "diag: dup counts over time: $(grep -h -A3 'dups' "$OUT"/diag.t*s.txt | grep -oE '\| [0-9]+ +\|$' | tr -d '| ' | tr '\n' ' ')"
+log "diag: dup counts over time: $(grep -h -A3 'dups' "$OUT"/diag.t[0-9]*s.txt | grep -oE '\| [0-9]+ +\|$' | tr -d '| ' | tr '\n' ' ')"
 
 token_matrix "$W" "$Q" >"$OUT/tokens.new.txt"
 log "token matrix old → new:"
