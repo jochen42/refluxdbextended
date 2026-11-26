@@ -18,7 +18,10 @@
 //! most recent `--wal-snapshot-size` WAL periods buffered (up to 3x that before
 //! force-snapshot), so the cap must comfortably exceed `--wal-snapshot-size`.
 //! `add_file` warns loudly if the cap ever evicts an un-persisted file rather
-//! than lose data silently. ReorgPlanner dedupes any tail/persisted overlap.
+//! than lose data silently. Tail and persisted rows can still overlap: a
+//! snapshot persists rows from WAL files newer than its WAL sequence. Tail
+//! chunks therefore carry the parquet file's partition id, so the planner
+//! dedupes them in one group.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -340,7 +343,7 @@ impl WalTailBuffer {
         }
 
         let mut out: Vec<Arc<dyn QueryChunk>> = Vec::with_capacity(by_partition.len());
-        for (_chunk_time, (ts_min_max, batches)) in by_partition {
+        for (chunk_time, (ts_min_max, batches)) in by_partition {
             // Concatenate the per-file batches into a single batch. The downstream
             // dedup/sort cost is dominated by the *number of batches*, not chunks
             // (sort-preserving-merge over many small streams), so merging them is
@@ -360,9 +363,16 @@ impl WalTailBuffer {
                 batches: vec![batch],
                 schema: influx_schema.clone(),
                 stats: Arc::new(stats),
+                // Same partition id as the parquet file for this gen1 chunk
+                // (`parquet_chunk_from_file`). The planner only deduplicates
+                // chunks within one partition, and a snapshot persists every
+                // buffered row below its end-time marker, including rows from
+                // WAL files after its `wal_file_sequence_number` that stay in
+                // the tail. With a separate partition those rows were counted
+                // twice until a later snapshot evicted their file.
                 partition_id: PartitionHashId::new(
                     data_types::TableId::new(0),
-                    &PartitionKey::from("wal-tail".to_string()),
+                    &PartitionKey::from(chunk_time.to_string()),
                 ),
                 sort_key: None,
                 id: ChunkId::new(),
@@ -530,6 +540,40 @@ mod tests {
         // chunks before the fix), and every row is preserved.
         assert_eq!(chunks.len(), 1, "tail chunks coalesce to one per partition");
         assert_eq!(total_rows(&chunks), 5, "all rows preserved across files");
+    }
+
+    /// A snapshot can persist rows whose WAL file stays in the tail. The planner
+    /// only dedupes within a partition, so a tail chunk must share the partition
+    /// id of the parquet file for the same gen1 chunk, or those rows count twice.
+    #[tokio::test]
+    async fn tail_chunk_shares_partition_with_parquet_of_same_gen1_chunk() {
+        let catalog = Catalog::new_in_memory("t").await.unwrap();
+        let writer = TestWriter::new_with_catalog(Arc::clone(&catalog));
+        let batch = writer
+            .write_lp_to_write_batch("cpu,host=a usage=1i 1000", 0)
+            .await;
+        let buf = tail_with_n_files(&catalog, &WalOp::Write(batch), 1);
+
+        let db_schema = catalog.db_schema(TestWriter::DB_NAME).unwrap();
+        let table_def = db_schema.table_definition("cpu").unwrap();
+        let filter = ChunkFilter::new(&table_def, &[]).unwrap();
+        let tail = buf
+            .get_table_chunks(Arc::clone(&db_schema), Arc::clone(&table_def), &filter, 0)
+            .unwrap();
+        assert_eq!(tail.len(), 1);
+
+        // The row at t=1000ns is in the gen1 chunk starting at 0, like this file.
+        let file = crate::ParquetFile::create_for_test("dbs/1/0/x.parquet");
+        assert_eq!(file.chunk_time, 0);
+        let parquet = crate::write_buffer::parquet_chunk_from_file(
+            &file,
+            &table_def.schema,
+            datafusion::execution::object_store::ObjectStoreUrl::parse("iox://influxdb3/").unwrap(),
+            Arc::new(object_store::memory::InMemory::new()),
+            0,
+            None,
+        );
+        assert_eq!(tail[0].partition_id(), parquet.partition_id());
     }
 
     #[tokio::test]
