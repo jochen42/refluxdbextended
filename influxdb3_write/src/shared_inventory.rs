@@ -389,12 +389,17 @@ impl SharedInventory {
         // Track watermarks so a downstream poller can start from here without
         // re-fetching anything we already saw.
         let mut wal_watermarks = since_per_node;
+        let mut wal_file_watermarks: HashMap<String, u64> = HashMap::new();
         for s in &wal_snapshots {
             let entry = wal_watermarks.entry(s.node_id.clone()).or_insert(0);
             let seq = s.snapshot_sequence_number.as_u64();
             if seq > *entry {
                 *entry = seq;
             }
+            let wal = wal_file_watermarks
+                .entry(s.node_id.to_string())
+                .or_insert(0);
+            *wal = (*wal).max(s.wal_file_sequence_number.as_u64());
         }
         let compaction_watermark = compactions_raw
             .last()
@@ -425,6 +430,7 @@ impl SharedInventory {
             wal_snapshots,
             compactions,
             wal_watermarks,
+            wal_file_watermarks,
             compaction_watermark,
             tombstones,
             compaction_tombstones,
@@ -477,6 +483,12 @@ pub struct LoadedInventory {
     /// Highest WAL snapshot sequence seen per node — feeds the inventory
     /// poller's starting cursor.
     pub wal_watermarks: HashMap<String, u64>,
+    /// Highest WAL *file* sequence covered by the loaded snapshots, per node.
+    /// Seeds the querier's WAL tail so it does not replay WAL files whose rows
+    /// are already in the loaded parquet: the planner dedupes a tail chunk and
+    /// a parquet file for the same rows in separate groups, so a replayed
+    /// persisted WAL file double-counts its rows.
+    pub wal_file_watermarks: HashMap<String, u64>,
     /// Highest compaction ULID seen — feeds the inventory poller's starting
     /// cursor for compaction listings.
     pub compaction_watermark: Option<String>,
@@ -806,6 +818,24 @@ mod tests {
 
         let flat = state.flatten();
         assert_eq!(flat.len(), 2);
+    }
+
+    /// The WAL tail of a restarted querier is seeded from these, so they must
+    /// carry the highest WAL *file* sequence per node (not the snapshot
+    /// sequence) over every loaded snapshot.
+    #[tokio::test]
+    async fn load_full_state_reports_wal_file_watermarks() {
+        let inv = SharedInventory::new(Arc::new(InMemory::new()));
+        for (node, snap_seq, wal_seq) in [("node-a", 1, 10), ("node-a", 2, 47), ("node-b", 1, 3)] {
+            let mut s = snap_with(node, snap_seq, &format!("{node}/{snap_seq}.parquet"));
+            s.wal_file_sequence_number = WalFileSequenceNumber::new(wal_seq);
+            inv.publish_wal_snapshot(node, &s).await.unwrap();
+        }
+
+        let state = inv.load_full_state().await.unwrap();
+        assert_eq!(state.wal_watermarks.get("node-a"), Some(&2));
+        assert_eq!(state.wal_file_watermarks.get("node-a"), Some(&47));
+        assert_eq!(state.wal_file_watermarks.get("node-b"), Some(&3));
     }
 
     #[tokio::test]

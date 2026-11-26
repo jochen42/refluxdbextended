@@ -79,7 +79,9 @@ pub fn verify_file_type_and_deserialize(b: Bytes) -> Result<WalContents> {
     Ok(contents)
 }
 
-pub(crate) fn serialize_to_file_bytes(contents: &WalContents) -> Result<Vec<u8>> {
+/// Encode WAL contents in the on-object-store file format. Public so peers
+/// (the querier WAL tail tests) can stage real WAL files.
+pub fn serialize_to_file_bytes(contents: &WalContents) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     buf.extend_from_slice(FILE_TYPE_IDENTIFIER);
 

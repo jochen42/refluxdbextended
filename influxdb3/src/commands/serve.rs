@@ -1736,6 +1736,14 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
                 writer_node_ids,
                 config.wal_tail_max_files,
             );
+            // Seed the persisted high-water from the snapshots folded at boot
+            // before the first tick. The inventory poller only evicts on
+            // snapshots it folds after boot, so without this a restarted
+            // querier replays already-persisted WAL files and double-counts
+            // their rows until the writer's next snapshot.
+            for (writer, wal_seq) in write_buffer_impl.initial_wal_file_watermarks() {
+                t.evict_up_to(&writer, wal_seq);
+            }
             Arc::clone(&t).spawn(influxdb3_write::wal_tail::WalTailBufferArgs {
                 poll_interval: wal_tail_interval,
                 shutdown: shutdown_manager.register(),
